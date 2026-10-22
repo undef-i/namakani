@@ -1,0 +1,43 @@
+package main
+
+import (
+	"embed"
+	"flag"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+
+	"namakani/internal/api"
+	"namakani/internal/store"
+	syncmgr "namakani/internal/sync"
+)
+
+var uiEmbed embed.FS
+
+func main() {
+	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
+	dataDir := flag.String("data", "./data", "data directory (sqlite db lives here)")
+	flag.Parse()
+
+	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
+		log.Fatalf("create data dir: %v", err)
+	}
+	st, err := store.Open(filepath.Join(*dataDir, "namakani.db"))
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+	defer st.DB.Close()
+
+	uiFS, err := fs.Sub(uiEmbed, "web/dist")
+	if err != nil {
+		log.Fatalf("ui fs: %v", err)
+	}
+
+	mgr := syncmgr.NewManager(st)
+	mgr.RecomputeSnippets()
+	srv := api.New(st, uiFS, mgr)
+	log.Printf("namakani listening on %s (data: %s)", *addr, *dataDir)
+	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
+}

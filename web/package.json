@@ -1,0 +1,30 @@
+{
+  "name": "namakani-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && rm -f dist/assets/*.eot dist/assets/*.ttf dist/assets/*.woff",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource/roboto": "^5.1.0",
+    "@mdi/font": "^7.4.47",
+    "@tiptap/extension-color": "^3.0.0",
+    "@tiptap/extension-image": "^3.0.0",
+    "@tiptap/extension-link": "^3.0.0",
+    "@tiptap/extension-text-align": "^3.0.0",
+    "@tiptap/extension-text-style": "^3.0.0",
+    "@tiptap/extension-underline": "^3.0.0",
+    "@tiptap/starter-kit": "^3.0.0",
+    "@tiptap/vue-3": "^3.0.0",
+    "vue": "^3.5.13",
+    "vuetify": "^3.7.14"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.7",
+    "vite-plugin-vuetify": "^2.0.4"
+  }
+}
