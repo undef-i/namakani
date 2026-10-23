@@ -313,23 +313,6 @@ const scopeStats = computed(() => {
   }
   return map
 })
-const accountInboxUnread = computed(() => {
-  const map = {}
-  for (const f of folders.value) {
-    if (f.special_use === 'inbox') map[f.account_id] = (map[f.account_id] ?? 0) + f.unread
-  }
-  return map
-})
-const syncIndicator = computed(() => {
-  let anySync = false
-  for (const a of accounts.value) {
-    const st = statuses.value[a.id]
-    if (!st) continue
-    if (st.state === 'error' || st.state === 'repair') return 'error'
-    if (st.state === 'syncing' || st.state === 'connecting') anySync = true
-  }
-  return anySync ? 'syncing' : 'idle'
-})
 const visibleScopes = computed(() => SCOPES.value.filter((s) => scopeStats.value[s.key]?.present))
 
 function applyTheme() {
@@ -1778,17 +1761,15 @@ onBeforeUnmount(() => {
     <template v-else>
       <v-app-bar height="64" flat class="app-topbar">
         <div v-if="lgAndUp" class="topbar-desktop">
-          <button type="button" class="topbar-menu-btn" :aria-label="t('展开菜单')" @click="toggleDrawer">
-            <v-icon icon="mdi-menu" size="24" />
-          </button>
+          <v-btn icon="mdi-menu" variant="text" :aria-label="t('展开菜单')" @click="toggleDrawer" />
           <span v-if="wideDesktop" class="topbar-title">Namakani</span>
+          <v-spacer />
           <div class="topbar-search">
             <v-text-field
               ref="searchEl"
               v-model="searchQuery"
               :placeholder="t('搜索')"
               variant="solo-filled"
-              rounded="pill"
               hide-details
               class="search-field-d"
               @input="onSearchInput"
@@ -1807,37 +1788,6 @@ onBeforeUnmount(() => {
               </template>
             </v-text-field>
           </div>
-          <v-spacer />
-          <span v-if="syncIndicator === 'syncing'" class="topbar-sync" :title="t('同步中')">
-            <v-icon icon="mdi-refresh" size="22" class="sync-spin" />
-          </span>
-          <v-btn
-            v-else-if="syncIndicator === 'error'"
-            icon="mdi-alert-circle"
-            variant="text"
-            color="error"
-            size="small"
-            :aria-label="t('同步失败')"
-            @click="openSettings"
-          />
-          <v-btn icon="mdi-cog" variant="text" size="small" :aria-label="t('设置')" @click="openSettings" />
-          <v-menu>
-            <template #activator="{ props: mp }">
-              <button
-                type="button"
-                v-bind="mp"
-                class="topbar-avatar"
-                :style="{ background: avatarColor(accounts[0]?.email || 'namakani') }"
-                :aria-label="t('账号')"
-              >
-                <span class="avatar-letter font-weight-bold">{{ (accounts[0]?.email || 'W').charAt(0).toUpperCase() }}</span>
-              </button>
-            </template>
-            <v-list density="compact">
-              <v-list-item prepend-icon="mdi-cog" :title="t('设置')" @click="openSettings" />
-              <v-list-item prepend-icon="mdi-logout" :title="t('退出登录')" @click="doLogout" />
-            </v-list>
-          </v-menu>
         </div>
         <div v-else class="appbar-search">
           <div class="search-wrap">
@@ -1883,7 +1833,6 @@ onBeforeUnmount(() => {
           <v-btn
             v-if="lgAndUp"
             color="primary-container"
-            rounded="pill"
             prepend-icon="mdi-pencil"
             class="nav-compose mb-2"
             @click="openCompose({})"
@@ -1929,7 +1878,6 @@ onBeforeUnmount(() => {
                 :prepend-icon="s.icon"
                 :title="s.label"
                 :active="scope === s.key"
-                rounded="pill"
                 @click="selectScope(s.key)"
               >
                 <template #append>
@@ -1944,27 +1892,6 @@ onBeforeUnmount(() => {
             </p>
           </template>
 
-          <template v-if="accounts.length > 1">
-            <div class="nav-group-label">{{ t('账号') }}</div>
-            <v-list density="compact" nav class="pa-0">
-              <v-list-item
-                v-for="a in accounts"
-                :key="a.id"
-                :active="rangeId === a.id"
-                rounded="pill"
-                @click="setRange(rangeId === a.id ? 0 : a.id)"
-              >
-                <template #prepend>
-                  <span class="nav-dot" :style="{ background: avatarColor(a.email || a.label || '') }" />
-                </template>
-                <v-list-item-title class="text-body-2">{{ a.label || a.email }}</v-list-item-title>
-                <template #append>
-                  <span v-if="accountInboxUnread[a.id]" class="nav-count">{{ accountInboxUnread[a.id] }}</span>
-                </template>
-              </v-list-item>
-            </v-list>
-          </template>
-
           <div class="mt-auto">
             <v-divider class="mb-2" />
             <v-list density="compact" nav class="pa-0">
@@ -1972,10 +1899,9 @@ onBeforeUnmount(() => {
                 prepend-icon="mdi-cog"
                 :title="t('设置')"
                 :active="settingsOpen"
-                rounded="pill"
                 @click="openAccounts"
               />
-              <v-list-item prepend-icon="mdi-logout" :title="t('退出登录')" rounded="pill" @click="doLogout" />
+              <v-list-item prepend-icon="mdi-logout" :title="t('退出登录')" @click="doLogout" />
             </v-list>
           </div>
         </div>
@@ -2338,7 +2264,7 @@ onBeforeUnmount(() => {
                   </div>
                 </template>
                 <v-btn
-                  v-if="listHasMore && !searching && !lgAndUp"
+                  v-if="listHasMore && !searching"
                   block
                   variant="text"
                   :loading="loadingMore"
@@ -2349,11 +2275,6 @@ onBeforeUnmount(() => {
               </template>
               </div>
             </div>
-            </div>
-            <div v-if="lgAndUp && listStatus === 'ready' && listHasMore && !searching" class="list-footer">
-              <v-btn variant="text" block size="small" :loading="loadingMore" @click="loadMore">
-                {{ t('加载更多') }}
-              </v-btn>
             </div>
             <div v-if="lgAndUp" class="list-drag" @pointerdown="onListDragStart" />
           </section>
@@ -2736,7 +2657,7 @@ onBeforeUnmount(() => {
       />
 
       <v-dialog v-model="settingsOpen" :z-index="settingsZ" :fullscreen="!lgAndUp" :max-width="lgAndUp ? 1080 : 920" scrollable transition="false" @update:model-value="(v) => { if (!v) closeSettings() }">
-        <v-card style="border-radius: 28px">
+        <v-card class="settings-card" :style="lgAndUp ? { height: 'min(760px, calc(100dvh - 48px))' } : undefined">
           <v-card-title class="d-flex align-center">
             {{ t('设置') }}
             <v-spacer />
@@ -2898,29 +2819,21 @@ body {
   background: rgb(var(--v-theme-surface));
   border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
 }
+.settings-card {
+  display: flex;
+  flex-direction: column;
+}
+.settings-card .v-card-text {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
 .topbar-desktop {
   display: flex;
   align-items: center;
   gap: 4px;
   width: 100%;
   padding: 0 16px 0 8px;
-}
-.topbar-menu-btn {
-  width: 48px;
-  height: 48px;
-  flex: none;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: rgba(var(--v-theme-on-surface), 0.75);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-}
-.topbar-menu-btn:hover {
-  background: rgba(var(--v-theme-on-surface), 0.06);
 }
 .topbar-title {
   font-size: 18px;
@@ -2932,60 +2845,9 @@ body {
   flex: 0 1 720px;
   min-width: 200px;
 }
-.topbar-search .v-field {
-  height: 56px;
-  border-radius: 28px;
-  background: rgb(var(--v-theme-surface-container-high));
-  box-shadow: none;
-}
-.topbar-search .v-field__input {
-  min-height: 56px;
-  padding-top: 0;
-  padding-bottom: 0;
-  font-size: 16px;
-}
-.topbar-sync {
-  width: 40px;
-  height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: rgba(var(--v-theme-on-surface), 0.65);
-}
-.sync-spin {
-  animation: wm-spin 1.8s linear infinite;
-}
-@keyframes wm-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-.topbar-avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  border: none;
-  margin-left: 8px;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font-size: 15px;
-}
 @media (min-width: 1280px) {
   .nav-drawer {
     border-right: 1px solid rgb(var(--v-theme-outline-variant));
-  }
-  .nav-drawer .v-list-item {
-    min-height: 44px;
-  }
-  .nav-drawer .v-list-item--active {
-    background: rgb(var(--v-theme-primary-container));
-    color: rgb(var(--v-theme-on-primary-container));
-  }
-  .nav-drawer .v-list-item__prepend .v-icon {
-    font-size: 20px;
   }
 }
 .nav-compose {
@@ -3008,22 +2870,10 @@ body {
   flex: 1;
   min-width: 0;
 }
-.nav-group-label {
-  font-size: 12px;
-  color: rgb(var(--v-theme-on-surface-variant));
-  padding: 14px 12px 4px;
-}
 .nav-count {
   font-size: 12px;
   font-weight: 600;
   color: rgb(var(--v-theme-on-surface));
-}
-.nav-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  flex: none;
-  display: block;
 }
 .list-section {
   display: flex;
@@ -3181,13 +3031,6 @@ body {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
   cursor: pointer;
 }
-.list-footer {
-  height: 36px;
-  flex: none;
-  border-top: 1px solid rgb(var(--v-theme-outline-variant));
-  display: flex;
-  align-items: center;
-}
 .list-drag {
   position: absolute;
   top: 0;
@@ -3252,11 +3095,6 @@ body {
   display: flex;
   justify-content: center;
   padding-top: 1px;
-  opacity: 0;
-}
-.mail-row-d:hover .row-check,
-.row-check.row-check-on {
-  opacity: 1;
 }
 .mail-avatar-d {
   flex: none;
@@ -3347,8 +3185,6 @@ body {
 }
 .row-chip {
   flex: none;
-  height: 20px;
-  font-size: 11px;
 }
 .density-compact .mail-row-d {
   height: 64px;
@@ -3370,6 +3206,7 @@ body {
   flex: 1 1 auto;
   min-width: 0;
   height: 100%;
+  background: rgb(var(--v-theme-surface));
 }
 .reader-overlay {
   position: fixed;

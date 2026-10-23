@@ -117,6 +117,7 @@ const schedInfoShow = ref(false)
 const undoShow = ref(false)
 const undoLeft = ref(0)
 const showCc = ref(false)
+const showBcc = ref(false)
 const contacts = ref([])
 const contactsError = ref(false)
 let saveTimer = null
@@ -297,7 +298,8 @@ watch(open, (isOpen) => {
   toChips.value = splitAddrStr(init.to ?? '')
   ccChips.value = splitAddrStr(init.cc ?? '')
   bccChips.value = splitAddrStr(init.bcc ?? '')
-  showCc.value = ccChips.value.length > 0 || bccChips.value.length > 0
+  showCc.value = ccChips.value.length > 0
+  showBcc.value = bccChips.value.length > 0
   toSearch.value = ''
   ccSearch.value = ''
   bccSearch.value = ''
@@ -739,6 +741,7 @@ function onKeydown(e) {
                 variant="plain"
                 density="compact"
                 hide-details
+                :menu-props="{ zIndex: 2600 }"
                 :items="accounts.map((a) => ({ title: (a.from_name || a.label) + ' <' + a.email + '>', value: String(a.id) }))"
                 class="cfield"
               />
@@ -758,17 +761,25 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="toInvalid.length > 0"
+                :menu-props="{ zIndex: 2600 }"
                 class="cfield"
               />
               <v-btn
-                icon="mdi-chevron-down"
                 size="x-small"
                 variant="text"
-                :aria-label="t('抄送和密送')"
-                class="chev-btn"
-                :class="{ 'chev-open': showCc }"
+                :color="showCc ? 'primary' : undefined"
                 @click="showCc = !showCc"
-              />
+              >
+                {{ t('抄送') }}
+              </v-btn>
+              <v-btn
+                size="x-small"
+                variant="text"
+                :color="showBcc ? 'primary' : undefined"
+                @click="showBcc = !showBcc"
+              >
+                {{ t('密送') }}
+              </v-btn>
             </div>
             <p v-if="toInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: toInvalid.join(t('，')) }) }}</p>
             <p v-if="contactsError" class="cerr">
@@ -790,11 +801,12 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="ccInvalid.length > 0"
+                :menu-props="{ zIndex: 2600 }"
                 class="cfield"
               />
             </div>
             <p v-if="showCc && ccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: ccInvalid.join(t('，')) }) }}</p>
-            <div v-if="showCc" class="crow">
+            <div v-if="showBcc" class="crow">
               <span class="clabel">{{ t('密送') }}</span>
               <v-combobox
                 @keydown.capture.enter="onBccEnter"
@@ -809,10 +821,11 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="bccInvalid.length > 0"
+                :menu-props="{ zIndex: 2600 }"
                 class="cfield"
               />
             </div>
-            <p v-if="showCc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
+            <p v-if="showBcc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
             <div class="crow">
               <v-text-field
                 v-model="subject"
@@ -1098,7 +1111,6 @@ function onKeydown(e) {
   display: flex;
   flex-direction: column;
   height: min(640px, calc(100dvh - 96px));
-  border-radius: 16px;
   box-shadow:
     0 4px 8px rgba(0, 0, 0, 0.14),
     0 12px 28px rgba(0, 0, 0, 0.18);
@@ -1188,15 +1200,6 @@ function onKeydown(e) {
   margin: 4px 0 0;
   font-size: 12px;
   color: rgb(var(--v-theme-error));
-}
-.chev-btn {
-  flex: none;
-}
-.chev-btn .v-icon {
-  transition: transform 0.15s ease;
-}
-.chev-open .v-icon {
-  transform: rotate(180deg);
 }
 .compose-actions {
   flex: none;

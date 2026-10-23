@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -44,10 +45,17 @@ type Server struct {
 	loginLastFail time.Time
 	tgSeenMu      sync.Mutex
 	tgSeen        map[string]tgChat
+	protonAuthMu  sync.Mutex
+	protonAuth    map[string]protonAuthEntry
+}
+
+type protonAuthEntry struct {
+	bridge string
+	at     time.Time
 }
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
-	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat)}
+	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry)}
 	go s.tgSupervise()
 	go s.scheduleLoop()
 	if key, err := auth.LoadOrCreateServerKey(filepath.Join(st.DataDir(), "server.key")); err == nil {
@@ -528,12 +536,51 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+const protonAuthReuseTTL = 10 * time.Minute
+
+func protonAuthFingerprint(in *accountIn) string {
+	sum := sha256.Sum256([]byte(in.Email + "\x00" + in.Password + "\x00" + in.MailboxPassword + "\x00" + in.TOTP))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Server) takeProtonAuth(in *accountIn) (string, bool) {
+	fp := protonAuthFingerprint(in)
+	s.protonAuthMu.Lock()
+	defer s.protonAuthMu.Unlock()
+	e, ok := s.protonAuth[fp]
+	if !ok {
+		return "", false
+	}
+	delete(s.protonAuth, fp)
+	if time.Since(e.at) > protonAuthReuseTTL {
+		return "", false
+	}
+	return e.bridge, true
+}
+
+func (s *Server) stashProtonAuth(in *accountIn, bridge string) {
+	s.protonAuthMu.Lock()
+	s.protonAuth[protonAuthFingerprint(in)] = protonAuthEntry{bridge: bridge, at: time.Now()}
+	s.protonAuthMu.Unlock()
+}
+
+func (s *Server) authorizeProton(in *accountIn) (string, error) {
+	if bridge, ok := s.takeProtonAuth(in); ok {
+		return bridge, nil
+	}
+	bridge, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken)
+	if err == nil {
+		s.stashProtonAuth(in, bridge)
+	}
+	return bridge, err
+}
+
 func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *accountIn) {
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" || in.Password == "" {
 		writeErr(w, http.StatusBadRequest, "label, email and password are required")
 		return
 	}
-	bridgePassword, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken)
+	bridgePassword, err := s.authorizeProton(in)
 	if err == proton.ErrTOTPRequired {
 		writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
 		return
@@ -581,7 +628,7 @@ func (s *Server) updateProtonAccount(w http.ResponseWriter, r *http.Request, key
 		username = in.Email
 	}
 	if in.Password != "" {
-		bridgePassword, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken)
+		bridgePassword, err := s.authorizeProton(in)
 		if err == proton.ErrTOTPRequired {
 			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
 			return
@@ -877,7 +924,7 @@ func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accoun
 		s.testProtonStored(w, key, in.ID)
 		return
 	}
-	bridgePassword, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken)
+	bridgePassword, err := s.authorizeProton(&in.accountIn)
 	if err != nil {
 		if err == proton.ErrTOTPRequired {
 			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
@@ -1066,6 +1113,13 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.mgr.Status(id))
 }
 
+type reconnectIn struct {
+	Password        string `json:"password"`
+	MailboxPassword string `json:"mailbox_password"`
+	TOTP            string `json:"totp"`
+	CaptchaToken    string `json:"captcha_token"`
+}
+
 func (s *Server) handleReconnectAccount(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -1081,6 +1135,40 @@ func (s *Server) handleReconnectAccount(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
+	}
+	var in reconnectIn
+	if r.ContentLength > 0 {
+		if err := decodeJSON(r, &in); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+	}
+	if acct.Kind == "proton" && in.Password != "" {
+		ain := &accountIn{Email: acct.Email, Password: in.Password, MailboxPassword: in.MailboxPassword, TOTP: in.TOTP, CaptchaToken: in.CaptchaToken}
+		bridgePassword, err := s.authorizeProton(ain)
+		if err == proton.ErrTOTPRequired {
+			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
+			return
+		}
+		var capErr *proton.CaptchaError
+		if errors.As(err, &capErr) {
+			writeJSON(w, http.StatusOK, map[string]any{"needs_captcha": true, "captcha_url": capErr.URL, "captcha_token": capErr.Token})
+			return
+		}
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		enc, err := auth.Encrypt(key, bridgePassword)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "encrypt failed")
+			return
+		}
+		if _, err := s.st.DB.Exec(`UPDATE accounts SET enc_password = ? WHERE id = ?`, enc, id); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update failed")
+			return
+		}
+		acct.Password = bridgePassword
 	}
 	s.mgr.Restart(acct)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

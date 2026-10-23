@@ -205,12 +205,12 @@ func classifySessionError(acct mail.Account, err error) (bool, string) {
 	case "tuta":
 		var re *tuta.RestError
 		if errors.As(err, &re) && (re.StatusCode == 401 || re.StatusCode == 403) {
-			return true, "登录凭据被拒绝或会话已失效，自动重连不可能成功。请在设置里更新密码后点「重新连接」。（" + err.Error() + "）"
+			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。（" + err.Error() + "）"
 		}
 	default:
 		var ie *imap.Error
 		if errors.As(err, &ie) && ie.Code == imap.ResponseCodeAuthenticationFailed {
-			return true, "服务器拒绝了登录凭据，自动重连不可能成功。请在设置里更新密码后点「重新连接」。（" + err.Error() + "）"
+			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。（" + err.Error() + "）"
 		}
 	}
 	return false, ""

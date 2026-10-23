@@ -17,7 +17,7 @@ const SECTIONS = computed(() => [
   { key: 'accounts', label: t('账号'), icon: 'mdi-account-multiple' },
   { key: 'appearance', label: t('外观'), icon: 'mdi-palette' },
   { key: 'compose', label: t('写信与发送'), icon: 'mdi-email-edit' },
-  { key: 'telegram', label: 'Telegram', icon: 'mdi-send-circle' },
+  { key: 'push', label: t('推送'), icon: 'mdi-bell' },
   { key: 'advanced', label: t('高级'), icon: 'mdi-cog' },
 ])
 
@@ -33,12 +33,12 @@ function kindText(a) {
 function statusChip(a) {
   const st = props.statuses[a.id]
   if (!st) return null
-  if (st.state === 'idle') return { text: t('已同步 {time}', { time: fmtListTime(st.last_sync_at) }), cls: 'st-ok', busy: false }
+  if (st.state === 'idle') return { text: t('已同步 {time}', { time: fmtListTime(st.last_sync_at) }), color: 'secondary-container' }
   if (st.state === 'syncing' || st.state === 'connecting')
-    return { text: t('同步中'), cls: 'st-busy', busy: true }
-  if (st.state === 'repair') return { text: t('需要手动修复'), cls: 'st-err', busy: false }
-  if (st.state === 'error') return { text: t('同步失败'), cls: 'st-err', busy: false }
-  return { text: t('未同步'), cls: 'st-busy', busy: false }
+    return { text: t('同步中'), color: 'surface-container-high' }
+  if (st.state === 'repair') return { text: t('需要手动修复'), color: 'error-container' }
+  if (st.state === 'error') return { text: t('同步失败'), color: 'error-container' }
+  return { text: t('未同步'), color: 'surface-container-high' }
 }
 
 const props = defineProps({
@@ -94,7 +94,26 @@ function statusText(a) {
 
 const reconnecting = ref(null)
 
+const rcOpen = ref(false)
+const rcTarget = ref(null)
+const rcForm = ref({ password: '', mailbox_password: '', totp: '', captcha_token: '' })
+const rcNeedsTotp = ref(false)
+const rcNeedsCaptcha = ref(false)
+const rcCaptchaUrl = ref('')
+const rcError = ref('')
+const rcBusy = ref(false)
+
 async function reconnect(a) {
+  if (a.kind === 'proton') {
+    rcTarget.value = a
+    rcForm.value = { password: '', mailbox_password: '', totp: '', captcha_token: '' }
+    rcNeedsTotp.value = false
+    rcNeedsCaptcha.value = false
+    rcCaptchaUrl.value = ''
+    rcError.value = ''
+    rcOpen.value = true
+    return
+  }
   reconnecting.value = a.id
   try {
     await api.reconnectAccount(a.id)
@@ -104,6 +123,42 @@ async function reconnect(a) {
     showSnack(t('重新连接失败：{error}', { error: err.message }))
   } finally {
     reconnecting.value = null
+  }
+}
+
+async function rcSubmit() {
+  if (!rcTarget.value || rcBusy.value) return
+  rcBusy.value = true
+  rcError.value = ''
+  const sentToken = rcForm.value.captcha_token
+  try {
+    const res = await api.reconnectAccount(rcTarget.value.id, { ...rcForm.value })
+    if (res && res.needs_captcha) {
+      rcForm.value.captcha_token = res.captcha_token
+      rcCaptchaUrl.value = res.captcha_url
+      rcNeedsCaptcha.value = true
+      return
+    }
+    if (sentToken && rcForm.value.captcha_token === sentToken) {
+      rcForm.value.captcha_token = ''
+      rcCaptchaUrl.value = ''
+      rcNeedsCaptcha.value = false
+    }
+    if (res && res.needs_totp) {
+      rcNeedsTotp.value = true
+      rcError.value = t('该账号开启了两步验证，请输入验证码')
+      return
+    }
+    rcOpen.value = false
+    showSnack(t('已重新连接'))
+    emit('changed')
+  } catch (err) {
+    if (sentToken && rcForm.value.captcha_token === sentToken) {
+      rcForm.value.captcha_token = ''
+    }
+    rcError.value = err.message
+  } finally {
+    rcBusy.value = false
   }
 }
 
@@ -164,6 +219,7 @@ function openCreate() {
   needsTotp.value = false
   needsCaptcha.value = false
   captchaUrl.value = ''
+  captchaCtx = ''
   resetTestState()
   dialogOpen.value = true
 }
@@ -175,6 +231,7 @@ function openEdit(a) {
   needsTotp.value = false
   needsCaptcha.value = false
   captchaUrl.value = ''
+  captchaCtx = ''
   resetTestState()
   dialogOpen.value = true
 }
@@ -192,11 +249,32 @@ function resetTestState() {
   testResult.value = ''
 }
 
+let captchaCtx = ''
+
+function captchaFingerprint() {
+  return JSON.stringify([form.value.email, form.value.password, form.value.mailbox_password, form.value.totp])
+}
+
+function consumeCaptcha(sentToken) {
+  if (sentToken && form.value.captcha_token === sentToken) {
+    form.value.captcha_token = ''
+    captchaUrl.value = ''
+    needsCaptcha.value = false
+    captchaCtx = ''
+  }
+}
+
 watch(
   form,
   () => {
     testOk.value = false
     testResult.value = ''
+    if (form.value.captcha_token && captchaCtx && captchaFingerprint() !== captchaCtx) {
+      form.value.captcha_token = ''
+      captchaUrl.value = ''
+      needsCaptcha.value = false
+      captchaCtx = ''
+    }
   },
   { deep: true },
 )
@@ -211,6 +289,7 @@ async function submit(mode) {
   }
   delete payload.id
   const isTest = mode === 'test'
+  const sentToken = payload.captcha_token
   let run = 0
   if (isTest) {
     run = ++testRun
@@ -229,12 +308,14 @@ async function submit(mode) {
     }
     if (isTest && run !== testRun) return
     if (res && res.needs_captcha) {
-      if (form.value.captcha_token) showSnack(t('验证已过期，已生成新的验证链接'))
+      if (sentToken) showSnack(t('验证已过期，已生成新的验证链接'))
       form.value.captcha_token = res.captcha_token
       captchaUrl.value = res.captcha_url
+      captchaCtx = captchaFingerprint()
       needsCaptcha.value = true
       return
     }
+    consumeCaptcha(sentToken)
     if (res && res.needs_totp) {
       needsTotp.value = true
       formError.value = t('该账号开启了两步验证，请输入验证码')
@@ -247,6 +328,7 @@ async function submit(mode) {
     dialogOpen.value = false
     emit('changed')
   } catch (err) {
+    consumeCaptcha(sentToken)
     if (isTest && run !== testRun) return
     if (isTest) {
       formError.value = t('连接失败：{error}', { error: err.message })
@@ -592,17 +674,16 @@ onMounted(() => {
 <template>
   <div class="settings-root">
     <nav v-if="lgAndUp" class="settings-nav">
-      <button
-        v-for="s in SECTIONS"
-        :key="s.key"
-        type="button"
-        class="settings-nav-item"
-        :class="{ 'nav-on': activeSection === s.key }"
-        @click="activeSection = s.key"
-      >
-        <v-icon :icon="s.icon" size="20" />
-        <span>{{ s.label }}</span>
-      </button>
+      <v-list nav density="comfortable" class="pa-0 bg-transparent">
+        <v-list-item
+          v-for="s in SECTIONS"
+          :key="s.key"
+          :prepend-icon="s.icon"
+          :title="s.label"
+          :active="activeSection === s.key"
+          @click="activeSection = s.key"
+        />
+      </v-list>
     </nav>
     <div class="settings-content">
     <section v-if="showSection('accounts')">
@@ -612,18 +693,13 @@ onMounted(() => {
     </div>
 
     <template v-if="accountsStatus === 'loading'">
-      <div class="d-flex flex-column ga-3">
-        <v-card v-for="i in 4" :key="i" variant="outlined" rounded="lg">
+      <div v-if="lgAndUp" class="acct-list">
+        <v-skeleton-loader :type="'list-item-avatar-three-line@' + (accounts.length || 5)" />
+      </div>
+      <div v-else class="d-flex flex-column ga-3">
+        <v-card v-for="i in (accounts.length || 3)" :key="i" variant="outlined">
           <v-card-text>
-            <div class="d-flex align-start ga-2">
-              <div class="flex-grow-1" style="min-width: 0">
-                <v-skeleton-loader type="text" width="40%" />
-                <v-skeleton-loader type="text" width="62%" />
-              </div>
-              <v-skeleton-loader type="avatar" width="32" height="32" />
-              <v-skeleton-loader type="avatar" width="32" height="32" />
-            </div>
-            <v-skeleton-loader type="text" width="55%" class="mt-2" />
+            <v-skeleton-loader type="list-item-three-line" />
           </v-card-text>
         </v-card>
       </div>
@@ -670,10 +746,9 @@ onMounted(() => {
             </v-btn>
           </div>
         </div>
-        <span v-if="statusChip(a)" class="acct-chip" :class="statusChip(a).cls">
+        <v-chip v-if="statusChip(a)" size="small" variant="flat" :color="statusChip(a).color" class="flex-none">
           {{ statusChip(a).text }}
-          <v-progress-linear v-if="statusChip(a).busy" indeterminate height="2" class="acct-chip-bar" />
-        </span>
+        </v-chip>
         <v-menu>
           <template #activator="{ props: mp }">
             <v-btn v-bind="mp" icon="mdi-dots-vertical" variant="text" size="small" :aria-label="t('更多')" />
@@ -686,7 +761,7 @@ onMounted(() => {
       </div>
     </div>
     <div v-else class="d-flex flex-column ga-3">
-      <v-card v-for="a in accounts" :key="a.id" variant="outlined" rounded="lg">
+      <v-card v-for="a in accounts" :key="a.id" variant="outlined">
         <v-card-text>
           <div class="d-flex align-start">
             <div style="min-width: 0">
@@ -872,8 +947,9 @@ onMounted(() => {
 
     </section>
 
-    <section v-if="showSection('telegram')" class="settings-sec">
-    <h2 class="text-h6 mb-3">{{ t('Telegram 推送') }}</h2>
+    <section v-if="showSection('push')" class="settings-sec">
+    <h2 class="text-h6 mb-3">{{ t('推送') }}</h2>
+    <div class="text-subtitle-1 font-weight-medium mb-3">Telegram</div>
     <template v-if="tgStatus === 'loading'">
       <v-skeleton-loader type="article" max-width="640" />
     </template>
@@ -914,7 +990,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <h2 class="text-h6 mb-3 mt-8">{{ t('浏览器推送') }}</h2>
+    <div class="text-subtitle-1 font-weight-medium mb-3 mt-8">{{ t('浏览器推送') }}</div>
     <template v-if="wpStatus === 'loading'">
       <v-skeleton-loader type="article" max-width="640" />
     </template>
@@ -958,7 +1034,7 @@ onMounted(() => {
   </div>
 
   <v-dialog v-model="dialogOpen" max-width="560">
-    <v-card style="border-radius: 28px">
+    <v-card>
       <v-card-title>{{ editing ? t('编辑账号') : t('添加账号') }}</v-card-title>
       <v-card-text>
         <v-form @submit.prevent="save">
@@ -1092,6 +1168,52 @@ onMounted(() => {
     </v-card>
   </v-dialog>
 
+  <v-dialog v-model="rcOpen" max-width="480">
+    <v-card>
+      <v-card-title>{{ t('重新连接') }}</v-card-title>
+      <v-card-text>
+        <p class="text-body-2 mb-3">{{ rcTarget?.label }}（{{ rcTarget?.email }}）</p>
+        <v-text-field
+          v-model="rcForm.password"
+          :label="t('登录密码')"
+          type="password"
+          variant="outlined"
+          density="comfortable"
+          class="mb-2"
+        />
+        <v-text-field
+          v-model="rcForm.mailbox_password"
+          :label="t('邮箱密码（可选）')"
+          type="password"
+          variant="outlined"
+          density="comfortable"
+          :placeholder="t('留空 = 与登录密码相同')"
+          class="mb-2"
+        />
+        <v-text-field
+          v-if="rcNeedsTotp"
+          v-model="rcForm.totp"
+          :label="t('两步验证码')"
+          variant="outlined"
+          density="comfortable"
+          class="mb-2"
+        />
+        <div v-if="rcNeedsCaptcha" class="d-flex flex-column flex-sm-row align-stretch align-sm-center ga-2 mb-2">
+          <v-btn :href="rcCaptchaUrl" target="_blank" rel="noopener" color="primary" variant="tonal" prepend-icon="mdi-open-in-new">
+            {{ t('打开人机验证') }}
+          </v-btn>
+          <v-btn variant="outlined" :loading="rcBusy" @click="rcSubmit">{{ t('已完成验证') }}</v-btn>
+        </div>
+        <v-alert v-if="rcError" type="error" variant="tonal" density="compact">{{ rcError }}</v-alert>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="rcOpen = false">{{ t('取消') }}</v-btn>
+        <v-btn color="primary" :loading="rcBusy" @click="rcSubmit">{{ t('重新连接') }}</v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
   <v-dialog v-model="deleteOpen" max-width="440">
     <v-card>
       <v-card-title>{{ t('删除账号') }}</v-card-title>
@@ -1114,37 +1236,16 @@ onMounted(() => {
 <style>
 .settings-root {
   display: flex;
-  align-items: flex-start;
+  align-items: stretch;
   width: 100%;
+  height: 100%;
+  min-height: 0;
 }
 .settings-nav {
   width: 240px;
   flex: none;
-  position: sticky;
-  top: 0;
   padding: 16px 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.settings-nav-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  height: 44px;
-  padding: 0 16px;
-  border: none;
-  background: transparent;
-  border-radius: 999px;
-  font-size: 14px;
-  color: rgb(var(--v-theme-on-surface));
-  cursor: pointer;
-  text-align: left;
-}
-.settings-nav-item.nav-on {
-  background: rgb(var(--v-theme-primary-container));
-  color: rgb(var(--v-theme-on-primary-container));
-  font-weight: 600;
+  overflow-y: auto;
 }
 .settings-content {
   flex: 1;
@@ -1152,6 +1253,8 @@ onMounted(() => {
   max-width: 880px;
   margin-inline: auto;
   padding: 16px;
+  overflow-y: auto;
+  min-height: 0;
 }
 .settings-sec {
   margin-top: 24px;
@@ -1202,31 +1305,5 @@ onMounted(() => {
   color: rgb(var(--v-theme-error));
   font-weight: 500;
 }
-.acct-chip {
-  position: relative;
-  flex: none;
-  border-radius: 999px;
-  padding: 4px 10px 6px;
-  font-size: 12px;
-  font-weight: 500;
-  overflow: hidden;
-}
-.acct-chip.st-ok {
-  background: rgb(var(--v-theme-secondary-container));
-  color: rgb(var(--v-theme-on-secondary-container));
-}
-.acct-chip.st-busy {
-  background: rgb(var(--v-theme-surface-container-high));
-  color: rgb(var(--v-theme-on-surface));
-}
-.acct-chip.st-err {
-  background: rgb(var(--v-theme-error-container));
-  color: rgb(var(--v-theme-on-error-container));
-}
-.acct-chip-bar {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-}
+
 </style>

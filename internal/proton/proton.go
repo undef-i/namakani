@@ -97,7 +97,7 @@ func (e *AuthTerminalError) Unwrap() error { return e.Err }
 var apiCodePattern = regexp.MustCompile(`\[(\d+)\]`)
 
 func humanVerificationReason(err error) string {
-	return "Proton 要求人工验证，在应用里反复重连也过不去。请先在 Proton 官方网页或应用里完成一次登录验证，回来后点「重新连接」。（" + err.Error() + "）"
+	return "Proton 要求完成人机验证。请点「重新连接」，在打开的窗口里输入密码并完成验证。（" + err.Error() + "）"
 }
 
 func ClassifyError(err error) (bool, string) {
@@ -114,23 +114,23 @@ func ClassifyError(err error) (bool, string) {
 		case 9001:
 			return true, humanVerificationReason(err)
 		case 10013:
-			return true, "Proton 登录令牌已被吊销，自动重连不可能成功。请点「重新连接」重新登录。（" + err.Error() + "）"
+			return true, "保存的登录凭据已被拒绝（登录令牌已吊销），请点「重新连接」重新登录。（" + err.Error() + "）"
 		}
 		return false, ""
 	}
 	if errors.Is(err, auth.ErrUnauthorized) {
-		return true, "保存的登录凭据已被拒绝，自动重连不可能成功。请在设置里更新密码后点「重新连接」。（" + err.Error() + "）"
+		return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。（" + err.Error() + "）"
 	}
 	msg := err.Error()
 	if strings.Contains(msg, "two factor authentication enabled") {
-		return true, "该账号开启了两步验证，自动重连无法完成。请在设置里更新该账号重新授权。（" + msg + "）"
+		return true, "登录需要两步验证码。请点「重新连接」，在打开的窗口里输入验证码。（" + msg + "）"
 	}
 	if strings.Contains(msg, "cannot re-authenticate") {
 		if strings.Contains(msg, "[9001]") {
 			return true, humanVerificationReason(err)
 		}
 		if apiCodePattern.MatchString(msg) {
-			return true, "Proton 拒绝了用保存凭据重新登录，自动重连不可能成功。请在设置里更新密码后点「重新连接」。（" + msg + "）"
+			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。（" + msg + "）"
 		}
 	}
 	return false, ""
