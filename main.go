@@ -39,8 +39,12 @@ func main() {
 	}
 
 	mgr := syncmgr.NewManager(st)
-	mgr.RecomputeSnippets()
 	srv := api.New(st, uiFS, mgr)
+	if mgr.SnippetsCurrent() {
+		log.Printf("snippet recompute: skipped, algorithm version current")
+	} else {
+		go mgr.RecomputeSnippets()
+	}
 	log.Printf("namakani listening on %s (data: %s)", *addr, *dataDir)
 	log.Fatal(http.ListenAndServe(*addr, srv.Handler()))
 }

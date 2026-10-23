@@ -178,6 +178,8 @@ var snippetGreetRes = []*regexp.Regexp{
 	regexp.MustCompile(`^(大家好|您好|你好)[，,：:!！]?\s*$`),
 }
 
+const SnippetVersion = 1
+
 func MakeSnippet(text, htmlBody string) string {
 	if s := snippetClean(text); s != "" {
 		return s

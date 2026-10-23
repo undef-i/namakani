@@ -2,9 +2,17 @@ package sync
 
 import (
 	"log"
+	"strconv"
 
 	"namakani/internal/mail"
 )
+
+const snippetVersionKey = "snippet_algo_version"
+
+func (m *Manager) SnippetsCurrent() bool {
+	v, ok, err := m.st.GetSetting(snippetVersionKey)
+	return err == nil && ok && v == strconv.Itoa(mail.SnippetVersion)
+}
 
 func (m *Manager) RecomputeSnippets() {
 	var lastID int64
@@ -47,6 +55,9 @@ func (m *Manager) RecomputeSnippets() {
 				}
 			}
 		}
+	}
+	if err := m.st.SetSetting(snippetVersionKey, strconv.Itoa(mail.SnippetVersion)); err != nil {
+		log.Printf("snippet recompute: stamp version: %v", err)
 	}
 	log.Printf("snippet recompute: %d/%d updated", changed, total)
 }
