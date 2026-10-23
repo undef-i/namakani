@@ -657,6 +657,21 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 				highestModSeq = msg.ModSeq
 			}
 		}
+		lister, ok := cl.(mail.UIDLister)
+		if !ok {
+			return change, fmt.Errorf("connection claims CONDSTORE but cannot list uids")
+		}
+		uids, err := lister.FetchUIDs()
+		if err != nil {
+			return change, fmt.Errorf("fetch uids: %w", err)
+		}
+		seen := make(map[uint32]bool, len(uids))
+		for _, uid := range uids {
+			seen[uid] = true
+		}
+		if err := m.reconcileDeletions(folderID, seen, &change); err != nil {
+			return change, err
+		}
 	} else {
 		all, err := cl.FetchFlags(0)
 		if err != nil {
@@ -678,22 +693,29 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 				highestModSeq = msg.ModSeq
 			}
 		}
-		local, err := m.st.FolderUIDs(folderID)
-		if err != nil {
+		if err := m.reconcileDeletions(folderID, seen, &change); err != nil {
 			return change, err
-		}
-		for uid := range local {
-			if !seen[uid] {
-				if id, ok := m.st.LocalID(folderID, uid); ok {
-					change.Removed = append(change.Removed, id)
-				}
-				if err := m.st.DeleteMessage(folderID, uid); err != nil {
-					return change, err
-				}
-			}
 		}
 	}
 
 	err = m.st.UpdateFolderSync(folderID, sel.UIDValidity, uidNext, highestModSeq, int(sel.NumMessages))
 	return change, err
+}
+
+func (m *Manager) reconcileDeletions(folderID int64, seen map[uint32]bool, change *Change) error {
+	local, err := m.st.FolderUIDs(folderID)
+	if err != nil {
+		return err
+	}
+	for uid := range local {
+		if !seen[uid] {
+			if id, ok := m.st.LocalID(folderID, uid); ok {
+				change.Removed = append(change.Removed, id)
+			}
+			if err := m.st.DeleteMessage(folderID, uid); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

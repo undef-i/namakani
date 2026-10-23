@@ -14,6 +14,10 @@ type BodyPrefetcher interface {
 	PrefetchBodies(uids []uint32) error
 }
 
+type UIDLister interface {
+	FetchUIDs() ([]uint32, error)
+}
+
 type SelectData struct {
 	UIDValidity uint32
 	UIDNext     uint32

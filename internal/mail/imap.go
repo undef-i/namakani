@@ -512,3 +512,16 @@ func (cl *Client) FetchFlags(changedSince uint64) ([]Msg, error) {
 	}
 	return cl.fetch(set, opts)
 }
+
+func (cl *Client) FetchUIDs() ([]uint32, error) {
+	data, err := cl.c.UIDSearch(&imap.SearchCriteria{}, nil).Wait()
+	if err != nil {
+		return nil, err
+	}
+	uids := data.AllUIDs()
+	out := make([]uint32, len(uids))
+	for i, u := range uids {
+		out[i] = uint32(u)
+	}
+	return out, nil
+}
