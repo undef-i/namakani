@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date_ts DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder_id, uid);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_key);
+CREATE INDEX IF NOT EXISTS idx_messages_acct_thread ON messages(account_id, thread_key, date_ts DESC, id DESC);
 CREATE TABLE IF NOT EXISTS bodies (
 	message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
 	text_body  TEXT NOT NULL DEFAULT '',

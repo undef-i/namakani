@@ -1343,50 +1343,106 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if q.Get("threaded") == "1" {
-		keyExpr := `COALESCE(NULLIF(m.thread_key, ''), 'id:' || m.id)`
-		query := `WITH agg AS (
-				SELECT m.account_id AS acct, ` + keyExpr + ` AS tk,
-					COUNT(*) AS cnt,
-					SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END) AS unread
-				FROM messages m JOIN folders f ON f.id = m.folder_id
-				WHERE ` + where + ` GROUP BY m.account_id, tk
-			),
-			ranked AS (
-				SELECT m.id AS mid,
-					ROW_NUMBER() OVER (PARTITION BY m.account_id, ` + keyExpr + `
-						ORDER BY m.date_ts DESC, m.id DESC) AS rn
-				FROM messages m JOIN folders f ON f.id = m.folder_id
-				WHERE ` + where + `
-			)
-			SELECT ` + messageCols + `, agg.cnt, agg.unread
-			` + messageJoins + `
-			JOIN ranked ON ranked.mid = m.id AND ranked.rn = 1
-			JOIN agg ON agg.acct = m.account_id AND agg.tk = ` + keyExpr + `
-			ORDER BY m.date_ts DESC, m.id DESC LIMIT ? OFFSET ?`
-		dbArgs := append(append(append([]any{}, args...), args...), limit, offset)
-		dbRows, err := s.st.DB.Query(query, dbArgs...)
+		type pageThread struct {
+			acct   int64
+			tk     string
+			cnt    int
+			unread int
+			lastTS int64
+			tieID  int64
+			repID  int64
+		}
+		var threads []pageThread
+		kRows, err := s.st.DB.Query(`SELECT m.account_id, m.thread_key, COUNT(*),
+				COALESCE(SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END), 0),
+				MAX(m.date_ts), MAX(m.id)
+			FROM messages m JOIN folders f ON f.id = m.folder_id
+			WHERE `+where+` AND m.thread_key <> ''
+			GROUP BY m.account_id, m.thread_key
+			ORDER BY MAX(m.date_ts) DESC, MAX(m.id) DESC`, args...)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "list threads failed")
 			return
 		}
-		defer dbRows.Close()
-		out := []threadOut{}
-		for dbRows.Next() {
-			var to threadOut
-			var fromJSON string
-			var hasAttach int
-			if err := dbRows.Scan(&to.ID, &to.AccountID, &to.AccountLabel, &to.FolderID, &to.FolderName,
-				&to.FolderSpecial, &to.ThreadKey, &to.Subject, &fromJSON, &to.DateTS, &to.Flags,
-				&hasAttach, &to.Snippet, &to.Size, &to.ThreadCount, &to.ThreadUnread); err != nil {
+		for kRows.Next() {
+			var t pageThread
+			if err := kRows.Scan(&t.acct, &t.tk, &t.cnt, &t.unread, &t.lastTS, &t.tieID); err != nil {
+				kRows.Close()
 				writeErr(w, http.StatusInternalServerError, "list threads failed")
 				return
 			}
-			to.HasAttach = hasAttach != 0
-			var addrs []mail.Addr
-			if err := json.Unmarshal([]byte(fromJSON), &addrs); err == nil && len(addrs) > 0 {
-				to.FromName = addrs[0].Name
-				to.FromEmail = addrs[0].Email
+			threads = append(threads, t)
+		}
+		kRows.Close()
+		if err := kRows.Err(); err != nil {
+			writeErr(w, http.StatusInternalServerError, "list threads failed")
+			return
+		}
+		sRows, err := s.st.DB.Query(`SELECT m.id, m.account_id, m.date_ts,
+				CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END
+			`+messageJoins+`
+			WHERE `+where+` AND m.thread_key = ''
+			ORDER BY m.date_ts DESC, m.id DESC`, args...)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "list threads failed")
+			return
+		}
+		for sRows.Next() {
+			var t pageThread
+			if err := sRows.Scan(&t.repID, &t.acct, &t.lastTS, &t.unread); err != nil {
+				sRows.Close()
+				writeErr(w, http.StatusInternalServerError, "list threads failed")
+				return
 			}
+			t.tk = "id:" + strconv.FormatInt(t.repID, 10)
+			t.cnt = 1
+			t.tieID = t.repID
+			threads = append(threads, t)
+		}
+		sRows.Close()
+		if err := sRows.Err(); err != nil {
+			writeErr(w, http.StatusInternalServerError, "list threads failed")
+			return
+		}
+		sort.Slice(threads, func(i, j int) bool {
+			if threads[i].lastTS != threads[j].lastTS {
+				return threads[i].lastTS > threads[j].lastTS
+			}
+			return threads[i].tieID > threads[j].tieID
+		})
+		if offset > len(threads) {
+			offset = len(threads)
+		}
+		end := offset + limit
+		if end > len(threads) {
+			end = len(threads)
+		}
+		page := threads[offset:end]
+		repIDs := make([]int64, 0, len(page))
+		for i := range page {
+			if page[i].repID == 0 {
+				var id int64
+				if err := s.st.DB.QueryRow(`SELECT id FROM messages
+					WHERE account_id = ? AND thread_key = ?
+					ORDER BY date_ts DESC, id DESC LIMIT 1`, page[i].acct, page[i].tk).Scan(&id); err != nil {
+					writeErr(w, http.StatusInternalServerError, "list threads failed")
+					return
+				}
+				page[i].repID = id
+			}
+			repIDs = append(repIDs, page[i].repID)
+		}
+		byID := make(map[int64]messageOut, len(repIDs))
+		for _, mo := range s.messageRowsByIDs(repIDs) {
+			byID[mo.ID] = mo
+		}
+		out := []threadOut{}
+		for _, t := range page {
+			mo, ok := byID[t.repID]
+			if !ok {
+				continue
+			}
+			to := threadOut{messageOut: mo, ThreadCount: t.cnt, ThreadUnread: t.unread}
 			if to.ThreadKey == "" {
 				to.ThreadKey = "id:" + strconv.FormatInt(to.ID, 10)
 			}
