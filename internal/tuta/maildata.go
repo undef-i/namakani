@@ -153,7 +153,7 @@ func (s *Session) listFolders() ([]tutaFolder, error) {
 		if err != nil {
 			return nil, err
 		}
-		mailboxID := root.str("699")
+		mailboxID := root.assocID("699")
 		if mailboxID == "" {
 			continue
 		}
@@ -165,7 +165,7 @@ func (s *Session) listFolders() ([]tutaFolder, error) {
 		if ref == nil {
 			continue
 		}
-		setsList := ref.str("442")
+		setsList := ref.assocID("442")
 		if setsList == "" {
 			continue
 		}
@@ -185,9 +185,9 @@ func (s *Session) listFolders() ([]tutaFolder, error) {
 				kind:      kind,
 				groupID:   groupID,
 				setListID: setsList,
-				entriesID: set.str("1459"),
+				entriesID: set.assocID("1459"),
 			}
-			f.setID = set.str("431")
+			f.setID = set.elemID("431")
 			if sys, ok := systemFolderNames[kind]; ok {
 				f.name = sys.name
 				f.special = sys.special

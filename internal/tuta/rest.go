@@ -2,10 +2,12 @@ package tuta
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -51,6 +53,13 @@ func (in instance) agg(key string) instance {
 	if v, ok := in[key].(map[string]any); ok {
 		return instance(v)
 	}
+	if v, ok := in[key].([]any); ok {
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				return instance(m)
+			}
+		}
+	}
 	return nil
 }
 
@@ -83,6 +92,21 @@ func (in instance) idList(key string) []string {
 		}
 	}
 	return out
+}
+
+func (in instance) assocID(key string) string {
+	ids := in.idList(key)
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
+}
+
+func (in instance) elemID(key string) string {
+	if _, el, ok := in.idTuple(key); ok {
+		return el
+	}
+	return in.str(key)
 }
 
 func (in instance) idTuple(key string) (string, string, bool) {
@@ -121,13 +145,31 @@ func b64decode(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
 }
 
+const (
+	dialTimeout           = 10 * time.Second
+	tlsHandshakeTimeout   = 10 * time.Second
+	responseHeaderTimeout = 20 * time.Second
+)
+
 type restClient struct {
 	http        *http.Client
 	accessToken string
+	ctx         context.Context
 }
 
 func newRestClient() *restClient {
-	return &restClient{http: &http.Client{Timeout: 60 * time.Second}}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ExpectContinueTimeout: time.Second,
+		MaxIdleConnsPerHost:   4,
+	}
+	return &restClient{http: &http.Client{Transport: transport}}
 }
 
 type restRequest struct {
@@ -155,7 +197,11 @@ func (c *restClient) do(req restRequest) ([]byte, int, error) {
 	if req.body != nil {
 		bodyReader = bytes.NewReader(req.body)
 	}
-	httpReq, err := http.NewRequest(req.method, u, bodyReader)
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, req.method, u, bodyReader)
 	if err != nil {
 		return nil, 0, err
 	}

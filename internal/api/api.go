@@ -66,6 +66,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/logout", s.authOnly(s.handleLogout))
 	mux.HandleFunc("GET /api/accounts", s.authOnly(s.handleListAccounts))
 	mux.HandleFunc("POST /api/accounts", s.authOnly(s.handleCreateAccount))
+	mux.HandleFunc("POST /api/accounts/test", s.authOnly(s.handleTestAccountForm))
 	mux.HandleFunc("PUT /api/accounts/{id}", s.authOnly(s.handleUpdateAccount))
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.authOnly(s.handleDeleteAccount))
 	mux.HandleFunc("POST /api/accounts/{id}/test", s.authOnly(s.handleTestAccount))
@@ -620,15 +621,18 @@ func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accoun
 		writeErr(w, http.StatusBadRequest, "label, email and password are required")
 		return
 	}
+	start := time.Now()
 	userID, accessToken, err := tuta.Authorize(in.Email, in.Password, in.TOTP)
 	if err == tuta.ErrTOTPRequired {
 		writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
 		return
 	}
 	if err != nil {
+		log.Printf("tuta: create account authorize failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	log.Printf("tuta: create account authorize ok in %s", time.Since(start).Round(time.Millisecond))
 	enc, err := auth.Encrypt(key, in.Password)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "encrypt failed")
@@ -668,15 +672,18 @@ func (s *Server) updateTutaAccount(w http.ResponseWriter, r *http.Request, key [
 	}
 	idNum, _ := strconv.ParseInt(id, 10, 64)
 	if in.Password != "" {
+		start := time.Now()
 		userID, accessToken, err := tuta.Authorize(in.Email, in.Password, in.TOTP)
 		if err == tuta.ErrTOTPRequired {
 			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
 			return
 		}
 		if err != nil {
+			log.Printf("tuta: update account %d authorize failed after %s: %v", idNum, time.Since(start).Round(time.Millisecond), err)
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		log.Printf("tuta: update account %d authorize ok in %s", idNum, time.Since(start).Round(time.Millisecond))
 		enc, err := auth.Encrypt(key, in.Password)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "encrypt failed")
@@ -752,6 +759,223 @@ func (s *Server) startAllWorkers(key []byte) {
 	}
 }
 
+type accountTestIn struct {
+	accountIn
+	ID int64 `json:"id"`
+}
+
+type testSideResult struct {
+	OK      bool   `json:"ok"`
+	Folders int    `json:"folders,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+func (s *Server) handleTestAccountForm(w http.ResponseWriter, r *http.Request) {
+	key, _ := s.credentialKey(r)
+	var in accountTestIn
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if in.Kind == "proton" {
+		s.testProtonAccount(w, key, &in)
+		return
+	}
+	if in.Kind == "tuta" {
+		s.testTutaAccount(w, key, &in)
+		return
+	}
+	s.testIMAPAccount(w, key, &in)
+}
+
+func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
+	if strings.TrimSpace(in.ImapHost) == "" || strings.TrimSpace(in.SmtpHost) == "" ||
+		strings.TrimSpace(in.Username) == "" {
+		writeErr(w, http.StatusBadRequest, "hosts and username are required")
+		return
+	}
+	if !auth.ValidTLSMode(in.ImapTLS) || !auth.ValidTLSMode(in.SmtpTLS) {
+		writeErr(w, http.StatusBadRequest, "tls mode must be tls, starttls or none")
+		return
+	}
+	imapPort, err := auth.ParsePort(in.ImapPort)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	smtpPort, err := auth.ParsePort(in.SmtpPort)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	password := in.Password
+	if password == "" && in.ID > 0 {
+		stored, err := s.loadMailAccount(in.ID, key)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "stored credentials unavailable")
+			return
+		}
+		password = stored.Password
+	}
+	if password == "" {
+		writeErr(w, http.StatusBadRequest, "password is required")
+		return
+	}
+	acct := mail.Account{
+		Label:         in.Label,
+		Email:         in.Email,
+		ImapHost:      in.ImapHost,
+		ImapPort:      imapPort,
+		ImapTLS:       in.ImapTLS,
+		SMTPHost:      in.SmtpHost,
+		SMTPPort:      smtpPort,
+		SMTPTLS:       in.SmtpTLS,
+		Username:      in.Username,
+		Password:      password,
+		TLSSkipVerify: in.TLSSkipVerify,
+	}
+	imapRes := testSideResult{}
+	if cl, err := mail.Connect(acct, nil); err != nil {
+		imapRes.Error = err.Error()
+	} else {
+		folders, ferr := cl.ListFolders()
+		cl.Close()
+		if ferr != nil {
+			imapRes.Error = "list folders: " + ferr.Error()
+		} else {
+			imapRes.OK = true
+			imapRes.Folders = len(folders)
+		}
+	}
+	smtpRes := testSideResult{}
+	if err := mail.TestSMTP(acct); err != nil {
+		smtpRes.Error = err.Error()
+	} else {
+		smtpRes.OK = true
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"imap": imapRes, "smtp": smtpRes})
+}
+
+func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
+	if strings.TrimSpace(in.Email) == "" {
+		writeErr(w, http.StatusBadRequest, "email is required")
+		return
+	}
+	if in.Password == "" {
+		if in.ID <= 0 {
+			writeErr(w, http.StatusBadRequest, "password is required")
+			return
+		}
+		s.testProtonStored(w, key, in.ID)
+		return
+	}
+	if _, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken); err != nil {
+		if err == proton.ErrTOTPRequired {
+			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
+			return
+		}
+		var capErr *proton.CaptchaError
+		if errors.As(err, &capErr) {
+			writeJSON(w, http.StatusOK, map[string]any{"needs_captcha": true, "captcha_url": capErr.URL, "captcha_token": capErr.Token})
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) testProtonStored(w http.ResponseWriter, key []byte, id int64) {
+	acct, err := s.loadMailAccount(id, key)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "stored credentials unavailable")
+		return
+	}
+	cl, err := proton.Connect(s.st, acct)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer cl.Close()
+	folders, err := cl.ListFolders()
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders)})
+}
+
+func (s *Server) testTutaAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
+	if strings.TrimSpace(in.Email) == "" {
+		writeErr(w, http.StatusBadRequest, "email is required")
+		return
+	}
+	if in.Password == "" {
+		if in.ID <= 0 {
+			writeErr(w, http.StatusBadRequest, "password is required")
+			return
+		}
+		s.testTutaStored(w, key, in.ID)
+		return
+	}
+	start := time.Now()
+	if _, _, err := tuta.Authorize(in.Email, in.Password, in.TOTP); err != nil {
+		if err == tuta.ErrTOTPRequired {
+			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
+			return
+		}
+		log.Printf("tuta: test authorize failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	log.Printf("tuta: test authorize ok in %s", time.Since(start).Round(time.Millisecond))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+const listFoldersTimeout = 45 * time.Second
+
+func listFoldersBounded(cl mail.Conn, d time.Duration) ([]mail.FolderInfo, error) {
+	type result struct {
+		folders []mail.FolderInfo
+		err     error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		folders, err := cl.ListFolders()
+		ch <- result{folders, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.folders, r.err
+	case <-time.After(d):
+		return nil, errors.New("list folders timed out")
+	}
+}
+
+func (s *Server) testTutaStored(w http.ResponseWriter, key []byte, id int64) {
+	start := time.Now()
+	acct, err := s.loadMailAccount(id, key)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "stored credentials unavailable")
+		return
+	}
+	cl, err := tuta.Connect(s.st, acct)
+	if err != nil {
+		log.Printf("tuta: test stored account %d connect failed after %s: %v", id, time.Since(start).Round(time.Millisecond), err)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer cl.Close()
+	folders, err := listFoldersBounded(cl, listFoldersTimeout)
+	if err != nil {
+		log.Printf("tuta: test stored account %d list folders failed after %s: %v", id, time.Since(start).Round(time.Millisecond), err)
+		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		return
+	}
+	log.Printf("tuta: test stored account %d ok in %s (%d folders)", id, time.Since(start).Round(time.Millisecond), len(folders))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders)})
+}
+
 func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -778,8 +1002,16 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cl.Close()
 	caps := cl.Capabilities()
-	folders, err := cl.ListFolders()
+	var folders []mail.FolderInfo
+	if acct.Kind == "tuta" {
+		folders, err = listFoldersBounded(cl, listFoldersTimeout)
+	} else {
+		folders, err = cl.ListFolders()
+	}
 	if err != nil {
+		if acct.Kind == "tuta" {
+			log.Printf("tuta: test account %d list folders failed: %v", id, err)
+		}
 		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
 		return
 	}
@@ -1048,13 +1280,30 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+type turnConn struct {
+	mail.Conn
+	end func()
+}
+
+func (c *turnConn) Close() {
+	c.Conn.Close()
+	if c.end != nil {
+		c.end()
+		c.end = nil
+	}
+}
+
 func (s *Server) openConn(key []byte, accountID int64) (mail.Conn, error) {
 	acct, err := s.loadMailAccount(accountID, key)
 	if err != nil {
 		return nil, err
 	}
 	if acct.Kind == "proton" {
-		return proton.Connect(s.st, acct)
+		sess, err := proton.Connect(s.st, acct)
+		if err != nil {
+			return nil, err
+		}
+		return &turnConn{Conn: sess, end: sess.UserTurn()}, nil
 	}
 	if acct.Kind == "tuta" {
 		return tuta.Connect(s.st, acct)

@@ -32,10 +32,6 @@ func (m *Manager) repairThreads(ctx context.Context, cl mail.Conn, acct mail.Acc
 			return
 		}
 		group := byFolder[fname]
-		if _, err := cl.Select(fname); err != nil {
-			log.Printf("thread repair account %d: select %s: %v", acct.ID, fname, err)
-			continue
-		}
 		for start := 0; start < len(group); start += size {
 			end := start + size
 			if end > len(group) {
@@ -46,7 +42,18 @@ func (m *Manager) repairThreads(ctx context.Context, cl mail.Conn, acct mail.Acc
 			for _, r := range batch {
 				uids = append(uids, r.UID)
 			}
-			hdrs, err := cl.FetchThreadHeaders(uids)
+			tend, ok := bgTurn(ctx, cl)
+			if !ok {
+				return
+			}
+			var hdrs map[uint32]mail.ThreadHeaders
+			var err error
+			if _, serr := cl.Select(fname); serr != nil {
+				err = serr
+			} else {
+				hdrs, err = cl.FetchThreadHeaders(uids)
+			}
+			tend()
 			if err != nil {
 				log.Printf("thread repair account %d: fetch %s: %v", acct.ID, fname, err)
 				break

@@ -93,7 +93,7 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 			if !ok {
 				continue
 			}
-			entryMail[e.str("1452")] = [2]string{l, el}
+			entryMail[e.elemID("1452")] = [2]string{l, el}
 			byList[l] = append(byList[l], el)
 		}
 		for listID, ids := range byList {
@@ -125,7 +125,7 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 			return nil, err
 		}
 		for _, e := range entries {
-			pair, ok := entryMail[e.str("1452")]
+			pair, ok := entryMail[e.elemID("1452")]
 			if !ok {
 				continue
 			}
@@ -154,7 +154,7 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 		if len(entries) < entriesPageSize {
 			break
 		}
-		start = entries[len(entries)-1].str("1452")
+		start = entries[len(entries)-1].elemID("1452")
 	}
 	return fc, nil
 }

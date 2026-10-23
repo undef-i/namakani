@@ -48,7 +48,7 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account) error {
 		return fmt.Errorf("list folders: %w", err)
 	}
 
-	syncOne := func(r folderRef) { m.syncFolderLocked(sess, acct, r) }
+	syncOne := func(r folderRef) { m.syncFolderLocked(ctx, sess, acct, r) }
 	if inboxRef != nil {
 		syncOne(*inboxRef)
 	}
@@ -144,6 +144,7 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account) error {
 		case <-ctx.Done():
 			return nil
 		case <-sweep.C:
+			sess.InvalidateFolders()
 			if newRefs, _, err := listRefs(); err == nil {
 				refs = newRefs
 				m.setStatus(acct.ID, &Status{State: "idle", Folders: len(refs)})

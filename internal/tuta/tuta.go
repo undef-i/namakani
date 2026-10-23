@@ -11,15 +11,20 @@
 package tuta
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
+	"time"
 
 	"namakani/internal/mail"
 	"namakani/internal/store"
 )
+
+const loginPhaseTimeout = 45 * time.Second
 
 const (
 	apiBaseURL = "https://app.tuta.com"
@@ -89,6 +94,15 @@ func credFingerprint(acct mail.Account) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func (s *Session) beginPhase(d time.Duration) func() {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	s.rest.ctx = ctx
+	return func() {
+		cancel()
+		s.rest.ctx = nil
+	}
+}
+
 func Connect(st *store.Store, acct mail.Account) (*Session, error) {
 	regMu.Lock()
 	defer regMu.Unlock()
@@ -99,11 +113,22 @@ func Connect(st *store.Store, acct mail.Account) (*Session, error) {
 	s := newSession()
 	s.st = st
 	s.acct = acct
-	if err := s.resume(); err != nil {
-		if err := s.login(acct.Password, ""); err != nil {
-			return nil, err
-		}
+	start := time.Now()
+	endPhase := s.beginPhase(loginPhaseTimeout)
+	via := "resume"
+	err := s.resume()
+	if err != nil {
+		via = "login"
+		err = s.login(acct.Password, "")
 	}
+	endPhase()
+	if err != nil {
+		log.Printf("tuta: connect account %d via %s failed after %s: %v",
+			acct.ID, via, time.Since(start).Round(time.Millisecond), err)
+		return nil, err
+	}
+	log.Printf("tuta: connect account %d via %s ok in %s",
+		acct.ID, via, time.Since(start).Round(time.Millisecond))
 	regByAcct[acct.ID] = s
 	return s, nil
 }
@@ -124,8 +149,14 @@ func Authorize(email, password, totp string) (userID, accessToken string, err er
 	s := newSession()
 	s.acct.Email = email
 	s.acct.Username = email
-	if err := s.login(password, totp); err != nil {
+	start := time.Now()
+	endPhase := s.beginPhase(loginPhaseTimeout)
+	err = s.login(password, totp)
+	endPhase()
+	if err != nil {
+		log.Printf("tuta: authorize failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
 		return "", "", err
 	}
+	log.Printf("tuta: authorize ok in %s", time.Since(start).Round(time.Millisecond))
 	return s.userID, s.accessToken, nil
 }

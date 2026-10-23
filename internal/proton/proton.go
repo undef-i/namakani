@@ -64,7 +64,13 @@ type Session struct {
 	keys  openpgp.EntityList
 	addrs []*protonmail.Address
 
-	cur *folderCache
+	cur     *folderCache
+	folders map[string]*folderCache
+
+	tmu     sync.Mutex
+	tcond   *sync.Cond
+	tholder int
+	tusers  int
 }
 
 var (

@@ -29,22 +29,12 @@ func (s *Session) groupKey(groupID string, version int) ([]byte, error) {
 
 func (s *Session) groupKeyLocked(groupID string, version int) ([]byte, error) {
 	if groupID == s.userGroupID && s.userGroupKey != nil {
-		if version == 0 || version == s.userKeyVersion {
+		if version == s.userKeyVersion {
 			return s.userGroupKey, nil
 		}
 	}
 	if byVer, ok := s.groupKeys[groupID]; ok {
-		if version == 0 {
-			best := -1
-			for v := range byVer {
-				if v > best {
-					best = v
-				}
-			}
-			if best >= 0 {
-				return byVer[best], nil
-			}
-		} else if k, ok := byVer[version]; ok {
+		if k, ok := byVer[version]; ok {
 			return k, nil
 		}
 	}
@@ -53,7 +43,7 @@ func (s *Session) groupKeyLocked(groupID string, version int) ([]byte, error) {
 		return nil, err
 	}
 	s.cacheGroupKeyLocked(groupID, currentVersion, current)
-	if version == 0 || version == currentVersion {
+	if version == currentVersion {
 		return current, nil
 	}
 	if version > currentVersion {
@@ -106,26 +96,35 @@ type membership struct {
 	groupType  string
 }
 
+func userMemberships(user instance) ([]membership, string) {
+	readMembership := func(m instance) membership {
+		return membership{
+			groupID:    m.assocID("29"),
+			symEncGKey: m.bytes("27"),
+			version:    parseKeyVersion(m.str("2246")),
+			symKeyVer:  parseKeyVersion(m.str("2247")),
+			groupType:  m.str("1030"),
+		}
+	}
+	var userGroupID string
+	var out []membership
+	if ug := user.agg("95"); ug != nil {
+		userGroupID = ug.assocID("29")
+		out = append(out, readMembership(ug))
+	}
+	for _, m := range user.aggList("96") {
+		out = append(out, readMembership(m))
+	}
+	return out, userGroupID
+}
+
 func (s *Session) loadUser() (instance, []membership, string, error) {
 	user, err := s.rest.getEntity("sys", "user", modelVersionSys, s.userID)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	var userGroupID string
-	if ug := user.agg("95"); ug != nil {
-		userGroupID = ug.str("29")
-	}
-	var out []membership
-	for _, m := range user.aggList("96") {
-		out = append(out, membership{
-			groupID:    m.str("29"),
-			symEncGKey: m.bytes("27"),
-			version:    parseKeyVersion(m.str("2246")),
-			symKeyVer:  parseKeyVersion(m.str("2247")),
-			groupType:  m.str("1030"),
-		})
-	}
-	return user, out, userGroupID, nil
+	mems, userGroupID := userMemberships(user)
+	return user, mems, userGroupID, nil
 }
 
 func (s *Session) loadCurrentGroupKey(groupID string) ([]byte, int, error) {
@@ -150,7 +149,7 @@ func (s *Session) loadCurrentGroupKey(groupID string) ([]byte, int, error) {
 }
 
 func (s *Session) userGroupKeyAtLocked(version int) ([]byte, error) {
-	if version == 0 || version == s.userKeyVersion {
+	if version == s.userKeyVersion {
 		return s.userGroupKey, nil
 	}
 	return s.groupKeyLocked(s.userGroupID, version)
@@ -170,7 +169,7 @@ func (s *Session) formerKeysListID(groupID string) (string, error) {
 	if ref == nil {
 		return "", fmt.Errorf("tuta: group %s has no former keys ref", groupID)
 	}
-	return ref.str("2269"), nil
+	return ref.assocID("2269"), nil
 }
 
 func (s *Session) loadFormerGroupKeys(groupID string, currentVersion, count int) ([]formerGroupKey, error) {
@@ -184,7 +183,7 @@ func (s *Session) loadFormerGroupKeys(groupID string, currentVersion, count int)
 	}
 	out := make([]formerGroupKey, 0, len(items))
 	for _, it := range items {
-		ver, err := decodeKeyVersionCustomID(it.str("2257"))
+		ver, err := decodeKeyVersionCustomID(it.elemID("2257"))
 		if err != nil {
 			continue
 		}
@@ -197,17 +196,7 @@ func (s *Session) groupKeyPair(groupID string, version int) (*groupKeyPair, erro
 	s.keysMu.Lock()
 	defer s.keysMu.Unlock()
 	if byVer, ok := s.keyPairs[groupID]; ok {
-		if version == 0 {
-			best := -1
-			for v := range byVer {
-				if v > best {
-					best = v
-				}
-			}
-			if best >= 0 {
-				return byVer[best], nil
-			}
-		} else if kp, ok := byVer[version]; ok {
+		if kp, ok := byVer[version]; ok {
 			return kp, nil
 		}
 	}
@@ -218,7 +207,7 @@ func (s *Session) groupKeyPair(groupID string, version int) (*groupKeyPair, erro
 	currentVersion := parseKeyVersion(group.str("2271"))
 	var kpInst instance
 	kpVersion := version
-	if version == 0 || version == currentVersion {
+	if version == currentVersion {
 		kpInst = group.agg("13")
 		kpVersion = currentVersion
 	} else {

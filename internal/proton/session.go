@@ -63,7 +63,55 @@ func (s *Session) selectFolder(name string) (*mail.SelectData, error) {
 	return &mail.SelectData{UIDValidity: 1, UIDNext: fc.maxUID + 1, NumMessages: uint32(fc.total)}, nil
 }
 
+func (s *Session) probeFolderLocked(fc *folderCache) (bool, error) {
+	total, msgs, err := s.c.ListMessages(&protonmail.MessageFilter{
+		Label: fc.label, Page: 0, PageSize: 150, Asc: false,
+	})
+	if err != nil {
+		return false, err
+	}
+	if total != fc.total {
+		return false, nil
+	}
+	for _, mm := range msgs {
+		if _, ok := fc.meta[mm.ID]; ok {
+			fc.meta[mm.ID] = mm
+		}
+	}
+	if len(msgs) == 0 {
+		return fc.total == 0, nil
+	}
+	if len(fc.ids) == 0 || msgs[0].ID != fc.ids[len(fc.ids)-1] {
+		return false, nil
+	}
+	for _, mm := range msgs {
+		if _, ok := fc.meta[mm.ID]; !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (s *Session) InvalidateFolders() {
+	s.mu.Lock()
+	s.folders = nil
+	s.cur = nil
+	s.mu.Unlock()
+}
+
 func (s *Session) listFolderLocked(name string) (*folderCache, error) {
+	if s.folders == nil {
+		s.folders = make(map[string]*folderCache)
+	}
+	if fc, ok := s.folders[name]; ok {
+		fresh, err := s.probeFolderLocked(fc)
+		if err != nil {
+			return nil, err
+		}
+		if fresh {
+			return fc, nil
+		}
+	}
 	label, err := s.folderLabel(name)
 	if err != nil {
 		return nil, err
@@ -111,6 +159,7 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 			break
 		}
 	}
+	s.folders[name] = fc
 	return fc, nil
 }
 
@@ -415,6 +464,8 @@ func (s *Session) MoveMessage(uid uint32, dest string) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
+	delete(s.folders, fc.name)
+	delete(s.folders, dest)
 	s.cur = nil
 	return destUID, nil
 }
@@ -433,6 +484,7 @@ func (s *Session) DeleteMessage(uid uint32) error {
 	if err := s.c.DeleteMessages([]string{id}); err != nil {
 		return err
 	}
+	delete(s.folders, fc.name)
 	s.cur = nil
 	return nil
 }
@@ -457,6 +509,7 @@ func (s *Session) AppendMessage(folder string, raw []byte, flags ...imap.Flag) (
 	if err != nil {
 		return 0, err
 	}
+	delete(s.folders, folder)
 	s.cur = nil
 	return uid, nil
 }

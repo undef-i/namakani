@@ -10,7 +10,7 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
-func SendSMTP(acct Account, from string, rcpts []string, msg []byte) error {
+func dialSMTP(acct Account) (*smtp.Client, error) {
 	addr := net.JoinHostPort(acct.SMTPHost, strconv.Itoa(acct.SMTPPort))
 	tlsConf := TLSConfigFor(acct.SMTPHost, acct.TLSSkipVerify)
 
@@ -27,18 +27,37 @@ func SendSMTP(acct Account, from string, rcpts []string, msg []byte) error {
 		c, err = smtp.Dial(addr)
 	}
 	if err != nil {
-		return fmt.Errorf("smtp connect: %w", err)
+		return nil, fmt.Errorf("smtp connect: %w", err)
 	}
-	defer c.Close()
 
 	if ok, _ := c.Extension("AUTH"); ok {
 		auth := sasl.NewPlainClient("", acct.Username, acct.Password)
 		if err := c.Auth(auth); err != nil {
-			return fmt.Errorf("smtp auth: %w", err)
+			c.Close()
+			return nil, fmt.Errorf("smtp auth: %w", err)
 		}
 	}
+	return c, nil
+}
+
+func SendSMTP(acct Account, from string, rcpts []string, msg []byte) error {
+	c, err := dialSMTP(acct)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
 	if err := c.SendMail(from, rcpts, bytes.NewReader(msg)); err != nil {
 		return fmt.Errorf("smtp send: %w", err)
 	}
+	return c.Quit()
+}
+
+func TestSMTP(acct Account) error {
+	c, err := dialSMTP(acct)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
 	return c.Quit()
 }

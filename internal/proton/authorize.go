@@ -110,13 +110,14 @@ func newClient() *protonmail.Client {
 	return &protonmail.Client{
 		RootURL:    "https://mail.proton.me/api",
 		AppVersion: "Other",
+		HTTPClient: &http.Client{Transport: rateLimitTransport{base: http.DefaultTransport}},
 	}
 }
 
 func Authorize(username, loginPassword, mailboxPassword, totp, hvToken string) (string, error) {
 	state := &hvState{armedToken: hvToken}
 	c := newClient()
-	c.HTTPClient = &http.Client{Transport: &hvTransport{base: http.DefaultTransport, state: state}}
+	c.HTTPClient = &http.Client{Transport: &hvTransport{base: rateLimitTransport{base: http.DefaultTransport}, state: state}}
 	bridgePassword, err := authorize(c, username, loginPassword, mailboxPassword, totp)
 	if err != nil && state.challenge != nil {
 		if u, ok := verifyURL(c.RootURL, state.challenge); ok {

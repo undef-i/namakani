@@ -29,6 +29,7 @@ export const updateAccount = (id, a) =>
   req('/api/accounts/' + id, { method: 'PUT', body: JSON.stringify(a) })
 export const deleteAccount = (id) => req('/api/accounts/' + id, { method: 'DELETE' })
 export const testAccount = (id) => post('/api/accounts/' + id + '/test')
+export const testAccountForm = (a) => post('/api/accounts/test', a)
 export const getSyncStatus = (id) => req('/api/accounts/' + id + '/sync')
 export const getAppSettings = () => req('/api/settings/app')
 export const saveAppSettings = (b) =>

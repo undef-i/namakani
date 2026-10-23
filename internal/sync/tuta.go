@@ -45,7 +45,7 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account) error {
 		return fmt.Errorf("list folders: %w", err)
 	}
 
-	syncOne := func(r folderRef) { m.syncFolderLocked(sess, acct, r) }
+	syncOne := func(r folderRef) { m.syncFolderLocked(ctx, sess, acct, r) }
 	if inboxRef != nil {
 		syncOne(*inboxRef)
 	}

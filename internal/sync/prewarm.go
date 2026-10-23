@@ -4,10 +4,21 @@ import (
 	"context"
 	"log"
 	"os"
+	"sort"
 
 	"namakani/internal/mail"
 	"namakani/internal/store"
 )
+
+func bgTurn(ctx context.Context, cl mail.Conn) (func(), bool) {
+	if t, ok := cl.(mail.BackgroundTurner); ok {
+		return t.BackgroundTurn(ctx)
+	}
+	if ctx.Err() != nil {
+		return nil, false
+	}
+	return func() {}, true
+}
 
 func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) {
 	batch := m.st.AppSettings().SyncBatch
@@ -15,6 +26,7 @@ func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) 
 	if attBatch < 1 {
 		attBatch = 1
 	}
+	sel := ""
 	for {
 		if ctx.Err() != nil {
 			return
@@ -27,12 +39,19 @@ func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) 
 		if len(cands) == 0 {
 			break
 		}
+		sort.SliceStable(cands, func(i, j int) bool { return cands[i].FolderName < cands[j].FolderName })
 		progressed := false
 		for _, c := range cands {
 			if ctx.Err() != nil {
 				return
 			}
-			if m.cacheBody(cl, acct, c) {
+			end, ok := bgTurn(ctx, cl)
+			if !ok {
+				return
+			}
+			okc := m.cacheBody(cl, acct, c, &sel)
+			end()
+			if okc {
 				progressed = true
 			}
 		}
@@ -44,23 +63,47 @@ func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) 
 	if err != nil || len(remaining) > 0 {
 		return
 	}
-	atts, err := m.st.AttachmentCandidates(acct.ID, attBatch)
-	if err != nil {
-		log.Printf("prewarm account %d: attachment candidates: %v", acct.ID, err)
-		return
-	}
-	for _, c := range atts {
+	for {
 		if ctx.Err() != nil {
 			return
 		}
-		m.cacheAttachment(cl, acct, c)
+		atts, err := m.st.AttachmentCandidates(acct.ID, attBatch)
+		if err != nil {
+			log.Printf("prewarm account %d: attachment candidates: %v", acct.ID, err)
+			return
+		}
+		if len(atts) == 0 {
+			return
+		}
+		sort.SliceStable(atts, func(i, j int) bool { return atts[i].FolderName < atts[j].FolderName })
+		progressed := false
+		for _, c := range atts {
+			if ctx.Err() != nil {
+				return
+			}
+			end, ok := bgTurn(ctx, cl)
+			if !ok {
+				return
+			}
+			okc := m.cacheAttachment(cl, acct, c, &sel)
+			end()
+			if okc {
+				progressed = true
+			}
+		}
+		if !progressed || len(atts) < attBatch {
+			return
+		}
 	}
 }
 
-func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandidate) bool {
-	if _, err := cl.Select(c.FolderName); err != nil {
-		log.Printf("prewarm account %d: select %s: %v", acct.ID, c.FolderName, err)
-		return false
+func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandidate, sel *string) bool {
+	if *sel != c.FolderName {
+		if _, err := cl.Select(c.FolderName); err != nil {
+			log.Printf("prewarm account %d: select %s: %v", acct.ID, c.FolderName, err)
+			return false
+		}
+		*sel = c.FolderName
 	}
 	raw, err := cl.FetchRaw(c.UID)
 	if err != nil {
@@ -103,9 +146,12 @@ func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandida
 	return true
 }
 
-func (m *Manager) cacheAttachment(cl mail.Conn, acct mail.Account, c store.AttachmentCandidate) bool {
-	if _, err := cl.Select(c.FolderName); err != nil {
-		return false
+func (m *Manager) cacheAttachment(cl mail.Conn, acct mail.Account, c store.AttachmentCandidate, sel *string) bool {
+	if *sel != c.FolderName {
+		if _, err := cl.Select(c.FolderName); err != nil {
+			return false
+		}
+		*sel = c.FolderName
 	}
 	raw, err := cl.FetchRaw(c.UID)
 	if err != nil {
@@ -126,7 +172,7 @@ func (m *Manager) cacheAttachment(cl mail.Conn, acct mail.Account, c store.Attac
 	}
 	path := m.st.AttachmentFilePath(c.AttachmentID)
 	if err := os.WriteFile(path, part.Bytes, 0o600); err != nil {
-		log.Printf("prewarm account %d: write attachment %d: %v", acct.ID, c.AttachmentID, err)
+		log.Printf("prewarm account %d: write attachment %d: %v", acct.ID, c.MessageID, err)
 		return false
 	}
 	if err := m.st.SetAttachmentLocalPath(c.AttachmentID, path); err != nil {

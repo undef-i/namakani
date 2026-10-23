@@ -151,7 +151,6 @@ func (m *Manager) setStatus(id int64, s *Status) {
 }
 
 func (m *Manager) run(ctx context.Context, acct mail.Account) {
-	backoff := 5 * time.Second
 	for {
 		err := m.session(ctx, acct)
 		if ctx.Err() != nil {
@@ -159,20 +158,7 @@ func (m *Manager) run(ctx context.Context, acct mail.Account) {
 		}
 		if err != nil {
 			m.setStatus(acct.ID, &Status{State: "error", LastError: err.Error()})
-			log.Printf("sync account %d: %v (retry in %s)", acct.ID, err, backoff)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		if err != nil {
-			backoff *= 2
-			if backoff > time.Minute {
-				backoff = time.Minute
-			}
-		} else {
-			backoff = 5 * time.Second
+			log.Printf("sync account %d: %v", acct.ID, err)
 		}
 	}
 }
@@ -196,10 +182,17 @@ func (m *Manager) folderMu(id int64) *sync.Mutex {
 	return mu
 }
 
-func (m *Manager) syncFolderLocked(cl mail.Conn, acct mail.Account, r folderRef) Change {
+func (m *Manager) syncFolderLocked(ctx context.Context, cl mail.Conn, acct mail.Account, r folderRef) Change {
 	mu := m.folderMu(r.id)
 	mu.Lock()
 	defer mu.Unlock()
+	if t, ok := cl.(mail.BackgroundTurner); ok {
+		end, ok := t.BackgroundTurn(ctx)
+		if !ok {
+			return Change{AccountID: acct.ID, FolderID: r.id}
+		}
+		defer end()
+	}
 	change, err := m.syncFolder(cl, acct, r.id, r.name)
 	if err != nil {
 		log.Printf("sync account %d folder %s: %v", acct.ID, r.name, err)
@@ -263,7 +256,7 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 	}
 
 	m.setStatus(acct.ID, &Status{State: "syncing", Folders: len(refs)})
-	syncOne := func(r folderRef) { m.syncFolderLocked(cl, acct, r) }
+	syncOne := func(r folderRef) { m.syncFolderLocked(ctx, cl, acct, r) }
 	if inboxRef != nil {
 		syncOne(*inboxRef)
 	}
@@ -376,27 +369,13 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 }
 
 func (m *Manager) watchFolder(ctx context.Context, acct mail.Account, r folderRef, kick chan<- struct{}) {
-	backoff := 5 * time.Second
 	for {
 		err := m.watchSession(ctx, acct, r, kick)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
-			log.Printf("sync account %d folder %s watch: %v (retry in %s)", acct.ID, r.name, err, backoff)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		if err != nil {
-			backoff *= 2
-			if backoff > time.Minute {
-				backoff = time.Minute
-			}
-		} else {
-			backoff = 5 * time.Second
+			log.Printf("sync account %d folder %s watch: %v", acct.ID, r.name, err)
 		}
 	}
 }
@@ -421,7 +400,7 @@ func (m *Manager) watchSession(ctx context.Context, acct mail.Account, r folderR
 	defer cl.Close()
 
 	syncMine := func() {
-		change := m.syncFolderLocked(cl, acct, r)
+		change := m.syncFolderLocked(ctx, cl, acct, r)
 		m.setStatus(acct.ID, &Status{State: "idle", LastSyncAt: time.Now().Unix()})
 		if len(change.Inserted) > 0 {
 			select {

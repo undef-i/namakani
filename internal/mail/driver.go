@@ -1,6 +1,14 @@
 package mail
 
-import "github.com/emersion/go-imap/v2"
+import (
+	"context"
+
+	"github.com/emersion/go-imap/v2"
+)
+
+type BackgroundTurner interface {
+	BackgroundTurn(ctx context.Context) (func(), bool)
+}
 
 type SelectData struct {
 	UIDValidity uint32

@@ -4,9 +4,19 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 )
+
+func logStep(step string, start time.Time, err error) {
+	if err != nil {
+		log.Printf("tuta: step %s failed after %s: %v", step, time.Since(start).Round(time.Millisecond), err)
+		return
+	}
+	log.Printf("tuta: step %s ok in %s", step, time.Since(start).Round(time.Millisecond))
+}
 
 func (s *Session) derivePassphraseKey(email, password string) ([]byte, int, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
@@ -57,7 +67,9 @@ func (s *Session) finishUnlock() error {
 
 func (s *Session) login(password, totp string) error {
 	email := strings.ToLower(strings.TrimSpace(s.acct.Email))
+	step := time.Now()
 	passphraseKey, _, err := s.derivePassphraseKey(email, password)
+	logStep("salt", step, err)
 	if err != nil {
 		return err
 	}
@@ -65,6 +77,7 @@ func (s *Session) login(password, totp string) error {
 	if _, err := rand.Read(accessKey); err != nil {
 		return err
 	}
+	step = time.Now()
 	ret, err := s.rest.callService(http.MethodPost, "sys", "sessionservice", modelVersionSys, instance{
 		"1212": "0",
 		"1213": email,
@@ -75,11 +88,12 @@ func (s *Session) login(password, totp string) error {
 		"1417": nil,
 		"1218": []any{},
 	})
+	logStep("session", step, err)
 	if err != nil {
 		return err
 	}
 	accessToken := ret.str("1221")
-	userAssoc := ret.str("1223")
+	userAssoc := ret.assocID("1223")
 	s.rest.accessToken = accessToken
 	s.accessToken = accessToken
 	if userAssoc != "" {
@@ -87,7 +101,10 @@ func (s *Session) login(password, totp string) error {
 	}
 	challenges := ret.aggList("1222")
 	if len(challenges) > 0 {
-		if err := s.completeSecondFactor(challenges, accessToken, totp); err != nil {
+		step = time.Now()
+		err := s.completeSecondFactor(challenges, accessToken, totp)
+		logStep("secondfactor", step, err)
+		if err != nil {
 			return err
 		}
 	}
@@ -95,7 +112,10 @@ func (s *Session) login(password, totp string) error {
 		return errors.New("tuta: login response missing user id")
 	}
 	s.passphraseKey = passphraseKey
-	if err := s.finishUnlock(); err != nil {
+	step = time.Now()
+	err = s.finishUnlock()
+	logStep("unlock", step, err)
+	if err != nil {
 		return err
 	}
 	s.persistSession()
@@ -121,7 +141,7 @@ func (s *Session) completeSecondFactor(challenges []instance, accessToken, totp 
 	}
 	sessionsList := ""
 	if auth := user.agg("1210"); auth != nil {
-		sessionsList = auth.str("1208")
+		sessionsList = auth.assocID("1208")
 	}
 	if sessionsList == "" {
 		return errors.New("tuta: session list not found for second factor auth")
@@ -146,13 +166,18 @@ func (s *Session) resume() error {
 	s.rest.accessToken = stored.AccessToken
 	s.accessToken = stored.AccessToken
 	s.userID = stored.UserID
+	step := time.Now()
 	passphraseKey, _, err := s.derivePassphraseKey(s.acct.Email, s.acct.Password)
+	logStep("resume-salt", step, err)
 	if err != nil {
 		s.rest.accessToken = ""
 		return err
 	}
 	s.passphraseKey = passphraseKey
-	if err := s.finishUnlock(); err != nil {
+	step = time.Now()
+	err = s.finishUnlock()
+	logStep("resume-unlock", step, err)
+	if err != nil {
 		s.rest.accessToken = ""
 		s.accessToken = ""
 		return err

@@ -141,7 +141,7 @@ func (s *Session) resolveSessionKey(inst instance, spec *typeSpec) ([]byte, erro
 
 func (s *Session) resolveWithBucketKey(inst instance, spec *typeSpec, bk instance) ([]byte, error) {
 	var bucketKey []byte
-	keyGroup := bk.str("2047")
+	keyGroup := bk.assocID("2047")
 	recipientKeyVersion := parseKeyVersion(bk.str("2252"))
 	if pubEnc := bk.bytes("2045"); len(pubEnc) > 0 {
 		if protocol := bk.str("2158"); protocol != "2" {

@@ -317,8 +317,8 @@ const ptrTension = computed(() => {
   return ((tsp / 4) - (tsp / 4) ** 2) * 2
 })
 const ptrY = computed(() => {
-  if (ptrBusy.value) return 14
-  return -96 + 102 * ptrDragPercent.value + 48 * ptrTension.value
+  if (ptrBusy.value) return 29
+  return -81 + 102 * ptrDragPercent.value + 48 * ptrTension.value
 })
 const ptrOpacity = computed(() => {
   if (ptrBusy.value) return 1
@@ -1550,6 +1550,7 @@ onBeforeUnmount(() => {
               </span>
             </div>
 
+            <div class="list-body">
             <div
               class="ptr-ind"
               :style="{
@@ -1686,6 +1687,7 @@ onBeforeUnmount(() => {
                 </v-btn>
               </template>
               </div>
+            </div>
             </div>
           </section>
 
@@ -1932,7 +1934,6 @@ onBeforeUnmount(() => {
 
               <template v-if="detailState === 'loading'">
                 <v-skeleton-loader type="paragraph@4" class="py-4" />
-                <p class="text-body-2 text-medium-emphasis">{{ t('正在从服务器取正文') }}</p>
               </template>
               <template v-else-if="detailState === 'error'">
                 <v-alert type="error" variant="tonal" density="compact" class="my-4">
@@ -2142,9 +2143,17 @@ body {
   height: 100%;
   position: relative;
 }
+.list-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 .ptr-ind {
   position: absolute;
-  top: 56px;
+  top: 0;
   left: 50%;
   z-index: 5;
   width: 40px;

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { intlLocale, lang, setLang, t } from '../i18n'
 import * as api from '../api.js'
 
@@ -124,7 +124,20 @@ function openEdit(a) {
   dialogOpen.value = true
 }
 
-async function save() {
+const testBusy = ref(false)
+const testOk = ref(false)
+const pendingMode = ref('save')
+
+watch(
+  form,
+  () => {
+    testOk.value = false
+  },
+  { deep: true },
+)
+
+async function submit(mode) {
+  pendingMode.value = mode
   formError.value = ''
   const payload = {
     ...form.value,
@@ -132,10 +145,20 @@ async function save() {
     smtp_port: Number(form.value.smtp_port),
   }
   delete payload.id
+  const isTest = mode === 'test'
+  if (isTest) {
+    testBusy.value = true
+    testOk.value = false
+  }
   try {
-    const res = editing.value
-      ? await api.updateAccount(editing.value, payload)
-      : await api.createAccount(payload)
+    let res
+    if (isTest) {
+      res = await api.testAccountForm({ ...payload, id: editing.value || 0 })
+    } else if (editing.value) {
+      res = await api.updateAccount(editing.value, payload)
+    } else {
+      res = await api.createAccount(payload)
+    }
     if (res && res.needs_captcha) {
       if (form.value.captcha_token) showSnack(t('验证已过期，已生成新的验证链接'))
       form.value.captcha_token = res.captcha_token
@@ -148,10 +171,57 @@ async function save() {
       formError.value = t('该账号开启了两步验证，请输入验证码')
       return
     }
+    if (isTest) {
+      reportTestResult(res)
+      return
+    }
     dialogOpen.value = false
     emit('changed')
   } catch (err) {
-    formError.value = err.message
+    if (isTest) {
+      formError.value = t('连接失败：{error}', { error: err.message })
+    } else {
+      formError.value = err.message
+    }
+  } finally {
+    if (isTest) testBusy.value = false
+  }
+}
+
+function save() {
+  return submit('save')
+}
+
+function testConnection() {
+  return submit('test')
+}
+
+function resumePending() {
+  return submit(pendingMode.value)
+}
+
+function reportTestResult(res) {
+  needsCaptcha.value = false
+  needsTotp.value = false
+  formError.value = ''
+  if (form.value.kind === 'proton' || form.value.kind === 'tuta') {
+    testOk.value = true
+    if (res && res.folders != null) {
+      showSnack(t('连接成功（{n} 个文件夹）', { n: res.folders }), 6000)
+    } else {
+      showSnack(t('连接成功'))
+    }
+    return
+  }
+  if (!res) return
+  const parts = []
+  if (!res.imap.ok) parts.push(t('IMAP 连接失败：{error}', { error: res.imap.error }))
+  if (!res.smtp.ok) parts.push(t('SMTP 连接失败：{error}', { error: res.smtp.error }))
+  if (parts.length) {
+    formError.value = parts.join('；')
+  } else {
+    testOk.value = true
+    showSnack(t('连接成功（{n} 个文件夹）', { n: res.imap.folders }), 6000)
   }
 }
 
@@ -169,23 +239,23 @@ async function confirmDelete() {
 }
 
 async function runTest(a) {
-  testState[a.id] = { busy: true, ok: false, text: t('连接中') }
+  testState[a.id] = { busy: true, ok: false, error: '', text: t('连接中') }
   try {
     const res = await api.testAccount(a.id)
     testState[a.id] = {
       busy: false,
       ok: true,
-      text:
-        t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
-          folders: res.folders.length,
-          caps: res.capabilities.length,
-          sample: res.capabilities
-            .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
-            .join('/'),
-        }),
+      error: '',
+      text: t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
+        folders: res.folders.length,
+        caps: res.capabilities.length,
+        sample: res.capabilities
+          .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
+          .join('/'),
+      }),
     }
   } catch (err) {
-    testState[a.id] = { busy: false, ok: false, text: t('连接失败：{error}', { error: err.message }) }
+    testState[a.id] = { busy: false, ok: false, error: err.message, text: '' }
   }
 }
 
@@ -194,10 +264,10 @@ const tg = ref({ enabled: false, chat_id: '', bot_token: '', has_token: false })
 const tgStatus = ref('loading')
 const tgMsg = ref('')
 const tgBusy = ref('')
-const snack = ref({ show: false, text: '' })
+const snack = ref({ show: false, text: '', timeout: 3000 })
 
-function showSnack(text) {
-  snack.value = { show: true, text }
+function showSnack(text, timeout = 3000) {
+  snack.value = { show: true, text, timeout }
 }
 
 async function loadTG() {
@@ -488,12 +558,20 @@ onMounted(() => {
               <div class="text-body-2 text-medium-emphasis text-truncate">{{ a.email }}</div>
             </div>
             <v-spacer />
-            <v-btn icon="mdi-connection" variant="text" size="small" :title="t('测试连接')" @click="runTest(a)" />
+            <v-btn
+              :icon="testState[a.id]?.ok ? 'mdi-check' : 'mdi-connection'"
+              :color="testState[a.id]?.ok ? 'success' : undefined"
+              :loading="!!testState[a.id]?.busy"
+              variant="text"
+              size="small"
+              :title="testState[a.id]?.ok ? t('连接成功') : t('测试连接')"
+              @click="runTest(a)"
+            />
             <v-btn icon="mdi-pencil" variant="text" size="small" :title="t('编辑')" @click="openEdit(a)" />
             <v-btn icon="mdi-delete" variant="text" size="small" :title="t('删除')" @click="askDelete(a)" />
           </div>
           <div v-if="a.kind === 'proton'" class="text-body-2 text-medium-emphasis mt-2">Proton Mail</div>
-          <div v-if="a.kind === 'tuta'" class="text-body-2 text-medium-emphasis mt-2">Tuta Mail</div>
+          <div v-else-if="a.kind === 'tuta'" class="text-body-2 text-medium-emphasis mt-2">Tuta Mail</div>
           <div v-else class="text-body-2 text-medium-emphasis mt-2" style="overflow-wrap: anywhere">
             IMAP {{ a.imap_host }}:{{ a.imap_port }} ({{ a.imap_tls }}){{ t('，') }}SMTP {{ a.smtp_host }}:{{ a.smtp_port }} ({{ a.smtp_tls }})
           </div>
@@ -506,11 +584,13 @@ onMounted(() => {
             {{ statusText(a) }}<template v-if="cacheText(a)">{{ t('，') }}{{ cacheText(a) }}</template>
           </div>
           <div
-            v-if="testState[a.id]"
-            class="text-body-2 mt-1"
-            :class="testState[a.id].ok ? '' : 'text-error'"
+            v-if="testState[a.id]?.error"
+            class="text-body-2 mt-1 text-error"
             style="overflow-wrap: anywhere"
           >
+            {{ t('连接失败：{error}', { error: testState[a.id].error }) }}
+          </div>
+          <div v-if="testState[a.id]?.text" class="text-body-2 mt-1" style="overflow-wrap: anywhere">
             {{ testState[a.id].text }}
           </div>
         </v-card-text>
@@ -751,70 +831,117 @@ onMounted(() => {
           <v-text-field v-model="form.label" :label="t('名称')" variant="outlined" density="comfortable" :placeholder="t('如 工作邮箱')" required class="mb-2" />
           <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="outlined" density="comfortable" required class="mb-2" />
           <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="outlined" density="comfortable" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
-          <v-text-field v-if="form.kind === 'imap'" v-model="form.username" :label="t('用户名')" variant="outlined" density="comfortable" required class="mb-2" />
-          <v-text-field
-            v-model="form.password"
-            :label="form.kind === 'proton' ? t('Proton Mail 登录密码') : form.kind === 'tuta' ? t('Tuta Mail 登录密码') : t('密码')"
-            type="password"
-            variant="outlined"
-            density="comfortable"
-            :placeholder="editing ? t('留空 = 不修改') : ''"
-            :required="!editing"
-            class="mb-2"
-          />
-          <v-text-field
-            v-if="form.kind === 'proton'"
-            v-model="form.mailbox_password"
-            :label="t('邮箱密码（可选）')"
-            type="password"
-            variant="outlined"
-            density="comfortable"
-            :placeholder="t('留空 = 与登录密码相同')"
-            class="mb-2"
-          />
-          <v-text-field
-            v-if="(form.kind === 'proton' || form.kind === 'tuta') && needsTotp"
-            v-model="form.totp"
-            :label="t('两步验证码')"
-            variant="outlined"
-            density="comfortable"
-            class="mb-2"
-          />
-          <div v-if="form.kind === 'proton' && needsCaptcha" class="d-flex flex-column flex-sm-row align-stretch align-sm-center ga-2 mb-2">
-            <v-btn :href="captchaUrl" target="_blank" rel="noopener" color="primary" variant="tonal" prepend-icon="mdi-open-in-new">
-              {{ t('打开人机验证') }}
-            </v-btn>
-            <v-btn variant="outlined" @click="save">{{ t('已完成验证') }}</v-btn>
-          </div>
           <v-textarea
             v-model="form.signature"
-            :label="t('签名（纯文本，写信时自动加到正文末尾）')"
+            :label="t('签名')"
             variant="outlined"
             density="comfortable"
             rows="3"
             class="mb-2"
           />
-          <v-row v-if="form.kind === 'imap'" dense class="mb-2">
-            <v-col cols="12" sm="6">
-              <v-text-field v-model="form.imap_host" :label="t('IMAP 服务器')" variant="outlined" density="comfortable" placeholder="imap.example.com" required hide-details />
-            </v-col>
-            <v-col cols="6" sm="3">
-              <v-text-field v-model.number="form.imap_port" :label="t('端口')" type="number" variant="outlined" density="comfortable" required hide-details />
-            </v-col>
-            <v-col cols="6" sm="3">
-              <v-select v-model="form.imap_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
-            </v-col>
-            <v-col cols="12" sm="6">
-              <v-text-field v-model="form.smtp_host" :label="t('SMTP 服务器')" variant="outlined" density="comfortable" placeholder="smtp.example.com" required hide-details />
-            </v-col>
-            <v-col cols="6" sm="3">
-              <v-text-field v-model.number="form.smtp_port" :label="t('端口')" type="number" variant="outlined" density="comfortable" required hide-details />
-            </v-col>
-            <v-col cols="6" sm="3">
-              <v-select v-model="form.smtp_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
-            </v-col>
-          </v-row>
-          <v-switch v-if="form.kind === 'imap'" v-model="form.tls_skip_verify" :label="t('跳过证书校验')" color="primary" hide-details class="mb-2" />
+          <v-divider class="my-3" />
+          <div class="text-subtitle-2 mb-2">{{ t('认证') }}</div>
+          <template v-if="form.kind === 'proton'">
+            <v-text-field
+              v-model="form.password"
+              :label="t('Proton Mail 登录密码')"
+              type="password"
+              variant="outlined"
+              density="comfortable"
+              :placeholder="editing ? t('留空 = 不修改') : ''"
+              :required="!editing"
+              class="mb-2"
+            />
+            <v-text-field
+              v-model="form.mailbox_password"
+              :label="t('邮箱密码（可选）')"
+              type="password"
+              variant="outlined"
+              density="comfortable"
+              :placeholder="t('留空 = 与登录密码相同')"
+              class="mb-2"
+            />
+            <v-text-field
+              v-if="needsTotp"
+              v-model="form.totp"
+              :label="t('两步验证码')"
+              variant="outlined"
+              density="comfortable"
+              class="mb-2"
+            />
+            <div v-if="needsCaptcha" class="d-flex flex-column flex-sm-row align-stretch align-sm-center ga-2 mb-2">
+              <v-btn :href="captchaUrl" target="_blank" rel="noopener" color="primary" variant="tonal" prepend-icon="mdi-open-in-new">
+                {{ t('打开人机验证') }}
+              </v-btn>
+              <v-btn variant="outlined" @click="resumePending">{{ t('已完成验证') }}</v-btn>
+            </div>
+          </template>
+          <template v-else-if="form.kind === 'tuta'">
+            <v-text-field
+              v-model="form.password"
+              :label="t('Tuta Mail 登录密码')"
+              type="password"
+              variant="outlined"
+              density="comfortable"
+              :placeholder="editing ? t('留空 = 不修改') : ''"
+              :required="!editing"
+              class="mb-2"
+            />
+            <v-text-field
+              v-if="needsTotp"
+              v-model="form.totp"
+              :label="t('两步验证码')"
+              variant="outlined"
+              density="comfortable"
+              class="mb-2"
+            />
+          </template>
+          <template v-else>
+            <v-text-field v-model="form.username" :label="t('用户名')" variant="outlined" density="comfortable" required class="mb-2" />
+            <v-text-field
+              v-model="form.password"
+              :label="t('密码')"
+              type="password"
+              variant="outlined"
+              density="comfortable"
+              :placeholder="editing ? t('留空 = 不修改') : ''"
+              :required="!editing"
+              class="mb-2"
+            />
+            <v-row dense class="mb-2">
+              <v-col cols="12" sm="6">
+                <v-text-field v-model="form.imap_host" :label="t('IMAP 服务器')" variant="outlined" density="comfortable" placeholder="imap.example.com" required hide-details />
+              </v-col>
+              <v-col cols="6" sm="3">
+                <v-text-field v-model.number="form.imap_port" :label="t('端口')" type="number" variant="outlined" density="comfortable" required hide-details />
+              </v-col>
+              <v-col cols="6" sm="3">
+                <v-select v-model="form.imap_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
+              </v-col>
+              <v-col cols="12" sm="6">
+                <v-text-field v-model="form.smtp_host" :label="t('SMTP 服务器')" variant="outlined" density="comfortable" placeholder="smtp.example.com" required hide-details />
+              </v-col>
+              <v-col cols="6" sm="3">
+                <v-text-field v-model.number="form.smtp_port" :label="t('端口')" type="number" variant="outlined" density="comfortable" required hide-details />
+              </v-col>
+              <v-col cols="6" sm="3">
+                <v-select v-model="form.smtp_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
+              </v-col>
+            </v-row>
+            <v-switch v-model="form.tls_skip_verify" :label="t('跳过证书校验')" color="primary" hide-details class="mb-2" />
+          </template>
+          <div class="d-flex align-center ga-2 mb-2">
+            <v-btn
+              variant="outlined"
+              :prepend-icon="testOk ? 'mdi-check' : 'mdi-connection'"
+              :color="testOk ? 'success' : undefined"
+              :loading="testBusy"
+              :disabled="testOk"
+              @click="testConnection"
+            >
+              {{ testOk ? t('连接成功') : t('测试连接') }}
+            </v-btn>
+          </div>
           <v-alert v-if="formError" type="error" variant="tonal" density="compact">{{ formError }}</v-alert>
         </v-form>
       </v-card-text>
@@ -840,7 +967,7 @@ onMounted(() => {
     </v-card>
   </v-dialog>
 
-  <v-snackbar v-model="snack.show" :timeout="3000" location="bottom">
+  <v-snackbar v-model="snack.show" :timeout="snack.timeout" location="bottom">
     {{ snack.text }}
   </v-snackbar>
 </template>
