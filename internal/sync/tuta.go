@@ -45,23 +45,42 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account) error {
 		return fmt.Errorf("list folders: %w", err)
 	}
 
-	syncOne := func(r folderRef) { m.syncFolderLocked(ctx, sess, acct, r) }
+	syncOne := func(r folderRef) error {
+		_, err := m.syncFolderLocked(ctx, sess, acct, r)
+		return err
+	}
+	var syncErr error
+	noteErr := func(err error) {
+		if err != nil && syncErr == nil {
+			syncErr = err
+		}
+	}
 	if inboxRef != nil {
-		syncOne(*inboxRef)
+		noteErr(syncOne(*inboxRef))
 	}
 	for _, r := range refs {
 		if inboxRef != nil && r.id == inboxRef.id {
 			continue
 		}
-		syncOne(r)
+		noteErr(syncOne(r))
 	}
 	n, _ := m.st.CountMessages(acct.ID)
-	m.setStatus(acct.ID, &Status{
-		State:      "idle",
-		LastSyncAt: time.Now().Unix(),
-		Folders:    len(refs),
-		Messages:   n,
-	})
+	if syncErr != nil {
+		m.setStatus(acct.ID, &Status{
+			State:      "error",
+			LastSyncAt: time.Now().Unix(),
+			LastError:  syncErr.Error(),
+			Folders:    len(refs),
+			Messages:   n,
+		})
+	} else {
+		m.setStatus(acct.ID, &Status{
+			State:      "idle",
+			LastSyncAt: time.Now().Unix(),
+			Folders:    len(refs),
+			Messages:   n,
+		})
+	}
 	m.mu.Lock()
 	m.live[acct.ID] = true
 	m.mu.Unlock()
@@ -72,11 +91,18 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account) error {
 		if newRefs, _, err := listRefs(); err == nil {
 			refs = newRefs
 		}
+		var firstErr error
 		for _, r := range refs {
-			syncOne(r)
+			if err := syncOne(r); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 		n, _ := m.st.CountMessages(acct.ID)
-		m.setStatus(acct.ID, &Status{State: "idle", LastSyncAt: time.Now().Unix(), Folders: len(refs), Messages: n})
+		if firstErr != nil {
+			m.setStatus(acct.ID, &Status{State: "error", LastSyncAt: time.Now().Unix(), LastError: firstErr.Error(), Folders: len(refs), Messages: n})
+		} else {
+			m.setStatus(acct.ID, &Status{State: "idle", LastSyncAt: time.Now().Unix(), Folders: len(refs), Messages: n})
+		}
 		m.prewarm(ctx, sess, acct)
 	}
 

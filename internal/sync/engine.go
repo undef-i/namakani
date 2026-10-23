@@ -182,14 +182,14 @@ func (m *Manager) folderMu(id int64) *sync.Mutex {
 	return mu
 }
 
-func (m *Manager) syncFolderLocked(ctx context.Context, cl mail.Conn, acct mail.Account, r folderRef) Change {
+func (m *Manager) syncFolderLocked(ctx context.Context, cl mail.Conn, acct mail.Account, r folderRef) (Change, error) {
 	mu := m.folderMu(r.id)
 	mu.Lock()
 	defer mu.Unlock()
 	if t, ok := cl.(mail.BackgroundTurner); ok {
 		end, ok := t.BackgroundTurn(ctx)
 		if !ok {
-			return Change{AccountID: acct.ID, FolderID: r.id}
+			return Change{AccountID: acct.ID, FolderID: r.id}, nil
 		}
 		defer end()
 	}
@@ -197,7 +197,7 @@ func (m *Manager) syncFolderLocked(ctx context.Context, cl mail.Conn, acct mail.
 	if err != nil {
 		log.Printf("sync account %d folder %s: %v", acct.ID, r.name, err)
 	}
-	return change
+	return change, err
 }
 
 func (m *Manager) session(ctx context.Context, acct mail.Account) error {
@@ -400,7 +400,7 @@ func (m *Manager) watchSession(ctx context.Context, acct mail.Account, r folderR
 	defer cl.Close()
 
 	syncMine := func() {
-		change := m.syncFolderLocked(ctx, cl, acct, r)
+		change, _ := m.syncFolderLocked(ctx, cl, acct, r)
 		m.setStatus(acct.ID, &Status{State: "idle", LastSyncAt: time.Now().Unix()})
 		if len(change.Inserted) > 0 {
 			select {

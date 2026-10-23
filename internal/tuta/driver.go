@@ -89,12 +89,12 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 		byList := make(map[string][]string)
 		entryMail := make(map[string][2]string)
 		for _, e := range entries {
-			l, el, ok := e.idTuple("1456")
-			if !ok {
+			pairs := e.idTuples("1456")
+			if len(pairs) != 1 {
 				continue
 			}
-			entryMail[e.elemID("1452")] = [2]string{l, el}
-			byList[l] = append(byList[l], el)
+			entryMail[e.elemID("1452")] = pairs[0]
+			byList[pairs[0][0]] = append(byList[pairs[0][0]], pairs[0][1])
 		}
 		for listID, ids := range byList {
 			mails, err := s.rest.loadMultiple("tutanota", "mail", modelVersionTutanota, listID, ids)
@@ -103,8 +103,14 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 			}
 			decrypted := make(map[string]instance, len(mails))
 			for _, m := range mails {
-				if _, err := s.decryptInstance(m, mailSpec); err != nil {
+				sk, err := s.decryptInstance(m, mailSpec)
+				if err != nil {
 					return nil, err
+				}
+				if sk != nil {
+					if pairs := m.idTuples("1308"); len(pairs) > 0 {
+						s.cacheInstKey(pairs[0][1], sk)
+					}
 				}
 				_, el, _ := m.idTuple("99")
 				decrypted[el] = m
@@ -173,9 +179,9 @@ func metaFromMail(m instance, listID string) *mailMeta {
 	meta.from = addrFromInstance(m.agg("111"))
 	meta.firstRcpt = addrFromInstance(m.agg("1306"))
 	meta.attachIDs = m.idTuples("115")
-	if arc, el, ok := m.idTuple("1308"); ok {
-		meta.detailsArc = arc
-		meta.detailsID = el
+	if pairs := m.idTuples("1308"); len(pairs) > 0 {
+		meta.detailsArc = pairs[0][0]
+		meta.detailsID = pairs[0][1]
 		meta.hasDetails = true
 	}
 	if meta.messageID == "" {

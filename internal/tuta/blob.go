@@ -1,7 +1,9 @@
 package tuta
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +12,14 @@ import (
 	"sync"
 	"time"
 )
+
+func genAggID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
 
 const maxBlobSizeBytes = 10 * 1024 * 1024
 
@@ -53,6 +63,32 @@ func (s *Session) requestBlobToken(in instance) (*blobAccessInfo, error) {
 	return res, nil
 }
 
+func archiveTokenRequest(archiveID string) instance {
+	return instance{
+		"78":  "0",
+		"180": nil,
+		"80":  []any{},
+		"181": []any{map[string]any{
+			"176": genAggID(),
+			"177": archiveID,
+			"178": nil,
+			"179": []any{},
+		}},
+	}
+}
+
+func writeTokenRequest(ownerGroup string) instance {
+	return instance{
+		"78":  "0",
+		"180": "1",
+		"181": []any{},
+		"80": []any{map[string]any{
+			"74": genAggID(),
+			"75": ownerGroup,
+		}},
+	}
+}
+
 func (s *Session) archiveToken(archiveID string) (*blobAccessInfo, error) {
 	tc := s.tokens()
 	tc.mu.Lock()
@@ -61,15 +97,7 @@ func (s *Session) archiveToken(archiveID string) (*blobAccessInfo, error) {
 		return info, nil
 	}
 	tc.mu.Unlock()
-	info, err := s.requestBlobToken(instance{
-		"78":  "0",
-		"180": nil,
-		"181": map[string]any{
-			"177": archiveID,
-			"178": nil,
-			"179": []any{},
-		},
-	})
+	info, err := s.requestBlobToken(archiveTokenRequest(archiveID))
 	if err != nil {
 		return nil, err
 	}
@@ -87,13 +115,7 @@ func (s *Session) writeToken(ownerGroup string) (*blobAccessInfo, error) {
 		return info, nil
 	}
 	tc.mu.Unlock()
-	info, err := s.requestBlobToken(instance{
-		"78":  "0",
-		"180": "1",
-		"80": map[string]any{
-			"75": ownerGroup,
-		},
-	})
+	info, err := s.requestBlobToken(writeTokenRequest(ownerGroup))
 	if err != nil {
 		return nil, err
 	}
@@ -170,16 +192,21 @@ func (s *Session) downloadBlobs(archiveID string, blobIDs []string) (map[string]
 	return out, nil
 }
 
-func (s *Session) downloadBlobChunk(info *blobAccessInfo, archiveID string, blobIDs []string) (map[string][]byte, error) {
+func blobGetInRequest(archiveID string, blobIDs []string) instance {
 	ids := make([]any, 0, len(blobIDs))
 	for _, id := range blobIDs {
-		ids = append(ids, map[string]any{"146": id})
+		ids = append(ids, map[string]any{"145": genAggID(), "146": id})
 	}
-	body, err := marshalInstance(instance{
+	return instance{
 		"51":  "0",
 		"52":  archiveID,
+		"110": nil,
 		"193": ids,
-	})
+	}
+}
+
+func (s *Session) downloadBlobChunk(info *blobAccessInfo, archiveID string, blobIDs []string) (map[string][]byte, error) {
+	body, err := marshalInstance(blobGetInRequest(archiveID, blobIDs))
 	if err != nil {
 		return nil, err
 	}

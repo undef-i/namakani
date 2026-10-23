@@ -2,6 +2,8 @@ package tuta
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -23,6 +25,7 @@ type typeSpec struct {
 	ownerKeyVer    string
 	kdfNonce       string
 	bucketKeyAssoc string
+	permissions    string
 	fields         []fieldSpec
 }
 
@@ -119,7 +122,34 @@ func (d *valueDecryptor) decrypt(fieldPath string, data []byte) ([]byte, error) 
 	return nil, fmt.Errorf("tuta: unsupported cipher kind %d", p.kind)
 }
 
+func (s *Session) cachedInstKey(elemID string) ([]byte, bool) {
+	s.keysMu.Lock()
+	defer s.keysMu.Unlock()
+	k, ok := s.instKeys[elemID]
+	return k, ok
+}
+
+func (s *Session) cacheInstKey(elemID string, key []byte) {
+	s.keysMu.Lock()
+	defer s.keysMu.Unlock()
+	if s.instKeys == nil {
+		s.instKeys = make(map[string][]byte)
+	}
+	s.instKeys[elemID] = key
+}
+
 func (s *Session) resolveSessionKey(inst instance, spec *typeSpec) ([]byte, error) {
+	if spec.idKey != "" {
+		_, elemID, ok := inst.idTuple(spec.idKey)
+		if !ok {
+			elemID = inst.str(spec.idKey)
+		}
+		if elemID != "" {
+			if k, hit := s.cachedInstKey(elemID); hit {
+				return k, nil
+			}
+		}
+	}
 	if spec.bucketKeyAssoc != "" {
 		if bk := inst.agg(spec.bucketKeyAssoc); bk != nil {
 			return s.resolveWithBucketKey(inst, spec, bk)
@@ -136,7 +166,36 @@ func (s *Session) resolveSessionKey(inst instance, spec *typeSpec) ([]byte, erro
 			return decryptKey(gk, enc)
 		}
 	}
+	if spec.permissions != "" {
+		if listID := inst.str(spec.permissions); listID != "" {
+			return s.resolveViaPermissions(listID)
+		}
+	}
 	return nil, nil
+}
+
+func (s *Session) resolveViaPermissions(listID string) ([]byte, error) {
+	perms, err := s.rest.loadRange("sys", "permission", modelVersionSys, listID, "", 100, false)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range perms {
+		typ := p.str("137")
+		if typ != "1" && typ != "2" {
+			continue
+		}
+		group := p.str("1002")
+		enc := p.bytes("1003")
+		if group == "" || len(enc) == 0 {
+			continue
+		}
+		gk, err := s.groupKey(group, parseKeyVersion(p.str("2242")))
+		if err != nil {
+			continue
+		}
+		return decryptKey(gk, enc)
+	}
+	return nil, errSessionKeyNotFound
 }
 
 func (s *Session) resolveWithBucketKey(inst instance, spec *typeSpec, bk instance) ([]byte, error) {
@@ -144,20 +203,31 @@ func (s *Session) resolveWithBucketKey(inst instance, spec *typeSpec, bk instanc
 	keyGroup := bk.assocID("2047")
 	recipientKeyVersion := parseKeyVersion(bk.str("2252"))
 	if pubEnc := bk.bytes("2045"); len(pubEnc) > 0 {
-		if protocol := bk.str("2158"); protocol != "2" {
-			return nil, fmt.Errorf("tuta: unsupported bucket key protocol version %q", protocol)
-		}
 		kp, err := s.groupKeyPair(keyGroup, recipientKeyVersion)
 		if err != nil {
 			return nil, err
 		}
-		bkKey, _, err := pqDecapsulate(pubEnc,
-			pqKeyPairs{x25519Priv: kp.x25519Priv, kyberPriv: kp.kyberPriv},
-			pqPublicKeys{x25519Pub: kp.x25519Pub, kyberPub: kp.kyberPub})
-		if err != nil {
-			return nil, err
+		switch protocol := bk.str("2158"); protocol {
+		case "2":
+			bkKey, _, err := pqDecapsulate(pubEnc,
+				pqKeyPairs{x25519Priv: kp.x25519Priv, kyberPriv: kp.kyberPriv},
+				pqPublicKeys{x25519Pub: kp.x25519Pub, kyberPub: kp.kyberPub})
+			if err != nil {
+				return nil, err
+			}
+			bucketKey = bkKey
+		case "0":
+			if kp.rsaPriv == nil {
+				return nil, errors.New("tuta: no rsa private key available for bucket key")
+			}
+			bkKey, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, kp.rsaPriv, pubEnc, nil)
+			if err != nil {
+				return nil, err
+			}
+			bucketKey = bkKey
+		default:
+			return nil, fmt.Errorf("tuta: unsupported bucket key protocol version %q", protocol)
 		}
-		bucketKey = bkKey
 	} else if groupEnc := bk.bytes("2046"); len(groupEnc) > 0 {
 		if keyGroup == "" {
 			keyGroup = inst.str(spec.ownerGroup)
@@ -178,10 +248,26 @@ func (s *Session) resolveWithBucketKey(inst instance, spec *typeSpec, bk instanc
 	if !ok {
 		elemID = inst.str(spec.idKey)
 	}
+	s.keysMu.Lock()
+	if s.instKeys == nil {
+		s.instKeys = make(map[string][]byte)
+	}
 	for _, isk := range bk.aggList("2048") {
-		if isk.str("2041") == elemID {
-			return decryptKey(bucketKey, isk.bytes("2042"))
+		id := isk.str("2041")
+		if id == "" {
+			continue
 		}
+		if _, done := s.instKeys[id]; done {
+			continue
+		}
+		if k, err := decryptKey(bucketKey, isk.bytes("2042")); err == nil {
+			s.instKeys[id] = k
+		}
+	}
+	cached := s.instKeys[elemID]
+	s.keysMu.Unlock()
+	if cached != nil {
+		return cached, nil
 	}
 	return nil, errSessionKeyNotFound
 }

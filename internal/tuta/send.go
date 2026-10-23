@@ -332,6 +332,95 @@ func parseRSAPublicKey(hexBytes []byte) (*rsa.PublicKey, error) {
 	return &rsa.PublicKey{N: n, E: 65537}, nil
 }
 
+func parseRSAPrivateKey(raw []byte) (*rsa.PrivateKey, error) {
+	if isHexString(raw) {
+		return parseRSAPrivateKeyHex(string(raw))
+	}
+	return parseRSAPrivateKeyBinary(raw)
+}
+
+func isHexString(b []byte) bool {
+	if len(b) == 0 || len(b)%2 != 0 {
+		return false
+	}
+	for _, c := range b {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func rsaPrivateKeyFromParts(parts [][]byte) (*rsa.PrivateKey, error) {
+	if len(parts) != 7 {
+		return nil, fmt.Errorf("tuta: rsa private key has %d components, want 7", len(parts))
+	}
+	priv := &rsa.PrivateKey{
+		PublicKey: rsa.PublicKey{N: new(big.Int).SetBytes(parts[0]), E: 65537},
+		D:         new(big.Int).SetBytes(parts[1]),
+		Primes: []*big.Int{
+			new(big.Int).SetBytes(parts[2]),
+			new(big.Int).SetBytes(parts[3]),
+		},
+		Precomputed: rsa.PrecomputedValues{
+			Dp:   new(big.Int).SetBytes(parts[4]),
+			Dq:   new(big.Int).SetBytes(parts[5]),
+			Qinv: new(big.Int).SetBytes(parts[6]),
+		},
+	}
+	if err := priv.Validate(); err != nil {
+		return nil, fmt.Errorf("tuta: invalid rsa private key: %w", err)
+	}
+	return priv, nil
+}
+
+func parseRSAPrivateKeyBinary(raw []byte) (*rsa.PrivateKey, error) {
+	pos := 0
+	var parts [][]byte
+	for pos < len(raw) {
+		if pos+2 > len(raw) {
+			return nil, errors.New("tuta: malformed rsa private key")
+		}
+		hexLen := int(raw[pos])<<8 | int(raw[pos+1])
+		pos += 2
+		if hexLen%2 != 0 {
+			return nil, errors.New("tuta: malformed rsa private key component length")
+		}
+		n := hexLen / 2
+		if pos+n > len(raw) {
+			return nil, errors.New("tuta: malformed rsa private key")
+		}
+		parts = append(parts, raw[pos:pos+n])
+		pos += n
+	}
+	return rsaPrivateKeyFromParts(parts)
+}
+
+func parseRSAPrivateKeyHex(hexStr string) (*rsa.PrivateKey, error) {
+	pos := 0
+	var parts [][]byte
+	for pos < len(hexStr) {
+		if pos+4 > len(hexStr) {
+			return nil, errors.New("tuta: malformed rsa private key")
+		}
+		length, err := parseHexInt(hexStr[pos : pos+4])
+		if err != nil {
+			return nil, err
+		}
+		pos += 4
+		if pos+length > len(hexStr) {
+			return nil, errors.New("tuta: malformed rsa private key")
+		}
+		comp, err := hex.DecodeString(hexStr[pos : pos+length])
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, comp)
+		pos += length
+	}
+	return rsaPrivateKeyFromParts(parts)
+}
+
 func parseHexInt(s string) (int, error) {
 	n := 0
 	for _, c := range s {

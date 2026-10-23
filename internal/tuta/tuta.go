@@ -12,6 +12,7 @@ package tuta
 
 import (
 	"context"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -74,6 +75,7 @@ type Session struct {
 	cur        *folderCache
 	tokenCache *tokenCache
 	folders    []tutaFolder
+	instKeys   map[string][]byte
 }
 
 type groupKeyPair struct {
@@ -82,6 +84,7 @@ type groupKeyPair struct {
 	kyberPub   []byte
 	kyberPriv  []byte
 	rsaPub     []byte
+	rsaPriv    *rsa.PrivateKey
 }
 
 var (

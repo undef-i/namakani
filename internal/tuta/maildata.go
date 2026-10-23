@@ -89,6 +89,7 @@ var mailDetailsBlobSpec = &typeSpec{
 	ownerEncSK:  "1304",
 	ownerKeyVer: "1408",
 	kdfNonce:    "1833",
+	permissions: "1301",
 	fields: []fieldSpec{
 		{id: "1305", agg: mailDetailsSpec},
 	},

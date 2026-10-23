@@ -28,19 +28,21 @@ func (s *Session) groupKey(groupID string, version int) ([]byte, error) {
 }
 
 func (s *Session) groupKeyLocked(groupID string, version int) ([]byte, error) {
-	if groupID == s.userGroupID && s.userGroupKey != nil {
-		if version == s.userKeyVersion {
-			return s.userGroupKey, nil
-		}
-	}
 	if byVer, ok := s.groupKeys[groupID]; ok {
 		if k, ok := byVer[version]; ok {
 			return k, nil
 		}
 	}
-	current, currentVersion, err := s.loadCurrentGroupKey(groupID)
-	if err != nil {
-		return nil, err
+	var current []byte
+	var currentVersion int
+	if groupID == s.userGroupID && s.userGroupKey != nil {
+		current, currentVersion = s.userGroupKey, s.userKeyVersion
+	} else {
+		var err error
+		current, currentVersion, err = s.loadCurrentGroupKey(groupID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	s.cacheGroupKeyLocked(groupID, currentVersion, current)
 	if version == currentVersion {
@@ -234,18 +236,29 @@ func (s *Session) groupKeyPair(groupID string, version int) (*groupKeyPair, erro
 		rsaPub:    kpInst.bytes("2"),
 	}
 	if enc := kpInst.bytes("2145"); len(enc) > 0 {
-		priv, err := decryptKey(decryptingKey, enc)
+		priv, err := decryptBytes(decryptingKey, enc)
 		if err != nil {
 			return nil, err
 		}
 		kp.x25519Priv = priv
 	}
 	if enc := kpInst.bytes("2147"); len(enc) > 0 {
-		priv, err := decryptKey(decryptingKey, enc)
+		priv, err := decryptBytes(decryptingKey, enc)
 		if err != nil {
 			return nil, err
 		}
 		kp.kyberPriv = priv
+	}
+	if enc := kpInst.bytes("3"); len(enc) > 0 {
+		privRaw, err := decryptBytes(decryptingKey, enc)
+		if err != nil {
+			return nil, err
+		}
+		priv, err := parseRSAPrivateKey(privRaw)
+		if err != nil {
+			return nil, err
+		}
+		kp.rsaPriv = priv
 	}
 	byVer, ok := s.keyPairs[groupID]
 	if !ok {
