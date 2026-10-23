@@ -817,13 +817,16 @@ async function onComposeDone() {
 }
 
 async function refreshAccounts() {
-  try {
-    accounts.value = await api.listAccounts()
-    accountsStatus.value = 'ready'
-  } catch {
-    accountsStatus.value = 'error'
-  }
-  await refreshData()
+  const accDone = (async () => {
+    try {
+      accounts.value = await api.listAccounts()
+      accountsStatus.value = 'ready'
+    } catch {
+      accountsStatus.value = 'error'
+    }
+    await loadStatuses()
+  })()
+  await Promise.all([accDone, loadFolders(), loadMessages()])
 }
 
 
@@ -1623,13 +1626,10 @@ function openAccounts() {
   if (!lgAndUp.value) drawerOpen.value = false
 }
 
-async function enter() {
+async function enter(st) {
   view.value = 'app'
   if (initialDeepId) openMessage(placeholderMessage(initialDeepId))
-  try {
-    const st = await api.getState()
-    if (st.app_settings) maxAttachmentMB.value = st.app_settings.max_attachment_mb
-  } catch {}
+  if (st && st.app_settings) maxAttachmentMB.value = st.app_settings.max_attachment_mb
   threaded.value = localStorage.getItem('wm_threaded') === '1'
   const storedUndo = parseInt(localStorage.getItem('wm_undo_seconds') ?? '', 10)
   if ([0, 5, 10, 20, 30].includes(storedUndo)) undoSeconds.value = storedUndo
@@ -1668,7 +1668,7 @@ async function boot() {
       authMode.value = 'login'
       view.value = 'auth'
     } else {
-      await enter()
+      await enter(st)
     }
   } catch (err) {
     bootError.value = err.message
