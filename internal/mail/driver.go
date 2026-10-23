@@ -10,6 +10,10 @@ type BackgroundTurner interface {
 	BackgroundTurn(ctx context.Context) (func(), bool)
 }
 
+type BodyPrefetcher interface {
+	PrefetchBodies(uids []uint32) error
+}
+
 type SelectData struct {
 	UIDValidity uint32
 	UIDNext     uint32

@@ -1357,6 +1357,7 @@ function menuRipple(e) {
 }
 
 function toggleDrawer() {
+  if (!lgAndUp.value && composeOpen.value) return
   drawerOpen.value = !drawerOpen.value
 }
 
@@ -1545,6 +1546,7 @@ onBeforeUnmount(() => {
         v-model="drawerOpen"
         temporary
         width="280"
+        :touchless="!lgAndUp && composeOpen"
       >
         <div class="d-flex flex-column pa-3 drawer-inner">
           <v-btn
@@ -1560,7 +1562,7 @@ onBeforeUnmount(() => {
           </v-btn>
 
           <template v-if="foldersStatus === 'loading'">
-            <v-skeleton-loader type="list-item@3" />
+            <v-skeleton-loader type="list-item@10" />
           </template>
           <template v-else-if="foldersStatus === 'error'">
             <p class="text-body-2 text-error px-1">
@@ -1618,7 +1620,6 @@ onBeforeUnmount(() => {
                 {{ listSnap.kind === 'search' ? t('搜索结果') : snapScopeLabel }}
               </h1>
               <span v-if="listBusy" class="text-caption text-medium-emphasis d-flex align-center ga-1 text-no-wrap">
-                <v-progress-circular indeterminate size="14" width="2" />
                 <template v-if="searchQuery.trim()">{{ t('搜索中') }}</template>
               </span>
               <span v-else-if="listSnap.kind === 'search' && listStatus === 'ready'" class="text-caption text-medium-emphasis">
@@ -1669,7 +1670,7 @@ onBeforeUnmount(() => {
             <div ref="listEl" class="list-scroll" @scroll="onListScroll">
               <div>
               <template v-if="listStatus === 'loading'">
-                <v-skeleton-loader type="list-item-three-line@6" />
+                <v-skeleton-loader type="list-item-three-line@24" />
               </template>
               <template v-else-if="listStatus === 'error'">
                 <div class="pa-4">
@@ -1789,7 +1790,7 @@ onBeforeUnmount(() => {
                 </h2>
                 <p class="text-caption text-medium-emphasis mb-3">{{ t('共 {n} 封', { n: convo.msgs.length }) }}</p>
                 <template v-if="convo.status === 'loading'">
-                  <v-skeleton-loader type="list-item-three-line@3" />
+                  <v-skeleton-loader type="list-item-three-line@12" />
                 </template>
                 <v-alert v-else-if="convo.status === 'error'" type="error" variant="tonal" density="compact">
                   {{ t('会话加载失败') }}
@@ -1987,7 +1988,7 @@ onBeforeUnmount(() => {
               </div>
 
               <template v-if="detailState === 'loading'">
-                <v-skeleton-loader type="paragraph@4" class="py-4" />
+                <v-skeleton-loader type="paragraph@10" class="py-4" />
               </template>
               <template v-else-if="detailState === 'error'">
                 <v-alert type="error" variant="tonal" density="compact" class="my-4">
@@ -2266,7 +2267,12 @@ body {
   background: rgb(var(--v-theme-surface));
 }
 .v-navigation-drawer--temporary {
+  top: 0 !important;
+  height: 100% !important;
   z-index: 2000 !important;
+}
+.v-navigation-drawer__scrim {
+  z-index: 1999 !important;
 }
 @media (min-width: 1440px) {
   .reader-scroll > * {

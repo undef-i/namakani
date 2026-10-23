@@ -544,7 +544,7 @@ onMounted(() => {
 
     <template v-if="accountsStatus === 'loading'">
       <div class="d-flex flex-column ga-3">
-        <v-card v-for="i in 2" :key="i" variant="outlined" rounded="lg">
+        <v-card v-for="i in 4" :key="i" variant="outlined" rounded="lg">
           <v-card-text>
             <div class="d-flex align-start ga-2">
               <div class="flex-grow-1" style="min-width: 0">

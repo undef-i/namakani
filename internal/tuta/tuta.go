@@ -76,6 +76,7 @@ type Session struct {
 	tokenCache *tokenCache
 	folders    []tutaFolder
 	instKeys   map[string][]byte
+	details    map[string]instance
 }
 
 type groupKeyPair struct {
@@ -145,6 +146,7 @@ func newSession() *Session {
 			archives: make(map[string]*blobAccessInfo),
 			writes:   make(map[string]*blobAccessInfo),
 		},
+		details: make(map[string]instance),
 	}
 }
 

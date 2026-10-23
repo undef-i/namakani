@@ -290,9 +290,69 @@ func (s *Session) FetchFlags(changedSince uint64) ([]mail.Msg, error) {
 	return out, nil
 }
 
+const detailsCacheMax = 256
+
+func (s *Session) PrefetchBodies(uids []uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fc, err := s.currentLocked()
+	if err != nil {
+		return err
+	}
+	byArchive := make(map[string][]*mailMeta)
+	for _, uid := range uids {
+		id, ok := fc.idByUID[uid]
+		if !ok {
+			continue
+		}
+		m := fc.meta[id]
+		if !m.hasDetails {
+			continue
+		}
+		if _, ok := s.details[m.id]; ok {
+			continue
+		}
+		byArchive[m.detailsArc] = append(byArchive[m.detailsArc], m)
+	}
+	for arc, metas := range byArchive {
+		ids := make([]string, 0, len(metas))
+		byID := make(map[string]*mailMeta, len(metas))
+		for _, m := range metas {
+			ids = append(ids, m.detailsID)
+			byID[m.detailsID] = m
+		}
+		blobs, err := s.loadBlobElements(arc, ids)
+		if err != nil {
+			return err
+		}
+		for _, blob := range blobs {
+			if _, err := s.decryptInstance(blob, mailDetailsBlobSpec); err != nil {
+				return err
+			}
+			_, el, _ := blob.idTuple("1300")
+			m := byID[el]
+			if m == nil {
+				continue
+			}
+			if s.details == nil {
+				s.details = make(map[string]instance)
+			}
+			if len(s.details) >= detailsCacheMax {
+				clear(s.details)
+			}
+			s.details[m.id] = blob.agg("1305")
+		}
+	}
+	return nil
+}
+
 func (s *Session) loadDetails(m *mailMeta) (instance, error) {
 	if !m.hasDetails {
 		return nil, nil
+	}
+	if d, ok := s.details[m.id]; ok {
+		delete(s.details, m.id)
+		return d, nil
 	}
 	blobs, err := s.loadBlobElements(m.detailsArc, []string{m.detailsID})
 	if err != nil {

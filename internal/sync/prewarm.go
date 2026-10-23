@@ -26,6 +26,11 @@ func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) 
 	if attBatch < 1 {
 		attBatch = 1
 	}
+	room, err := m.st.NewCacheRoom()
+	if err != nil {
+		log.Printf("prewarm account %d: cache room: %v", acct.ID, err)
+		return
+	}
 	sel := ""
 	for {
 		if ctx.Err() != nil {
@@ -41,19 +46,49 @@ func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) 
 		}
 		sort.SliceStable(cands, func(i, j int) bool { return cands[i].FolderName < cands[j].FolderName })
 		progressed := false
-		for _, c := range cands {
-			if ctx.Err() != nil {
-				return
+		for i := 0; i < len(cands); {
+			j := i
+			for j < len(cands) && cands[j].FolderName == cands[i].FolderName {
+				j++
 			}
-			end, ok := bgTurn(ctx, cl)
-			if !ok {
-				return
+			group := cands[i:j]
+			if _, ok := cl.(mail.BodyPrefetcher); ok {
+				end, ok := bgTurn(ctx, cl)
+				if !ok {
+					return
+				}
+				if sel != group[0].FolderName {
+					if _, err := cl.Select(group[0].FolderName); err != nil {
+						log.Printf("prewarm account %d: select %s: %v", acct.ID, group[0].FolderName, err)
+						end()
+						return
+					}
+					sel = group[0].FolderName
+				}
+				uids := make([]uint32, 0, len(group))
+				for _, c := range group {
+					uids = append(uids, c.UID)
+				}
+				if err := cl.(mail.BodyPrefetcher).PrefetchBodies(uids); err != nil {
+					log.Printf("prewarm account %d: prefetch %s: %v", acct.ID, group[0].FolderName, err)
+				}
+				end()
 			}
-			okc := m.cacheBody(cl, acct, c, &sel)
-			end()
-			if okc {
-				progressed = true
+			for _, c := range group {
+				if ctx.Err() != nil {
+					return
+				}
+				end, ok := bgTurn(ctx, cl)
+				if !ok {
+					return
+				}
+				okc := m.cacheBody(cl, acct, c, &sel, room)
+				end()
+				if okc {
+					progressed = true
+				}
 			}
+			i = j
 		}
 		if !progressed || len(cands) < batch {
 			break
@@ -85,7 +120,7 @@ func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) 
 			if !ok {
 				return
 			}
-			okc := m.cacheAttachment(cl, acct, c, &sel)
+			okc := m.cacheAttachment(cl, acct, c, &sel, room)
 			end()
 			if okc {
 				progressed = true
@@ -97,7 +132,7 @@ func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) 
 	}
 }
 
-func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandidate, sel *string) bool {
+func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandidate, sel *string, room *store.CacheRoom) bool {
 	if *sel != c.FolderName {
 		if _, err := cl.Select(c.FolderName); err != nil {
 			log.Printf("prewarm account %d: select %s: %v", acct.ID, c.FolderName, err)
@@ -116,7 +151,7 @@ func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandida
 		return false
 	}
 	size := int64(len(parsed.Text) + len(parsed.HTML))
-	fits, err := m.st.MakeRoomForBody(size, c.DateTS, c.MessageID)
+	fits, err := room.MakeRoomForBody(size, c.DateTS, c.MessageID)
 	if err != nil {
 		log.Printf("prewarm account %d: budget: %v", acct.ID, err)
 		return false
@@ -128,6 +163,7 @@ func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandida
 		log.Printf("prewarm account %d: save body %d: %v", acct.ID, c.MessageID, err)
 		return false
 	}
+	room.NoteBodySaved(size)
 	rows := make([]store.AttachmentRow, 0, len(parsed.Attachments))
 	for _, a := range parsed.Attachments {
 		rows = append(rows, store.AttachmentRow{
@@ -146,7 +182,7 @@ func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandida
 	return true
 }
 
-func (m *Manager) cacheAttachment(cl mail.Conn, acct mail.Account, c store.AttachmentCandidate, sel *string) bool {
+func (m *Manager) cacheAttachment(cl mail.Conn, acct mail.Account, c store.AttachmentCandidate, sel *string, room *store.CacheRoom) bool {
 	if *sel != c.FolderName {
 		if _, err := cl.Select(c.FolderName); err != nil {
 			return false
@@ -162,7 +198,7 @@ func (m *Manager) cacheAttachment(cl mail.Conn, acct mail.Account, c store.Attac
 		return false
 	}
 	size := int64(len(part.Bytes))
-	fits, err := m.st.MakeRoomForAttachment(size, c.DateTS, c.MessageID, c.AttachmentID)
+	fits, err := room.MakeRoomForAttachment(size, c.DateTS, c.MessageID, c.AttachmentID)
 	if err != nil || !fits {
 		return false
 	}
@@ -179,5 +215,6 @@ func (m *Manager) cacheAttachment(cl mail.Conn, acct mail.Account, c store.Attac
 		_ = os.Remove(path)
 		return false
 	}
+	room.NoteAttachmentSaved(size)
 	return true
 }

@@ -31,6 +31,33 @@ const open = computed({
   set: (v) => emit('update:modelValue', v),
 })
 
+const vvStyle = ref({})
+let vvAttached = false
+function syncVV() {
+  const vv = window.visualViewport
+  if (!vv) return
+  vvStyle.value = { top: vv.offsetTop + 'px', height: vv.height + 'px' }
+}
+function attachVV() {
+  if (vvAttached || !window.visualViewport) return
+  vvAttached = true
+  window.visualViewport.addEventListener('resize', syncVV)
+  window.visualViewport.addEventListener('scroll', syncVV)
+  syncVV()
+}
+function detachVV() {
+  if (!vvAttached || !window.visualViewport) return
+  vvAttached = false
+  window.visualViewport.removeEventListener('resize', syncVV)
+  window.visualViewport.removeEventListener('scroll', syncVV)
+  vvStyle.value = {}
+}
+watch([open, lgAndUp], ([isOpen, up]) => {
+  if (isOpen && !up) attachVV()
+  else detachVV()
+}, { immediate: true })
+onBeforeUnmount(detachVV)
+
 const accountId = ref('')
 const toChips = ref([])
 const ccChips = ref([])
@@ -656,6 +683,7 @@ function onKeydown(e) {
   <div
     v-show="open"
     class="compose-root"
+    :style="!lgAndUp ? vvStyle : undefined"
     :class="{
       'compose-root-mobile': !lgAndUp,
       'compose-max': maximized && lgAndUp,
@@ -1161,6 +1189,18 @@ function onKeydown(e) {
   border-left: none;
   border-right: none;
   border-radius: 0;
+  flex: none;
+}
+.compose-root-mobile .compose-body {
+  overflow-y: auto;
+}
+.compose-root-mobile .compose-editarea {
+  flex: none;
+}
+.compose-root-mobile .compose-editarea .ProseMirror {
+  flex: none;
+  min-height: 180px;
+  overflow-y: visible;
 }
 .compose-toolbar {
   display: flex;

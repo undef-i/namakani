@@ -172,12 +172,31 @@ func (s *Store) EvictBody(messageID int64) error {
 	return s.ftsSetBody(messageID, "")
 }
 
-func (s *Store) MakeRoomForBody(size, dateTS, msgID int64) (bool, error) {
+type CacheRoom struct {
+	s         *Store
+	bodyBytes int64
+	attBytes  int64
+}
+
+func (s *Store) NewCacheRoom() (*CacheRoom, error) {
 	bodyBytes, attBytes, err := s.CacheUsage()
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	usage := bodyBytes + attBytes
+	return &CacheRoom{s: s, bodyBytes: bodyBytes, attBytes: attBytes}, nil
+}
+
+func (r *CacheRoom) NoteBodySaved(size int64) {
+	r.bodyBytes += size
+}
+
+func (r *CacheRoom) NoteAttachmentSaved(size int64) {
+	r.attBytes += size
+}
+
+func (r *CacheRoom) MakeRoomForBody(size, dateTS, msgID int64) (bool, error) {
+	s := r.s
+	usage := r.bodyBytes + r.attBytes
 	if usage+size <= s.CacheBudgetBytes() {
 		return true, nil
 	}
@@ -185,7 +204,7 @@ func (s *Store) MakeRoomForBody(size, dateTS, msgID int64) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if usage-attBytes-oldBodies+size > s.CacheBudgetBytes() {
+	if usage-r.attBytes-oldBodies+size > s.CacheBudgetBytes() {
 		return false, nil
 	}
 	for usage+size > s.CacheBudgetBytes() {
@@ -197,6 +216,7 @@ func (s *Store) MakeRoomForBody(size, dateTS, msgID int64) (bool, error) {
 				return false, err
 			}
 			usage -= freed
+			r.attBytes -= freed
 			continue
 		}
 		id, sz, found, err := s.oldestCachedBodyBefore(dateTS, msgID)
@@ -210,16 +230,14 @@ func (s *Store) MakeRoomForBody(size, dateTS, msgID int64) (bool, error) {
 			return false, err
 		}
 		usage -= sz
+		r.bodyBytes -= sz
 	}
 	return true, nil
 }
 
-func (s *Store) MakeRoomForAttachment(size, dateTS, msgID, attID int64) (bool, error) {
-	bodyBytes, attBytes, err := s.CacheUsage()
-	if err != nil {
-		return false, err
-	}
-	usage := bodyBytes + attBytes
+func (r *CacheRoom) MakeRoomForAttachment(size, dateTS, msgID, attID int64) (bool, error) {
+	s := r.s
+	usage := r.bodyBytes + r.attBytes
 	if usage+size <= s.CacheBudgetBytes() {
 		return true, nil
 	}
@@ -243,6 +261,7 @@ func (s *Store) MakeRoomForAttachment(size, dateTS, msgID, attID int64) (bool, e
 			return false, err
 		}
 		usage -= freed
+		r.attBytes -= freed
 	}
 	return true, nil
 }
