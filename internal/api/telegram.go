@@ -377,6 +377,7 @@ type tgItem struct {
 	Account string
 	From    string
 	Subject string
+	Snippet string
 }
 
 const tgNamakaniBase = "https://namakani.example.com"
@@ -387,6 +388,10 @@ func tgDeepLink(id int64) string {
 
 func rtBold(s string) any {
 	return map[string]any{"type": "bold", "text": s}
+}
+
+func rtItalic(s string) any {
+	return map[string]any{"type": "italic", "text": s}
 }
 
 func rtURL(text any, url string) any {
@@ -412,8 +417,15 @@ func tgRichBlocks(it tgItem) []any {
 		tgParagraph([]any{rtURL(rtBold(it.Subject), tgDeepLink(it.ID))}),
 		tgParagraph([]any{it.From, "  ", rtDateTime(it.DateTS)}),
 	}
-	blocks = append(blocks, map[string]any{"type": "footer", "text": it.Account})
+	blocks = append(blocks, map[string]any{"type": "footer", "text": tgFooterText(it)})
 	return blocks
+}
+
+func tgFooterText(it tgItem) any {
+	if it.Snippet == "" {
+		return it.Account
+	}
+	return []any{rtItalic(it.Snippet), "\n", it.Account}
 }
 
 func (s *Server) tgPushOne(cfg tgConfig, it tgItem) {
@@ -469,6 +481,7 @@ func (s *Server) freshInboxItems(c syncmgr.Change) []tgItem {
 			Account: row.AccountLabel,
 			From:    from,
 			Subject: subject,
+			Snippet: row.Snippet,
 		})
 	}
 	return items

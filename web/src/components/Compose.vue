@@ -1037,7 +1037,7 @@ function onKeydown(e) {
   max-width: none;
 }
 .compose-max {
-  inset: 24px;
+  inset: 0;
   width: auto;
   max-width: none;
 }
@@ -1056,7 +1056,8 @@ function onKeydown(e) {
 }
 .compose-max .compose-card {
   height: 100%;
-  border-radius: 16px;
+  border-radius: 0;
+  box-shadow: none;
 }
 .compose-head {
   display: flex;
@@ -1073,16 +1074,22 @@ function onKeydown(e) {
   min-height: 0;
 }
 .compose-body {
+  display: flex;
+  flex-direction: column;
   flex: 1;
-  overflow-y: auto;
+  overflow: hidden;
   min-height: 0;
   padding: 12px 0;
 }
 .compose-pad {
+  flex: none;
+  max-height: 32dvh;
+  overflow-y: auto;
   padding-left: 16px;
   padding-right: 16px;
 }
 .cform {
+  flex: none;
   padding: 0 16px;
 }
 .crow {
@@ -1135,6 +1142,10 @@ function onKeydown(e) {
   border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 .compose-editor {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
   margin: 0;
   border: none;
 }
@@ -1153,22 +1164,26 @@ function onKeydown(e) {
 }
 .compose-toolbar {
   display: flex;
+  flex: none;
   flex-wrap: wrap;
   align-items: center;
   padding: 4px 10px;
   border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
+.compose-editarea {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
 .compose-editarea .ProseMirror {
-  min-height: 180px;
-  max-height: 40dvh;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 12px 16px;
   outline: none;
   font-size: 14px;
   line-height: 1.55;
-}
-.compose-root-mobile .compose-editarea .ProseMirror {
-  max-height: none;
 }
 .compose-editarea .ProseMirror p {
   margin: 0 0 8px;

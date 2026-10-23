@@ -165,18 +165,36 @@ func ParseBodyPart(raw []byte, partPath string) (*Attachment, error) {
 
 const snippetMaxRunes = 140
 
-var snippetCutRe = regexp.MustCompile(`^(On .{1,160} wrote:|.{0,100}写道[:：]|[-_]{3,}\s*(Original Message|原始邮件|转发邮件)|_{10,}|-{10,}\s*$)`)
+var snippetCutRe = regexp.MustCompile(`^(On .{1,200} wrote:|.{0,100}写道[:：]|[-_]{2,}\s*(Original Message|原始邮件|转发邮件|Forwarded message)|Begin forwarded message[:：]|_{10,}|-{10,}\s*$)`)
+
+var snippetFromRe = regexp.MustCompile(`^(From|发件人)[:：]`)
+
+var snippetHdrRe = regexp.MustCompile(`^(Sent|Date|To|Cc|Subject|发送时间|日期|收件人|抄送|主题)[:：]`)
+
+var snippetGreetRes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^(hi|hello|hey|hiya|howdy|greetings|good\s+(morning|afternoon|evening|day))\b[\s,!.]*([a-z][a-z'.-]*( [a-z][a-z'.-]*){0,1})?[\s,!.]*$`),
+	regexp.MustCompile(`(?i)^dear\s+[^,.!?;]{1,40}[,:]$`),
+	regexp.MustCompile(`^[^，。！？；、]{0,24}(您好|你好)[，,：:!！]?\s*$`),
+	regexp.MustCompile(`^(大家好|您好|你好)[，,：:!！]?\s*$`),
+}
 
 func MakeSnippet(text, htmlBody string) string {
-	src := text
-	if strings.TrimSpace(src) == "" && htmlBody != "" {
-		src = htmlToText(htmlBody)
+	if s := snippetClean(text); s != "" {
+		return s
 	}
+	if strings.TrimSpace(htmlBody) != "" {
+		return snippetClean(htmlToText(htmlBody))
+	}
+	return ""
+}
+
+func snippetClean(src string) string {
 	if strings.TrimSpace(src) == "" {
 		return ""
 	}
+	lines := strings.Split(src, "\n")
 	var kept []string
-	for _, ln := range strings.Split(src, "\n") {
+	for i, ln := range lines {
 		t := strings.TrimSpace(ln)
 		if t == "--" {
 			break
@@ -187,14 +205,59 @@ func MakeSnippet(text, htmlBody string) string {
 		if snippetCutRe.MatchString(t) {
 			break
 		}
-		kept = append(kept, ln)
+		if strings.HasPrefix(t, "On ") && !strings.Contains(t, "wrote:") && i+1 < len(lines) && strings.HasSuffix(strings.TrimSpace(lines[i+1]), "wrote:") {
+			break
+		}
+		if strings.Contains(t, "@") && snippetFromRe.MatchString(t) && snippetHeaderFollows(lines, i) {
+			break
+		}
+		kept = append(kept, t)
 	}
-	s := strings.Join(strings.Fields(strings.Join(kept, "\n")), " ")
+	start := 0
+	for start < len(kept) && (kept[start] == "" || snippetIsGreeting(kept[start])) {
+		start++
+	}
+	if start > 0 && start < len(kept) {
+		kept = kept[start:]
+	}
+	s := strings.Join(strings.Fields(strings.Join(kept, " ")), " ")
+	return truncateSnippet(s)
+}
+
+func snippetHeaderFollows(lines []string, i int) bool {
+	for j := i + 1; j < len(lines) && j <= i+4; j++ {
+		if snippetHdrRe.MatchString(strings.TrimSpace(lines[j])) {
+			return true
+		}
+	}
+	return false
+}
+
+func snippetIsGreeting(line string) bool {
+	for _, re := range snippetGreetRes {
+		if re.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateSnippet(s string) string {
 	r := []rune(s)
-	if len(r) > snippetMaxRunes {
-		s = string(r[:snippetMaxRunes])
+	if len(r) <= snippetMaxRunes {
+		return s
 	}
-	return s
+	cut := snippetMaxRunes - 1
+	idx := -1
+	for i := 0; i < cut; i++ {
+		if r[i] == ' ' {
+			idx = i
+		}
+	}
+	if idx >= cut*2/3 {
+		return string(r[:idx]) + "…"
+	}
+	return string(r[:cut]) + "…"
 }
 
 func htmlToText(htmlBody string) string {
@@ -207,9 +270,9 @@ func htmlToText(htmlBody string) string {
 	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode {
 			switch n.Data {
-			case "script", "style", "head", "title":
+			case "script", "style", "head", "title", "noscript":
 				return
-			case "br", "p", "div", "tr", "li", "blockquote", "table",
+			case "br", "p", "div", "tr", "td", "li", "blockquote", "table",
 				"h1", "h2", "h3", "h4", "h5", "h6":
 				sb.WriteByte('\n')
 			}

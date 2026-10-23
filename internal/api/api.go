@@ -514,11 +514,13 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	if idNum, err := strconv.ParseInt(r.PathValue("id"), 10, 64); err == nil {
-		s.mgr.Stop(idNum)
-	}
-	_, err := s.st.DB.Exec("DELETE FROM accounts WHERE id = ?", r.PathValue("id"))
+	idNum, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad account id")
+		return
+	}
+	s.mgr.Stop(idNum)
+	if err := s.st.DeleteAccount(idNum); err != nil {
 		writeErr(w, http.StatusInternalServerError, "delete failed")
 		return
 	}

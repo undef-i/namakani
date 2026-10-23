@@ -600,7 +600,7 @@ function clearSearch() {
 
 function openCompose(init) {
   composeInit.value = init
-  if (!lgAndUp.value) drawerOpen.value = false
+  drawerOpen.value = false
   composeOpen.value = true
 }
 
@@ -816,7 +816,7 @@ function disconnectEvents() {
 function selectScope(key) {
   scope.value = key
   clearSelection()
-  if (!lgAndUp.value) drawerOpen.value = false
+  drawerOpen.value = false
   searchQuery.value = ''
   searching.value = false
   loadMessages()
@@ -1357,12 +1357,8 @@ function menuRipple(e) {
 }
 
 function toggleDrawer() {
-  if (lgAndUp.value) return
   drawerOpen.value = !drawerOpen.value
 }
-watch(lgAndUp, (up) => {
-  drawerOpen.value = up
-}, { immediate: true })
 
 let readerTouch = null
 function onReaderTouchStart(e) {
@@ -1389,7 +1385,7 @@ function onReaderTouchEnd(e) {
 
 function openAccounts() {
   openSettings()
-  if (!lgAndUp.value) drawerOpen.value = false
+  drawerOpen.value = false
 }
 
 async function enter() {
@@ -1517,7 +1513,7 @@ onBeforeUnmount(() => {
       <v-app-bar height="64" flat>
         <div class="appbar-search">
           <div class="search-wrap">
-            <button v-if="!lgAndUp" type="button" class="search-menu-btn" :aria-label="t('展开菜单')" @pointerdown="menuRipple" @click="toggleDrawer">
+            <button type="button" class="search-menu-btn" :aria-label="t('展开菜单')" @pointerdown="menuRipple" @click="toggleDrawer">
               <v-icon icon="mdi-menu" size="22" />
             </button>
             <v-text-field
@@ -1547,26 +1543,11 @@ onBeforeUnmount(() => {
 
       <v-navigation-drawer
         v-model="drawerOpen"
-        :permanent="lgAndUp"
-        :temporary="!lgAndUp"
-        :rail="lgAndUp"
-        rail-width="56"
+        temporary
         width="280"
       >
         <div class="d-flex flex-column pa-3 drawer-inner">
           <v-btn
-            v-if="lgAndUp"
-            color="primary"
-            icon="mdi-pencil"
-            rounded="xl"
-            size="small"
-            class="mb-4 align-self-center"
-            style="flex: none"
-            :aria-label="t('写信')"
-            @click="openCompose({})"
-          />
-          <v-btn
-            v-else
             color="primary"
             block
             rounded="xl"
@@ -1582,7 +1563,7 @@ onBeforeUnmount(() => {
             <v-skeleton-loader type="list-item@3" />
           </template>
           <template v-else-if="foldersStatus === 'error'">
-            <p v-if="!lgAndUp" class="text-body-2 text-error px-1">
+            <p class="text-body-2 text-error px-1">
               {{ t('文件夹加载失败：{error}', { error: foldersError }) }}
               <v-btn variant="text" size="small" @click="loadFolders">{{ t('重试') }}</v-btn>
             </p>
@@ -1592,24 +1573,13 @@ onBeforeUnmount(() => {
               <v-list-item
                 v-for="s in visibleScopes"
                 :key="s.key"
+                :prepend-icon="s.icon"
                 :title="s.label"
                 :active="scope === s.key"
                 rounded="pill"
                 @click="selectScope(s.key)"
               >
-                <template #prepend>
-                  <v-badge
-                    v-if="lgAndUp"
-                    :model-value="scopeStats[s.key].unread > 0"
-                    :content="scopeStats[s.key].unread"
-                    color="primary"
-                    location="top end"
-                  >
-                    <v-icon :icon="s.icon" />
-                  </v-badge>
-                  <v-icon v-else :icon="s.icon" />
-                </template>
-                <template v-if="!lgAndUp" #append>
+                <template #append>
                   <v-badge
                     v-if="scopeStats[s.key].unread > 0"
                     :content="scopeStats[s.key].unread"
@@ -1619,7 +1589,7 @@ onBeforeUnmount(() => {
                 </template>
               </v-list-item>
             </v-list>
-            <p v-if="visibleScopes.length === 0 && !lgAndUp" class="text-body-2 text-medium-emphasis px-1">
+            <p v-if="visibleScopes.length === 0" class="text-body-2 text-medium-emphasis px-1">
               {{ t('暂无文件夹（同步后出现）') }}
             </p>
           </template>
@@ -2075,7 +2045,7 @@ onBeforeUnmount(() => {
         @click="openCompose({})"
       />
 
-      <v-dialog v-model="settingsOpen" :fullscreen="!lgAndUp" max-width="920" scrollable transition="false" @update:model-value="(v) => { if (!v) closeSettings() }">
+      <v-dialog v-model="settingsOpen" z-index="2700" :fullscreen="!lgAndUp" max-width="920" scrollable transition="false" @update:model-value="(v) => { if (!v) closeSettings() }">
         <v-card>
           <v-card-title class="d-flex align-center">
             {{ t('设置') }}
@@ -2238,15 +2208,6 @@ body {
   .appbar-search {
     width: 380px;
   }
-}
-@media (min-width: 1280px) {
-  .search-field .v-field__input {
-    padding-inline-start: 16px;
-  }
-}
-.v-navigation-drawer--rail .drawer-inner {
-  padding: 8px;
-  align-items: center;
 }
 .list-section {
   display: flex;
