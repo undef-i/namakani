@@ -1,18 +1,19 @@
 import { createApp } from 'vue'
 import { createVuetify } from 'vuetify'
-import { zhHans } from 'vuetify/locale'
+import { en, zhHans } from 'vuetify/locale'
 import 'vuetify/styles'
 import '@mdi/font/css/materialdesignicons.css'
 import '@fontsource/roboto/400.css'
 import '@fontsource/roboto/500.css'
 import '@fontsource/roboto/700.css'
 import App from './App.vue'
+import { lang } from './i18n'
 
 const vuetify = createVuetify({
   locale: {
-    locale: 'zhHans',
-    fallback: 'zhHans',
-    messages: { zhHans },
+    locale: lang.value === 'zh' ? 'zhHans' : 'en',
+    fallback: 'en',
+    messages: { zhHans, en },
   },
   theme: {
     defaultTheme: 'light',

@@ -9,17 +9,17 @@ import (
 	"namakani/internal/store"
 )
 
-const (
-	prewarmBodiesPerRound      = 100
-	prewarmAttachmentsPerRound = 50
-)
-
 func (m *Manager) prewarm(ctx context.Context, cl *mail.Client, acct mail.Account) {
+	batch := m.st.AppSettings().SyncBatch
+	attBatch := batch / 2
+	if attBatch < 1 {
+		attBatch = 1
+	}
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		cands, err := m.st.BodyCandidates(acct.ID, prewarmBodiesPerRound)
+		cands, err := m.st.BodyCandidates(acct.ID, batch)
 		if err != nil {
 			log.Printf("prewarm account %d: candidates: %v", acct.ID, err)
 			return
@@ -36,7 +36,7 @@ func (m *Manager) prewarm(ctx context.Context, cl *mail.Client, acct mail.Accoun
 				progressed = true
 			}
 		}
-		if !progressed || len(cands) < prewarmBodiesPerRound {
+		if !progressed || len(cands) < batch {
 			break
 		}
 	}
@@ -44,7 +44,7 @@ func (m *Manager) prewarm(ctx context.Context, cl *mail.Client, acct mail.Accoun
 	if err != nil || len(remaining) > 0 {
 		return
 	}
-	atts, err := m.st.AttachmentCandidates(acct.ID, prewarmAttachmentsPerRound)
+	atts, err := m.st.AttachmentCandidates(acct.ID, attBatch)
 	if err != nil {
 		log.Printf("prewarm account %d: attachment candidates: %v", acct.ID, err)
 		return
@@ -94,6 +94,11 @@ func (m *Manager) cacheBody(cl *mail.Client, acct mail.Account, c store.BodyCand
 	}
 	if _, err := m.st.ReplaceAttachments(c.MessageID, rows); err != nil {
 		log.Printf("prewarm account %d: attachments %d: %v", acct.ID, c.MessageID, err)
+	}
+	if len(parsed.References) > 0 || parsed.InReplyTo != "" {
+		if err := m.st.RecomputeThreadKey(acct.ID, c.MessageID, parsed.References, parsed.InReplyTo); err != nil {
+			log.Printf("prewarm account %d: thread key %d: %v", acct.ID, c.MessageID, err)
+		}
 	}
 	return true
 }

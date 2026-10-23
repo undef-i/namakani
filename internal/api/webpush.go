@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	settingWPEnabled      = "wp_enabled"
 	settingVAPIDPublic    = "vapid_public"
 	settingVAPIDPrivateEn = "vapid_private_enc"
 
@@ -51,11 +50,6 @@ func (s *Server) vapidKeys() (pub, priv string, err error) {
 		return "", "", err
 	}
 	return pub, priv, nil
-}
-
-func (s *Server) wpEnabled() bool {
-	v, ok, _ := s.st.GetSetting(settingWPEnabled)
-	return ok && v == "1"
 }
 
 type wpSubscription struct {
@@ -116,9 +110,6 @@ func (s *Server) wpSend(pub, priv string, subs []wpSubscription, payload []byte)
 }
 
 func (s *Server) wpNotify(c syncmgr.Change) {
-	if !s.wpEnabled() {
-		return
-	}
 	subs := s.wpSubscriptions()
 	if len(subs) == 0 {
 		return
@@ -155,29 +146,9 @@ func (s *Server) handleGetWebPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":       s.wpEnabled(),
 		"public_key":    pub,
 		"subscriptions": len(s.wpSubscriptions()),
 	})
-}
-
-func (s *Server) handlePutWebPush(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
-		return
-	}
-	v := "0"
-	if req.Enabled {
-		v = "1"
-	}
-	if err := s.st.SetSetting(settingWPEnabled, v); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	s.handleGetWebPush(w, r)
 }
 
 type wpSubscribeReq struct {

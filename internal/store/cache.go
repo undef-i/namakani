@@ -6,8 +6,6 @@ import (
 	"strconv"
 )
 
-const CacheBudgetBytes = 4 * 1024 * 1024 * 1024
-
 func (s *Store) cacheBodyBytes() (int64, error) {
 	var n int64
 	err := s.DB.QueryRow(`SELECT COALESCE(SUM(LENGTH(text_body) + LENGTH(html_body)), 0) FROM bodies`).Scan(&n)
@@ -180,17 +178,17 @@ func (s *Store) MakeRoomForBody(size, dateTS, msgID int64) (bool, error) {
 		return false, err
 	}
 	usage := bodyBytes + attBytes
-	if usage+size <= CacheBudgetBytes {
+	if usage+size <= s.CacheBudgetBytes() {
 		return true, nil
 	}
 	oldBodies, err := s.bodyBytesBefore(dateTS, msgID)
 	if err != nil {
 		return false, err
 	}
-	if usage-attBytes-oldBodies+size > CacheBudgetBytes {
+	if usage-attBytes-oldBodies+size > s.CacheBudgetBytes() {
 		return false, nil
 	}
-	for usage+size > CacheBudgetBytes {
+	for usage+size > s.CacheBudgetBytes() {
 		if id, path, sz, found, err := s.oldestCachedAttachment(0, 0, 0, true); err != nil {
 			return false, err
 		} else if found {
@@ -222,17 +220,17 @@ func (s *Store) MakeRoomForAttachment(size, dateTS, msgID, attID int64) (bool, e
 		return false, err
 	}
 	usage := bodyBytes + attBytes
-	if usage+size <= CacheBudgetBytes {
+	if usage+size <= s.CacheBudgetBytes() {
 		return true, nil
 	}
 	lower, err := s.attachmentBytesBefore(dateTS, msgID, attID)
 	if err != nil {
 		return false, err
 	}
-	if usage-lower+size > CacheBudgetBytes {
+	if usage-lower+size > s.CacheBudgetBytes() {
 		return false, nil
 	}
-	for usage+size > CacheBudgetBytes {
+	for usage+size > s.CacheBudgetBytes() {
 		id, path, sz, found, err := s.oldestCachedAttachment(dateTS, msgID, attID, false)
 		if err != nil {
 			return false, err

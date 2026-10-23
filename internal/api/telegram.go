@@ -19,8 +19,6 @@ const (
 	settingTGEnabled  = "tg_enabled"
 	settingTGChatID   = "tg_chat_id"
 	settingTGTokenEnc = "tg_token_enc"
-
-	tgFreshWindow = 15 * time.Minute
 )
 
 type tgConfig struct {
@@ -436,7 +434,10 @@ func (s *Server) freshInboxItems(c syncmgr.Change) []tgItem {
 	if !ok || f.SpecialUse != "inbox" {
 		return nil
 	}
-	cutoff := time.Now().Add(-tgFreshWindow).Unix()
+	var cutoff int64
+	if c.Initial {
+		cutoff = time.Now().Add(-time.Duration(s.st.AppSettings().PushWindowMinutes) * time.Minute).Unix()
+	}
 	var items []tgItem
 	for _, row := range s.messageRowsByIDs(c.Inserted) {
 		if row.FolderID != c.FolderID || row.DateTS < cutoff {

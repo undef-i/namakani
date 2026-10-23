@@ -1,23 +1,26 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useDisplay, useTheme } from 'vuetify'
+import { useDisplay, useLocale, useTheme } from 'vuetify'
+import { intlLocale, lang, t } from './i18n'
 import Auth from './components/Auth.vue'
 import Accounts from './components/Accounts.vue'
 import Compose from './components/Compose.vue'
 import * as api from './api.js'
 
-const SCOPES = [
-  { key: 'inbox', label: '收件箱', icon: 'mdi-inbox' },
-  { key: 'sent', label: '已发送', icon: 'mdi-send' },
-  { key: 'drafts', label: '草稿箱', icon: 'mdi-file-document-edit-outline' },
-  { key: 'archive', label: '归档', icon: 'mdi-archive' },
-  { key: 'junk', label: '垃圾邮件', icon: 'mdi-alert-octagon-outline' },
-  { key: 'trash', label: '回收站', icon: 'mdi-delete' },
-]
+const SCOPES = computed(() => [
+  { key: 'inbox', label: t('收件箱'), icon: 'mdi-inbox' },
+  { key: 'sent', label: t('已发送'), icon: 'mdi-send' },
+  { key: 'drafts', label: t('草稿箱'), icon: 'mdi-file-document-edit-outline' },
+  { key: 'archive', label: t('归档'), icon: 'mdi-archive' },
+  { key: 'junk', label: t('垃圾邮件'), icon: 'mdi-alert-octagon-outline' },
+  { key: 'trash', label: t('回收站'), icon: 'mdi-delete' },
+])
 const PAGE_SIZE = 60
 
 const display = useDisplay()
 const theme = useTheme()
+const vuetifyLocale = useLocale()
+watch(lang, (v) => (vuetifyLocale.current.value = v === 'zh' ? 'zhHans' : 'en'), { immediate: true })
 const lgAndUp = computed(() => display.lgAndUp.value)
 const wideLayout = computed(() => display.width.value >= 1440)
 
@@ -42,6 +45,15 @@ const detailState = ref('idle')
 const detailError = ref('')
 const opBusy = ref(false)
 let detailToken = 0
+
+function clearSelection() {
+  detailToken++
+  selected.value = null
+  detail.value = null
+  if (!booted && (location.hash.startsWith('#/mail/') || location.hash.startsWith('#m-'))) {
+    history.pushState(null, '', location.pathname + location.search)
+  }
+}
 const frameEl = ref(null)
 const drawerOpen = ref(false)
 const loadingMore = ref(false)
@@ -54,9 +66,13 @@ const searching = ref(false)
 const searchQuery = ref('')
 let searchTimer = null
 const threaded = ref(false)
-const expandedKey = ref('')
-const threadMsgs = ref([])
+const undoSeconds = ref(5)
+const maxAttachmentMB = ref(20)
+const convo = ref(null)
+const convoOpenIds = ref(new Set())
+const convoDetails = ref({})
 const cursorIdx = ref(0)
+const cursorActive = ref(false)
 const helpOpen = ref(false)
 const listEl = ref(null)
 const searchEl = ref(null)
@@ -69,7 +85,52 @@ let esDelay = 1000
 let statusTimer = null
 let booted = false
 
-const scopeLabel = computed(() => SCOPES.find((s) => s.key === scope.value)?.label ?? scope.value)
+function deepIdFromHash() {
+  const m = /^#\/mail\/(\d+)$/.exec(location.hash) || /^#m-(\d+)$/.exec(location.hash)
+  return m ? +m[1] : 0
+}
+
+const initialDeepId = deepIdFromHash()
+
+function placeholderMessage(id) {
+  return {
+    id,
+    account_id: 0,
+    account_label: '',
+    folder_id: 0,
+    folder_name: '',
+    folder_special: '',
+    thread_key: '',
+    subject: '',
+    from_name: '',
+    from_email: '',
+    date_ts: 0,
+    flags: 0,
+    has_attach: false,
+    snippet: '',
+    size: 0,
+  }
+}
+
+function enrichSelected(d) {
+  if (selected.value?.id !== d.id) return
+  selected.value = {
+    ...selected.value,
+    account_id: d.account_id,
+    account_label: d.account_label,
+    folder_id: d.folder_id,
+    folder_name: d.folder_name,
+    subject: d.subject || '',
+    from_name: d.from?.name || '',
+    from_email: d.from?.email || '',
+    date_ts: d.date_ts,
+    flags: d.flags,
+    has_attach: !!d.has_attach,
+    size: d.size,
+  }
+}
+
+const scopeLabel = computed(() => SCOPES.value.find((s) => s.key === scope.value)?.label ?? scope.value)
 const scopeStats = computed(() => {
   const map = {}
   for (const f of folders.value) {
@@ -82,7 +143,7 @@ const scopeStats = computed(() => {
   }
   return map
 })
-const visibleScopes = computed(() => SCOPES.filter((s) => scopeStats.value[s.key]?.present))
+const visibleScopes = computed(() => SCOPES.value.filter((s) => scopeStats.value[s.key]?.present))
 
 function applyTheme() {
   const dark =
@@ -134,26 +195,33 @@ function avatarLetter(m) {
 function fmtListTime(ts) {
   const d = new Date(ts * 1000)
   const now = new Date()
-  const pad = (n) => String(n).padStart(2, '0')
-  if (d.toDateString() === now.toDateString()) return pad(d.getHours()) + ':' + pad(d.getMinutes())
-  if (d.getFullYear() === now.getFullYear()) return d.getMonth() + 1 + '/' + d.getDate()
-  return d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate()
+  if (d.toDateString() === now.toDateString())
+    return new Intl.DateTimeFormat(intlLocale(), { hour: '2-digit', minute: '2-digit', hour12: false }).format(d)
+  if (d.getFullYear() === now.getFullYear())
+    return new Intl.DateTimeFormat(intlLocale(), { month: 'numeric', day: 'numeric' }).format(d)
+  return new Intl.DateTimeFormat(intlLocale(), { year: 'numeric', month: 'numeric', day: 'numeric' }).format(d)
 }
 
 function fmtFull(ts) {
-  const d = new Date(ts * 1000)
-  const pad = (n) => String(n).padStart(2, '0')
-  return (
-    d.getFullYear() +
-    '-' +
-    pad(d.getMonth() + 1) +
-    '-' +
-    pad(d.getDate()) +
-    ' ' +
-    pad(d.getHours()) +
-    ':' +
-    pad(d.getMinutes())
-  )
+  return new Intl.DateTimeFormat(intlLocale(), {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(ts * 1000))
+}
+
+function fmtFullEn(ts) {
+  return new Intl.DateTimeFormat('en-US', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(ts * 1000))
 }
 
 function fmtSize(n) {
@@ -167,12 +235,14 @@ function fmtAddrList(list) {
 }
 
 
-async function loadMessages() {
-  listStatus.value = 'loading'
+async function loadMessages(soft = false) {
+  const keepReady = soft && listStatus.value === 'ready'
+  if (!keepReady) listStatus.value = 'loading'
   listError.value = ''
   listOffset = 0
-  expandedKey.value = ''
-  threadMsgs.value = []
+  convo.value = null
+  convoOpenIds.value = new Set()
+  convoDetails.value = {}
   cursorIdx.value = 0
   try {
     if (searching.value) {
@@ -186,6 +256,10 @@ async function loadMessages() {
     }
     listStatus.value = 'ready'
   } catch (err) {
+    if (keepReady) {
+      listStatus.value = 'ready'
+      return
+    }
     messages.value = []
     listHasMore.value = false
     listStatus.value = 'error'
@@ -231,6 +305,7 @@ const ptrRaw = ref(0)
 const ptrBusy = ref(false)
 const ptrTracking = ref(false)
 let ptrStartY = -1
+let ptrStartX = -1
 let ptrAttachedEl = null
 
 const ptrTotal = computed(() => ptrRaw.value * 0.5)
@@ -243,7 +318,11 @@ const ptrTension = computed(() => {
 })
 const ptrY = computed(() => {
   if (ptrBusy.value) return 14
-  return -58 + PTR_TRIGGER * ptrDragPercent.value + PTR_TRIGGER * ptrTension.value * 2
+  return -96 + 102 * ptrDragPercent.value + 48 * ptrTension.value
+})
+const ptrOpacity = computed(() => {
+  if (ptrBusy.value) return 1
+  return Math.min(1, ptrDragPercent.value * 1.6)
 })
 const ptrArc = computed(() => {
   const adj = ptrAdjusted.value
@@ -264,24 +343,17 @@ const ptrArc = computed(() => {
   const s = Math.min(1, adj)
   let arrow = ''
   if (s > 0) {
-    const w = 10 * s
-    const h = 5 * s
-    const ox = r + cx - w / 2
-    const oy = cy + 1.25
     const a = rad(startDeg + sweepDeg)
-    const cos = Math.cos(a)
-    const sin = Math.sin(a)
-    arrow = [
-      [ox, oy],
-      [ox + w, oy],
-      [ox + w / 2, oy + h],
-    ]
-      .map(([x, y]) => {
-        const dx = x - cx
-        const dy = y - cy
-        return (cx + dx * cos - dy * sin).toFixed(2) + ',' + (cy + dx * sin + dy * cos).toFixed(2)
-      })
-      .join(' ')
+    const tx = -Math.sin(a)
+    const ty = Math.cos(a)
+    const nx = Math.cos(a)
+    const ny = Math.sin(a)
+    const hw = 5 * s
+    const hh = 5 * s
+    arrow =
+      (ex + tx * hh).toFixed(2) + ',' + (ey + ty * hh).toFixed(2) + ' ' +
+      (ex + nx * hw).toFixed(2) + ',' + (ey + ny * hw).toFixed(2) + ' ' +
+      (ex - nx * hw).toFixed(2) + ',' + (ey - ny * hw).toFixed(2)
   }
   return { path, arrow }
 })
@@ -294,6 +366,7 @@ function ptrStart(e) {
     return
   }
   ptrStartY = e.touches[0].clientY
+  ptrStartX = e.touches[0].clientX
   ptrTracking.value = true
 }
 
@@ -306,6 +379,12 @@ function ptrMove(e) {
     return
   }
   const dy = e.touches[0].clientY - ptrStartY
+  const dx = e.touches[0].clientX - ptrStartX
+  if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy)) {
+    ptrRaw.value = 0
+    ptrTracking.value = false
+    return
+  }
   if (dy <= 0) {
     ptrRaw.value = 0
     return
@@ -340,20 +419,132 @@ watch(listEl, (el) => {
   el.addEventListener('touchcancel', ptrEnd)
 })
 
+
+const SWIPE_COMMIT = 96
+const swipeId = ref(0)
+const swipeDx = ref(0)
+const swipeDragging = ref(false)
+const exitId = ref(0)
+const exitH = ref(0)
+const exitTrans = ref(false)
+let swipeStart = null
+let swipeWidth = 0
+let swipeHeight = 0
+let suppressClickUntil = 0
+
+function rowWrapStyle(m) {
+  if (exitId.value !== m.id) return {}
+  return {
+    height: exitH.value + 'px',
+    transition: exitTrans.value ? 'height 0.22s ease' : 'none',
+  }
+}
+
+function rowSwipeStyle(m) {
+  if (swipeId.value !== m.id) return {}
+  return {
+    transform: 'translateX(' + swipeDx.value + 'px)',
+    transition: swipeDragging.value ? 'none' : 'transform 0.18s ease',
+    background: 'rgb(var(--v-theme-surface))',
+  }
+}
+
+function rowTouchStart(e, m) {
+  if (exitId.value === m.id) return
+  swipeStart = { id: m.id, x: e.touches[0].clientX, y: e.touches[0].clientY, engaged: false }
+  swipeId.value = m.id
+  swipeDx.value = 0
+  swipeDragging.value = false
+}
+
+function rowTouchMove(e, m) {
+  if (!swipeStart || swipeStart.id !== m.id) return
+  const dx = e.touches[0].clientX - swipeStart.x
+  const dy = e.touches[0].clientY - swipeStart.y
+  if (!swipeStart.engaged) {
+    if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+      swipeStart.engaged = true
+      swipeDragging.value = true
+    } else if (Math.abs(dy) > 10) {
+      swipeStart = null
+      swipeId.value = 0
+      return
+    } else {
+      return
+    }
+  }
+  if (e.cancelable) e.preventDefault()
+  swipeDx.value = dx
+}
+
+function rowTouchEnd(e, m) {
+  if (!swipeStart || swipeStart.id !== m.id) return
+  const engaged = swipeStart.engaged
+  swipeStart = null
+  swipeDragging.value = false
+  if (!engaged) {
+    swipeId.value = 0
+    swipeDx.value = 0
+    return
+  }
+  suppressClickUntil = Date.now() + 900
+  const dx = swipeDx.value
+  swipeWidth = e.currentTarget.offsetWidth || window.innerWidth
+  swipeHeight = e.currentTarget.parentElement?.offsetHeight ?? e.currentTarget.offsetHeight
+  const canArchive = scope.value !== 'archive' && scope.value !== 'trash'
+  if (dx >= SWIPE_COMMIT && canArchive) {
+    settleSwipe(m, 'archive')
+  } else if (dx <= -SWIPE_COMMIT) {
+    settleSwipe(m, 'delete')
+  } else {
+    swipeDx.value = 0
+    setTimeout(() => {
+      if (!swipeStart) swipeId.value = 0
+    }, 200)
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+async function settleSwipe(m, action) {
+  swipeDx.value = action === 'archive' ? swipeWidth : -swipeWidth
+  await sleep(200)
+  exitTrans.value = false
+  exitId.value = m.id
+  exitH.value = swipeHeight
+  await sleep(30)
+  exitTrans.value = true
+  exitH.value = 0
+  await sleep(240)
+  try {
+    if (action === 'archive') await archiveFor(m)
+    else await deleteFor(m)
+    for (let i = 0; i < 40 && messages.value.some((x) => x.id === m.id); i++) {
+      await sleep(50)
+    }
+  } finally {
+    swipeId.value = 0
+    swipeDx.value = 0
+    exitId.value = 0
+    exitTrans.value = false
+  }
+}
+
 function onSearchInput() {
   clearTimeout(searchTimer)
   searchTimer = setTimeout(() => {
     searching.value = searchQuery.value.trim().length > 0
-    selected.value = null
-    detail.value = null
-    loadMessages()
+    clearSelection()
+    loadMessages(true)
   }, 300)
 }
 
 function clearSearch() {
   searchQuery.value = ''
   searching.value = false
-  loadMessages()
+  loadMessages(true)
 }
 
 function openCompose(init) {
@@ -388,6 +579,12 @@ async function loadStatuses() {
 
 async function refreshData() {
   await Promise.all([loadFolders(), loadMessages(), loadStatuses()])
+}
+
+async function onComposeDone() {
+  const jobs = [loadFolders(), loadStatuses()]
+  if (scope.value === 'drafts' || scope.value === 'sent') jobs.push(loadMessages(true))
+  await Promise.all(jobs)
 }
 
 async function refreshAccounts() {
@@ -444,8 +641,11 @@ function insertThreaded(item) {
   }
   messages.value[i] = row
   messages.value = [...messages.value].sort((a, b) => b.date_ts - a.date_ts || b.id - a.id)
-  if (expandedKey.value === item.account_id + ':' + key) {
-    threadMsgs.value = [...threadMsgs.value, item].sort((a, b) => a.date_ts - b.date_ts || a.id - b.id)
+  if (convo.value && convo.value.accountId === item.account_id && convo.value.threadKey === key) {
+    convo.value = {
+      ...convo.value,
+      msgs: [...convo.value.msgs, item].sort((a, b) => a.date_ts - b.date_ts || a.id - b.id),
+    }
   }
 }
 
@@ -460,7 +660,9 @@ function applyFlagsEvent(items) {
     }
     return next
   })
-  threadMsgs.value = threadMsgs.value.map(patch)
+  if (convo.value) {
+    convo.value = { ...convo.value, msgs: convo.value.msgs.map(patch) }
+  }
   if (selected.value && byId.has(selected.value.id)) {
     selected.value = { ...selected.value, flags: byId.get(selected.value.id) }
     if (detail.value) detail.value = { ...detail.value, flags: selected.value.flags }
@@ -475,10 +677,11 @@ function applyRemovedEvent(ev) {
   } else {
     messages.value = messages.value.filter((m) => !ids.has(m.id))
   }
-  threadMsgs.value = threadMsgs.value.filter((m) => !ids.has(m.id))
+  if (convo.value) {
+    convo.value = { ...convo.value, msgs: convo.value.msgs.filter((m) => !ids.has(m.id)) }
+  }
   if (selected.value && ids.has(selected.value.id)) {
-    selected.value = null
-    detail.value = null
+    clearSelection()
   }
 }
 
@@ -559,18 +762,24 @@ function disconnectEvents() {
 
 function selectScope(key) {
   scope.value = key
-  selected.value = null
-  detail.value = null
+  clearSelection()
   drawerOpen.value = false
   searchQuery.value = ''
   searching.value = false
   loadMessages()
 }
 
-const FRAME_CSS =
-  '<style>html,body{margin:0;padding:0;background:#fff;color:#000;' +
-  'font:14px/1.5 Arial,Helvetica,"PingFang SC","Microsoft YaHei",sans-serif;' +
-  'overflow-wrap:anywhere}img{max-width:100%;height:auto}table{max-width:100%}a{color:#0000ee}</style>'
+const frameCss = computed(() => {
+  const dark = theme.global.current.value.dark
+  const fg = dark ? '#e6e6e6' : '#000'
+  const link = dark ? '#8ab4f8' : '#0000ee'
+  const scheme = dark ? 'dark' : 'light'
+  return (
+    '<style>:root{color-scheme:' + scheme + '}html,body{margin:0;padding:0;background:transparent;color:' + fg + ';' +
+    'font:14px/1.5 Arial,Helvetica,"PingFang SC","Microsoft YaHei",sans-serif;' +
+    'overflow-wrap:anywhere}img{max-width:100%;height:auto}table{max-width:100%}a{color:' + link + '}</style>'
+  )
+})
 
 function frameLoaded() {
   try {
@@ -582,7 +791,12 @@ function frameLoaded() {
 
 function patchLocalFlags(id, flags) {
   messages.value = messages.value.map((x) => (x.id === id ? { ...x, flags } : x))
-  threadMsgs.value = threadMsgs.value.map((x) => (x.id === id ? { ...x, flags } : x))
+  if (convo.value) {
+    convo.value = {
+      ...convo.value,
+      msgs: convo.value.msgs.map((x) => (x.id === id ? { ...x, flags } : x)),
+    }
+  }
   if (selected.value?.id === id) {
     selected.value = { ...selected.value, flags }
     if (detail.value) detail.value = { ...detail.value, flags }
@@ -601,9 +815,7 @@ async function markSeen(m) {
 
 function prefetchNeighbors(m) {
   const pool =
-    threadMsgs.value.length && threadMsgs.value.some((x) => x.id === m.id)
-      ? threadMsgs.value
-      : messages.value
+    convo.value && convo.value.msgs.some((x) => x.id === m.id) ? convo.value.msgs : messages.value
   const i = pool.findIndex((x) => x.id === m.id)
   if (i < 0) return
   for (const n of [pool[i - 1], pool[i + 1]]) {
@@ -625,40 +837,45 @@ function afterOpen(m) {
 }
 
 
-async function openMessageById(id) {
-  try {
-    const d = await api.getMessage(id)
-    detailCache.set(id, d)
-    await openMessage({
-      id: d.id,
-      account_id: d.account_id,
-      account_label: d.account_label,
-      folder_id: d.folder_id,
-      folder_name: d.folder_name,
-      folder_special: '',
-      thread_key: '',
-      subject: d.subject || '',
-      from_name: d.from?.name || '',
-      from_email: d.from?.email || '',
-      date_ts: d.date_ts,
-      flags: d.flags,
-      has_attach: !!d.has_attach,
-      snippet: '',
-      size: d.size,
-    })
-  } catch {
+function openMessageById(id) {
+  openMessage(placeholderMessage(id))
+}
+
+let settingsPushed = false
+
+function openSettings() {
+  if (location.hash !== '#/settings') {
+    settingsPushed = true
+    location.hash = '#/settings'
+  }
+  settingsOpen.value = true
+}
+
+function closeSettings() {
+  if (location.hash === '#/settings' && settingsPushed) {
+    settingsPushed = false
+    history.back()
+    return
+  }
+  settingsOpen.value = false
+  if (location.hash === '#/settings') {
+    const want = selected.value ? '#/mail/' + selected.value.id : ''
+    history.pushState(null, '', want === '' ? location.pathname + location.search : want)
   }
 }
 
 function onHashChange() {
   if (!booted) return
-  const m = /^#\/mail\/(\d+)$/.exec(location.hash) || /^#m-(\d+)$/.exec(location.hash)
-  if (m) {
-    const id = +m[1]
+  if (location.hash === '#/settings') {
+    settingsOpen.value = true
+    return
+  }
+  if (settingsOpen.value) settingsOpen.value = false
+  const id = deepIdFromHash()
+  if (id) {
     if (selected.value?.id !== id) openMessageById(id)
   } else if (selected.value) {
-    selected.value = null
-    detail.value = null
+    clearSelection()
   }
 }
 
@@ -673,6 +890,7 @@ watch(selected, (sel) => {
 })
 
 async function openMessage(m) {
+  closeConvo()
   if (scope.value === 'drafts' && !searching.value) {
     try {
       const d = await api.getMessage(m.id)
@@ -695,6 +913,7 @@ async function openMessage(m) {
   if (cached) {
     detail.value = cached
     detailState.value = 'ready'
+    enrichSelected(cached)
     markSeen(m)
     afterOpen(m)
     return
@@ -704,10 +923,11 @@ async function openMessage(m) {
   const tk = ++detailToken
   try {
     const d = await api.getMessage(m.id)
-    if (tk !== detailToken) return
+    detailCache.set(m.id, d)
+    if (tk !== detailToken || selected.value?.id !== m.id) return
     detail.value = d
     detailState.value = 'ready'
-    detailCache.set(m.id, d)
+    enrichSelected(d)
     markSeen(m)
     afterOpen(m)
   } catch (err) {
@@ -718,26 +938,123 @@ async function openMessage(m) {
   }
 }
 
-async function toggleThread(m) {
-  const key = m.account_id + ':' + (m.thread_key || 'id:' + m.id)
-  if (expandedKey.value === key) {
-    expandedKey.value = ''
-    threadMsgs.value = []
+async function openConversation(m) {
+  clearSelection()
+  const threadKey = m.thread_key || 'id:' + m.id
+  convo.value = {
+    accountId: m.account_id,
+    threadKey,
+    subject: m.subject || '',
+    status: 'loading',
+    msgs: [],
+  }
+  convoOpenIds.value = new Set()
+  convoDetails.value = {}
+  try {
+    const msgs = await api.getThreadMessages(scope.value, m.account_id, threadKey)
+    if (!convo.value || convo.value.threadKey !== threadKey) return
+    const sorted = [...msgs].sort((a, b) => a.date_ts - b.date_ts || a.id - b.id)
+    convo.value = { ...convo.value, status: 'ready', msgs: sorted }
+    const open = new Set()
+    for (const msg of sorted) {
+      if (!(msg.flags & 1)) open.add(msg.id)
+    }
+    if (sorted.length) open.add(sorted[sorted.length - 1].id)
+    convoOpenIds.value = open
+    for (const msg of sorted) {
+      if (open.has(msg.id)) {
+        loadCardBody(msg.id)
+        markSeen(msg)
+      }
+    }
+  } catch {
+    if (convo.value && convo.value.threadKey === threadKey) {
+      convo.value = { ...convo.value, status: 'error' }
+    }
+  }
+}
+
+function closeConvo() {
+  convo.value = null
+  convoOpenIds.value = new Set()
+  convoDetails.value = {}
+}
+
+async function loadCardBody(id) {
+  if (convoDetails.value[id]) return
+  const cached = detailCache.get(id)
+  if (cached) {
+    convoDetails.value = { ...convoDetails.value, [id]: cached }
     return
   }
-  expandedKey.value = key
-  threadMsgs.value = []
   try {
-    threadMsgs.value = await api.getThreadMessages(scope.value, m.account_id, m.thread_key || 'id:' + m.id)
+    const d = await api.getMessage(id)
+    detailCache.set(id, d)
+    convoDetails.value = { ...convoDetails.value, [id]: d }
   } catch {
-    threadMsgs.value = []
+  }
+}
+
+function toggleCard(msg) {
+  const next = new Set(convoOpenIds.value)
+  if (next.has(msg.id)) {
+    next.delete(msg.id)
+  } else {
+    next.add(msg.id)
+    loadCardBody(msg.id)
+    markSeen(msg)
+  }
+  convoOpenIds.value = next
+}
+
+function cardFrameLoaded(e) {
+  try {
+    const el = e.target
+    const doc = el?.contentDocument
+    if (doc) el.style.height = doc.documentElement.scrollHeight + 'px'
+  } catch {
+  }
+}
+
+function replyCard(msg) {
+  const d = convoDetails.value[msg.id]
+  if (!d) return
+  const subj = msg.subject || ''
+  openCompose({
+    account_id: msg.account_id,
+    to: d.from ? (d.from.name ? d.from.name + ' <' + d.from.email + '>' : d.from.email) : '',
+    subject: /^re:/i.test(subj) ? subj : 'Re: ' + subj,
+    text: quoteFor(msg, d),
+    reply_to_id: msg.id,
+  })
+}
+
+function forwardCard(msg) {
+  const d = convoDetails.value[msg.id]
+  if (!d) return
+  const subj = msg.subject || ''
+  openCompose({
+    account_id: msg.account_id,
+    subject: /^(fwd|fw):/i.test(subj) ? subj : 'Fwd: ' + subj,
+    text: quoteFor(msg, d),
+  })
+}
+
+async function toggleCardSeen(msg) {
+  try {
+    const res = await api.setFlags(msg.id, { seen: !(msg.flags & 1) })
+    patchLocalFlags(msg.id, res.flags)
+    loadFolders()
+  } catch {
   }
 }
 
 function rowClick(m, idx) {
+  if (Date.now() < suppressClickUntil) return
   cursorIdx.value = idx
+  cursorActive.value = false
   if (threaded.value && !searching.value && (m.thread_count ?? 1) > 1) {
-    toggleThread(m)
+    openConversation(m)
     return
   }
   openMessage(m)
@@ -774,20 +1091,24 @@ async function starFor(m) {
   }
 }
 
-function quoteText() {
-  const from = detail.value.from
-    ? (detail.value.from.name ? detail.value.from.name + ' ' : '') + '<' + detail.value.from.email + '>'
+function quoteFor(msg, d) {
+  const from = d.from
+    ? (d.from.name ? d.from.name + ' ' : '') + '<' + d.from.email + '>'
     : ''
   return (
-    '\n\n----- 原邮件 -----\n发件人：' +
+    '\n\n----- Original message -----\nFrom: ' +
     from +
-    '\n时间：' +
-    fmtFull(selected.value.date_ts) +
-    '\n主题：' +
-    (selected.value.subject || '') +
+    '\nTime: ' +
+    fmtFullEn(msg.date_ts) +
+    '\nSubject: ' +
+    (msg.subject || '') +
     '\n\n' +
-    (detail.value.text || '')
+    (d.text || '')
   )
+}
+
+function quoteText() {
+  return quoteFor(selected.value, detail.value)
 }
 
 function replySelected() {
@@ -817,10 +1138,16 @@ function forwardSelected() {
 }
 
 function afterRemoval(id) {
-  threadMsgs.value = threadMsgs.value.filter((m) => m.id !== id)
+  if (convo.value) {
+    const left = convo.value.msgs.filter((m) => m.id !== id)
+    if (left.length === 0) {
+      closeConvo()
+    } else {
+      convo.value = { ...convo.value, msgs: left }
+    }
+  }
   if (selected.value?.id === id) {
-    selected.value = null
-    detail.value = null
+    clearSelection()
   }
   if (threaded.value && !searching.value) {
     reloadLoaded()
@@ -862,7 +1189,12 @@ async function markAllRead() {
         ? { ...m, flags: m.flags | 1, thread_unread: 0 }
         : { ...m, flags: m.flags | 1 },
     )
-    threadMsgs.value = threadMsgs.value.map((m) => ({ ...m, flags: m.flags | 1 }))
+    if (convo.value) {
+      convo.value = {
+        ...convo.value,
+        msgs: convo.value.msgs.map((m) => ({ ...m, flags: m.flags | 1 })),
+      }
+    }
     if (selected.value) patchLocalFlags(selected.value.id, selected.value.flags | 1)
     loadFolders()
   } catch {
@@ -888,6 +1220,7 @@ function replyToMessage(m) {
 
 function moveCursor(d) {
   if (messages.value.length === 0) return
+  cursorActive.value = true
   cursorIdx.value = Math.max(0, Math.min(messages.value.length - 1, cursorIdx.value + d))
   requestAnimationFrame(() => {
     listEl.value
@@ -950,6 +1283,21 @@ function onGlobalKey(e) {
 }
 
 
+function menuRipple(e) {
+  const btn = e.currentTarget
+  const rect = btn.getBoundingClientRect()
+  const d = Math.max(rect.width, rect.height) * 2
+  const x = e.clientX ? e.clientX - rect.left : rect.width / 2
+  const y = e.clientY ? e.clientY - rect.top : rect.height / 2
+  const span = document.createElement('span')
+  span.className = 'menu-ripple'
+  span.style.width = span.style.height = d + 'px'
+  span.style.left = x - d / 2 + 'px'
+  span.style.top = y - d / 2 + 'px'
+  btn.appendChild(span)
+  setTimeout(() => span.remove(), 500)
+}
+
 function toggleDrawer() {
   drawerOpen.value = !drawerOpen.value
 }
@@ -972,19 +1320,29 @@ function onReaderTouchEnd(e) {
   const scroller = e.currentTarget.querySelector('.reader-scroll')
   const atTop = !scroller || scroller.scrollTop <= 0
   if ((dx > 90 && Math.abs(dy) < 60) || (atTop && dy > 110 && Math.abs(dx) < 60)) {
-    selected.value = null
-    detail.value = null
+    if (convo.value) {
+      closeConvo()
+    } else {
+      clearSelection()
+    }
   }
 }
 
 function openAccounts() {
-  settingsOpen.value = true
+  openSettings()
   drawerOpen.value = false
 }
 
 async function enter() {
   view.value = 'app'
+  if (initialDeepId) openMessage(placeholderMessage(initialDeepId))
+  try {
+    const st = await api.getState()
+    if (st.app_settings) maxAttachmentMB.value = st.app_settings.max_attachment_mb
+  } catch {}
   threaded.value = localStorage.getItem('wm_threaded') === '1'
+  const storedUndo = parseInt(localStorage.getItem('wm_undo_seconds') ?? '', 10)
+  if ([0, 5, 10, 20, 30].includes(storedUndo)) undoSeconds.value = storedUndo
   await refreshAccounts()
   connectEvents()
   booted = true
@@ -1018,7 +1376,7 @@ async function doLogout() {
   accounts.value = []
   folders.value = []
   messages.value = []
-  selected.value = null
+  clearSelection()
   settingsOpen.value = false
   authMode.value = 'login'
   view.value = 'auth'
@@ -1028,6 +1386,15 @@ function onThreadedChange(v) {
   threaded.value = v
   localStorage.setItem('wm_threaded', v ? '1' : '0')
   if (!searching.value) loadMessages()
+}
+
+function onAppSettings(s) {
+  maxAttachmentMB.value = s.max_attachment_mb
+}
+
+function onUndoSecondsChange(v) {
+  undoSeconds.value = v
+  localStorage.setItem('wm_undo_seconds', String(v))
 }
 
 onMounted(() => {
@@ -1049,14 +1416,14 @@ onBeforeUnmount(() => {
   <v-app>
     <div v-if="view === 'loading'" class="boot-center">
       <v-progress-circular indeterminate color="primary" />
-      <div class="mt-3 text-body-2 text-medium-emphasis">加载中</div>
+      <div class="mt-3 text-body-2 text-medium-emphasis">{{ t('加载中') }}</div>
     </div>
 
     <div v-else-if="view === 'error'" class="boot-center px-4">
-      <v-alert type="error" variant="tonal" max-width="440" title="启动失败">
+      <v-alert type="error" variant="tonal" max-width="440" :title="t('启动失败')">
         {{ bootError }}
         <div class="mt-2">
-          <v-btn size="small" variant="outlined" @click="boot">重试</v-btn>
+          <v-btn size="small" variant="outlined" @click="boot">{{ t('重试') }}</v-btn>
         </div>
       </v-alert>
     </div>
@@ -1067,18 +1434,13 @@ onBeforeUnmount(() => {
       <v-app-bar height="64" flat>
         <div class="appbar-search" :class="{ 'search-after-drawer': wideLayout && drawerOpen }">
           <div class="search-wrap">
-            <v-btn
-              icon="mdi-menu"
-              variant="text"
-              size="small"
-              aria-label="展开菜单"
-              class="search-menu-btn"
-              @click="toggleDrawer"
-            />
+            <button type="button" class="search-menu-btn" :aria-label="t('展开菜单')" @pointerdown="menuRipple" @click="toggleDrawer">
+              <v-icon icon="mdi-menu" size="22" />
+            </button>
             <v-text-field
               ref="searchEl"
               v-model="searchQuery"
-              placeholder="搜索主题、发件人、正文"
+              :placeholder="t('搜索主题、发件人、正文')"
               variant="solo-filled"
               rounded="pill"
               density="compact"
@@ -1091,7 +1453,7 @@ onBeforeUnmount(() => {
                 icon="mdi-close"
                 variant="text"
                 size="x-small"
-                aria-label="清除搜索"
+                :aria-label="t('清除搜索')"
                 @click="clearSearch"
               />
               </template>
@@ -1116,17 +1478,16 @@ onBeforeUnmount(() => {
             style="height: 40px; flex: none"
             @click="openCompose({})"
           >
-            写信
+            {{ t('写信') }}
           </v-btn>
 
-          <div class="text-caption text-medium-emphasis px-1 pb-1">聚合文件夹</div>
           <template v-if="foldersStatus === 'loading'">
             <v-skeleton-loader type="list-item@3" />
           </template>
           <template v-else-if="foldersStatus === 'error'">
             <p class="text-body-2 text-error px-1">
-              文件夹加载失败：{{ foldersError }}
-              <v-btn variant="text" size="small" @click="loadFolders">重试</v-btn>
+              {{ t('文件夹加载失败：{error}', { error: foldersError }) }}
+              <v-btn variant="text" size="small" @click="loadFolders">{{ t('重试') }}</v-btn>
             </p>
           </template>
           <template v-else>
@@ -1151,7 +1512,7 @@ onBeforeUnmount(() => {
               </v-list-item>
             </v-list>
             <p v-if="visibleScopes.length === 0" class="text-body-2 text-medium-emphasis px-1">
-              暂无文件夹（同步后出现）
+              {{ t('暂无文件夹（同步后出现）') }}
             </p>
           </template>
 
@@ -1160,12 +1521,12 @@ onBeforeUnmount(() => {
             <v-list density="compact" nav class="pa-0">
               <v-list-item
                 prepend-icon="mdi-cog"
-                title="设置"
+                :title="t('设置')"
                 :active="settingsOpen"
                 rounded="pill"
                 @click="openAccounts"
               />
-              <v-list-item prepend-icon="mdi-logout" title="退出登录" rounded="pill" @click="doLogout" />
+              <v-list-item prepend-icon="mdi-logout" :title="t('退出登录')" rounded="pill" @click="doLogout" />
             </v-list>
           </div>
         </div>
@@ -1176,16 +1537,16 @@ onBeforeUnmount(() => {
           <section class="list-section">
             <div class="d-flex align-center ga-1 px-2 py-2 border-b">
               <h1 class="text-body-1 font-weight-bold text-truncate px-1">
-                {{ searching ? '搜索结果' : scopeLabel }}
+                {{ searching ? t('搜索结果') : scopeLabel }}
               </h1>
               <span v-if="searching && listStatus === 'ready'" class="text-caption text-medium-emphasis">
-                {{ messages.length }} 封
+                {{ t('{n} 封', { n: messages.length }) }}
               </span>
               <span
                 v-else-if="!searching && foldersStatus === 'ready' && scopeStats[scope]"
                 class="text-caption text-medium-emphasis text-no-wrap"
               >
-                {{ scopeStats[scope].total }} 封<template v-if="scopeStats[scope].unread">（{{ scopeStats[scope].unread }} 未读）</template>
+                {{ t('{n} 封', { n: scopeStats[scope].total }) }}<template v-if="scopeStats[scope].unread">{{ t('（{n} 未读）', { n: scopeStats[scope].unread }) }}</template>
               </span>
             </div>
 
@@ -1193,7 +1554,7 @@ onBeforeUnmount(() => {
               class="ptr-ind"
               :style="{
                 transform: 'translate(-50%, ' + ptrY + 'px)',
-                opacity: ptrRaw > 2 || ptrBusy ? 1 : 0,
+                opacity: ptrRaw > 0 || ptrBusy ? 1 : 0,
                 transition: ptrTracking ? 'none' : 'transform 0.25s ease, opacity 0.2s ease',
               }"
             >
@@ -1203,8 +1564,9 @@ onBeforeUnmount(() => {
                 size="22"
                 width="2.5"
                 color="primary"
+                bg-color="transparent"
               />
-              <svg v-else width="40" height="40" viewBox="0 0 40 40" aria-hidden="true">
+              <svg v-else width="40" height="40" viewBox="0 0 40 40" aria-hidden="true" :style="{ opacity: ptrOpacity }">
                 <path
                   v-if="ptrArc.path"
                   :d="ptrArc.path"
@@ -1228,25 +1590,45 @@ onBeforeUnmount(() => {
               <template v-else-if="listStatus === 'error'">
                 <div class="pa-4">
                   <v-alert type="error" variant="tonal" density="compact">
-                    邮件列表加载失败：{{ listError }}
+                    {{ t('邮件列表加载失败：{error}', { error: listError }) }}
                     <div class="mt-2">
-                      <v-btn size="small" variant="outlined" @click="loadMessages">重试</v-btn>
+                      <v-btn size="small" variant="outlined" @click="loadMessages">{{ t('重试') }}</v-btn>
                     </div>
                   </v-alert>
                 </div>
               </template>
               <template v-else-if="messages.length === 0">
                 <p class="pa-6 text-body-2 text-medium-emphasis">
-                  {{ searching ? '没有找到匹配的邮件。' : '这里还没有邮件。添加账号后会自动同步进来。' }}
+                  {{ searching ? t('没有找到匹配的邮件。') : t('这里还没有邮件。添加账号后会自动同步进来。') }}
                 </p>
               </template>
               <template v-else>
                 <template v-for="(m, idx) in messages" :key="m.id">
+                  <div class="mail-row-wrap" :style="rowWrapStyle(m)">
+                    <div
+                      v-if="scope !== 'archive' && scope !== 'trash'"
+                      class="swipe-bg swipe-bg-left"
+                      :style="{ opacity: swipeId === m.id && swipeDx > 0 ? 1 : 0 }"
+                    >
+                      <v-icon icon="mdi-archive" color="white" size="20" />
+                    </div>
+                    <div
+                      class="swipe-bg swipe-bg-right"
+                      :style="{ opacity: swipeId === m.id && swipeDx < 0 ? 1 : 0 }"
+                    >
+                      <v-icon icon="mdi-delete" color="white" size="20" />
+                    </div>
                   <div
+                    v-ripple
                     class="mail-row"
                     :data-rowidx="idx"
-                    :class="{ 'mail-row-active': selected?.id === m.id || idx === cursorIdx }"
+                    :class="{ 'mail-row-active': (lgAndUp && selected?.id === m.id) || (cursorActive && idx === cursorIdx) }"
+                    :style="rowSwipeStyle(m)"
                     @click="rowClick(m, idx)"
+                    @touchstart.passive="rowTouchStart($event, m)"
+                    @touchmove="rowTouchMove($event, m)"
+                    @touchend="rowTouchEnd($event, m)"
+                    @touchcancel="rowTouchEnd($event, m)"
                   >
                     <v-avatar :color="avatarColor(m.from_email)" size="38" class="mail-avatar">
                       <span class="text-white text-body-2 font-weight-medium">{{ avatarLetter(m) }}</span>
@@ -1258,13 +1640,13 @@ onBeforeUnmount(() => {
                           class="text-body-2 text-truncate flex-1-1"
                           :class="{ 'font-weight-bold': !(m.flags & 1) }"
                         >
-                          {{ m.from_name || m.from_email || '(未知发件人)' }}
+                          {{ m.from_name || m.from_email || t('(未知发件人)') }}
                         </span>
                         <span
                           v-if="threaded && !searching && (m.thread_count ?? 1) > 1"
                           class="text-caption text-medium-emphasis text-no-wrap"
                         >
-                          共 {{ m.thread_count }} 封<template v-if="m.thread_unread">，{{ m.thread_unread }} 未读</template>
+                          {{ t('共 {n} 封', { n: m.thread_count }) }}<template v-if="m.thread_unread">{{ t('，{n} 未读', { n: m.thread_unread }) }}</template>
                         </span>
                         <v-icon v-if="m.has_attach" icon="mdi-paperclip" size="14" class="text-medium-emphasis" />
                         <span class="text-caption text-medium-emphasis text-no-wrap">{{ fmtListTime(m.date_ts) }}</span>
@@ -1273,7 +1655,7 @@ onBeforeUnmount(() => {
                           variant="text"
                           size="x-small"
                           density="compact"
-                          :aria-label="(m.flags & 2) ? '取消星标' : '星标'"
+                          :aria-label="(m.flags & 2) ? t('取消星标') : t('星标')"
                           @click.stop="starFor(m)"
                         >
                           <v-icon
@@ -1284,36 +1666,14 @@ onBeforeUnmount(() => {
                         </v-btn>
                       </div>
                       <div class="text-body-2 text-truncate" :class="{ 'font-weight-bold': !(m.flags & 1) }">
-                        {{ m.subject || '(无主题)' }}
+                        {{ m.subject || t('(无主题)') }}
                       </div>
                       <div class="text-caption text-medium-emphasis text-truncate">
-                        {{ m.account_label }}<template v-if="searching">，{{ m.folder_name }}</template><template v-if="m.snippet">，{{ m.snippet }}</template>
+                        {{ m.account_label }}<template v-if="searching">{{ t('，') }}{{ m.folder_name }}</template><template v-if="m.snippet">{{ t('，') }}{{ m.snippet }}</template>
                       </div>
                     </div>
                   </div>
-                  <template v-if="threaded && !searching && expandedKey === m.account_id + ':' + (m.thread_key || 'id:' + m.id)">
-                    <div
-                      v-for="sub in threadMsgs"
-                      :key="sub.id"
-                      class="mail-row mail-row-sub"
-                      :class="{ 'mail-row-active': selected?.id === sub.id }"
-                      @click="openMessage(sub)"
-                    >
-                      <div class="d-flex align-center ga-2">
-                        <span v-if="!(sub.flags & 1)" class="unread-dot" />
-                        <span
-                          class="text-body-2 text-truncate flex-1-1"
-                          :class="{ 'font-weight-bold': !(sub.flags & 1) }"
-                        >
-                          {{ sub.from_name || sub.from_email || '(未知发件人)' }}
-                        </span>
-                        <span class="text-caption text-medium-emphasis text-no-wrap">{{ fmtListTime(sub.date_ts) }}</span>
-                      </div>
-                      <div class="text-body-2 text-truncate" :class="{ 'font-weight-bold': !(sub.flags & 1) }">
-                        {{ sub.subject || '(无主题)' }}
-                      </div>
-                    </div>
-                  </template>
+                  </div>
                 </template>
                 <v-btn
                   v-if="listHasMore && !searching"
@@ -1322,19 +1682,19 @@ onBeforeUnmount(() => {
                   :loading="loadingMore"
                   @click="loadMore"
                 >
-                  加载更多
+                  {{ t('加载更多') }}
                 </v-btn>
               </template>
               </div>
             </div>
           </section>
 
-          <section class="reader-section" :class="{ 'd-none': !lgAndUp && !selected, 'reader-overlay': !lgAndUp && !!selected }">
-            <div v-if="!selected" class="h-100 d-flex align-center justify-center">
-              <p class="text-body-2 text-medium-emphasis">未选择邮件</p>
+          <section class="reader-section" :class="{ 'd-none': !lgAndUp && !selected && !convo, 'reader-overlay': !lgAndUp && (!!selected || !!convo) }">
+            <div v-if="!selected && !convo" class="h-100 d-flex align-center justify-center">
+              <p class="text-body-2 text-medium-emphasis">{{ t('未选择邮件') }}</p>
             </div>
             <div
-              v-else
+              v-else-if="convo"
               class="reader-main"
               @touchstart.passive="onReaderTouchStart"
               @touchend.passive="onReaderTouchEnd"
@@ -1345,16 +1705,164 @@ onBeforeUnmount(() => {
                   icon="mdi-close"
                   size="small"
                   variant="text"
-                  aria-label="关闭"
-                  @click="selected = null; detail = null"
+                  :aria-label="t('关闭')"
+                  @click="closeConvo"
+                />
+              </div>
+              <div class="reader-scroll px-3 pb-3 px-sm-4 pb-sm-4">
+                <h2 class="text-h6 font-weight-bold mb-1" style="overflow-wrap: anywhere">
+                  {{ convo.subject || t('(无主题)') }}
+                </h2>
+                <p class="text-caption text-medium-emphasis mb-3">{{ t('共 {n} 封', { n: convo.msgs.length }) }}</p>
+                <template v-if="convo.status === 'loading'">
+                  <v-skeleton-loader type="list-item-three-line@3" />
+                </template>
+                <v-alert v-else-if="convo.status === 'error'" type="error" variant="tonal" density="compact">
+                  {{ t('会话加载失败') }}
+                  <div class="mt-2">
+                    <v-btn size="small" variant="outlined" @click="convo = null">{{ t('关闭') }}</v-btn>
+                  </div>
+                </v-alert>
+                <div v-else class="convo-stack">
+                  <div v-for="msg in convo.msgs" :key="msg.id" class="convo-card">
+                    <div v-ripple class="convo-card-head" @click="toggleCard(msg)">
+                      <v-avatar :color="avatarColor(msg.from_email)" size="32" class="flex-none">
+                        <span class="text-white text-caption font-weight-medium">{{ avatarLetter(msg) }}</span>
+                      </v-avatar>
+                      <div class="flex-1-1" style="min-width: 0">
+                        <div class="d-flex align-center ga-2">
+                          <span v-if="!(msg.flags & 1)" class="unread-dot" />
+                          <span
+                            class="text-body-2 text-truncate flex-1-1"
+                            :class="{ 'font-weight-bold': !(msg.flags & 1) }"
+                          >
+                            {{ msg.from_name || msg.from_email || t('(未知发件人)') }}
+                          </span>
+                          <span class="text-caption text-medium-emphasis text-no-wrap">{{ fmtListTime(msg.date_ts) }}</span>
+                          <v-icon
+                            :icon="convoOpenIds.has(msg.id) ? 'mdi-chevron-up' : 'mdi-chevron-down'"
+                            size="18"
+                            class="text-medium-emphasis flex-none"
+                          />
+                        </div>
+                        <div v-if="!convoOpenIds.has(msg.id)" class="text-caption text-medium-emphasis text-truncate">
+                          {{ msg.snippet || '' }}
+                        </div>
+                      </div>
+                    </div>
+                    <div v-if="convoOpenIds.has(msg.id)" class="convo-card-body">
+                      <template v-if="convoDetails[msg.id]">
+                        <div class="text-caption text-medium-emphasis mb-1">
+                          <template v-if="convoDetails[msg.id].to?.length">
+                            {{ t('收件人') }} {{ fmtAddrList(convoDetails[msg.id].to) }}
+                          </template>
+                          <template v-if="convoDetails[msg.id].cc?.length">
+                            {{ t('，抄送') }} {{ fmtAddrList(convoDetails[msg.id].cc) }}
+                          </template>
+                          {{ t('，') }}{{ fmtFull(msg.date_ts) }}
+                        </div>
+                        <div class="d-flex align-center ga-1 border-y py-1 mb-2">
+                          <v-btn icon variant="text" size="small" :disabled="opBusy" @click="toggleCardSeen(msg)">
+                            <v-icon :icon="msg.flags & 1 ? 'mdi-email' : 'mdi-email-open'" />
+                            <v-tooltip activator="parent" location="bottom">
+                              {{ msg.flags & 1 ? t('标为未读') : t('标为已读') }}
+                            </v-tooltip>
+                          </v-btn>
+                          <v-btn icon variant="text" size="small" :disabled="!convoDetails[msg.id]" @click="replyCard(msg)">
+                            <v-icon icon="mdi-reply" />
+                            <v-tooltip activator="parent" location="bottom">{{ t('回复') }}</v-tooltip>
+                          </v-btn>
+                          <v-btn icon variant="text" size="small" :disabled="!convoDetails[msg.id]" @click="forwardCard(msg)">
+                            <v-icon icon="mdi-share" />
+                            <v-tooltip activator="parent" location="bottom">{{ t('转发') }}</v-tooltip>
+                          </v-btn>
+                          <v-btn icon variant="text" size="small" :disabled="opBusy" @click="starFor(msg)">
+                            <v-icon
+                              :icon="msg.flags & 2 ? 'mdi-star' : 'mdi-star-outline'"
+                              :color="msg.flags & 2 ? 'amber-darken-2' : undefined"
+                            />
+                            <v-tooltip activator="parent" location="bottom">
+                              {{ msg.flags & 2 ? t('取消星标') : t('星标') }}
+                            </v-tooltip>
+                          </v-btn>
+                          <v-btn
+                            v-if="scope !== 'archive' && scope !== 'trash'"
+                            icon
+                            variant="text"
+                            size="small"
+                            :disabled="opBusy"
+                            @click="archiveFor(msg)"
+                          >
+                            <v-icon icon="mdi-archive" />
+                            <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
+                          </v-btn>
+                          <v-btn icon variant="text" size="small" :disabled="opBusy" @click="deleteFor(msg)">
+                            <v-icon icon="mdi-delete" />
+                            <v-tooltip activator="parent" location="bottom">
+                              {{ scope === 'trash' || scope === 'junk' ? t('彻底删除') : t('删除') }}
+                            </v-tooltip>
+                          </v-btn>
+                        </div>
+                        <div v-if="convoDetails[msg.id].attachments.length > 0" class="d-flex flex-wrap ga-2 py-2">
+                          <v-btn
+                            v-for="a in convoDetails[msg.id].attachments"
+                            :key="a.id"
+                            variant="outlined"
+                            size="small"
+                            prepend-icon="mdi-paperclip"
+                            :href="api.attachmentURL(convoDetails[msg.id].id, a.id)"
+                          >
+                            <span class="text-truncate" style="max-width: 55vw">{{ a.filename }}</span>
+                            <span class="text-medium-emphasis ml-1">{{ fmtSize(a.size) }}</span>
+                          </v-btn>
+                        </div>
+                        <div v-if="convoDetails[msg.id].html" style="overflow: hidden">
+                          <iframe
+                            :title="t('邮件正文')"
+                            class="d-block w-100 border-0"
+                            style="height: 320px; background: transparent"
+                            sandbox="allow-same-origin"
+                            :srcdoc="frameCss + convoDetails[msg.id].html"
+                            @load="cardFrameLoaded"
+                          />
+                        </div>
+                        <div
+                          v-else-if="convoDetails[msg.id].text"
+                          class="py-2 text-body-2"
+                          style="white-space: pre-wrap; line-height: 1.6"
+                        >
+                          {{ convoDetails[msg.id].text }}
+                        </div>
+                        <p v-else class="py-4 text-body-2 text-medium-emphasis">{{ t('这封邮件没有可显示的正文。') }}</p>
+                      </template>
+                      <v-skeleton-loader v-else type="paragraph@2" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div
+              v-else-if="selected"
+              class="reader-main"
+              @touchstart.passive="onReaderTouchStart"
+              @touchend.passive="onReaderTouchEnd"
+            >
+              <div v-if="!lgAndUp" class="reader-head">
+                <v-spacer />
+                <v-btn
+                  icon="mdi-close"
+                  size="small"
+                  variant="text"
+                  :aria-label="t('关闭')"
+                  @click="clearSelection()"
                 />
               </div>
               <div class="reader-scroll px-3 pb-3 px-sm-4 pb-sm-4">
               <h2 class="text-h6 font-weight-bold mb-2" style="overflow-wrap: anywhere">
-                {{ selected.subject || '(无主题)' }}
+                {{ selected.subject || t('(无主题)') }}
               </h2>
               <div class="meta-grid text-body-2 mb-3">
-                <span class="text-medium-emphasis">发件人</span>
+                <span class="text-medium-emphasis">{{ t('发件人') }}</span>
                 <span style="overflow-wrap: anywhere">
                   {{
                     detail?.from
@@ -1367,33 +1875,33 @@ onBeforeUnmount(() => {
                   }}
                 </span>
                 <template v-if="detail?.to?.length">
-                  <span class="text-medium-emphasis">收件人</span>
+                  <span class="text-medium-emphasis">{{ t('收件人') }}</span>
                   <span style="overflow-wrap: anywhere">{{ fmtAddrList(detail.to) }}</span>
                 </template>
                 <template v-if="detail?.cc?.length">
-                  <span class="text-medium-emphasis">抄送</span>
+                  <span class="text-medium-emphasis">{{ t('抄送') }}</span>
                   <span style="overflow-wrap: anywhere">{{ fmtAddrList(detail.cc) }}</span>
                 </template>
-                <span class="text-medium-emphasis">时间</span>
+                <span class="text-medium-emphasis">{{ t('时间') }}</span>
                 <span>{{ fmtFull(selected.date_ts) }}</span>
-                <span class="text-medium-emphasis">账号</span>
-                <span style="overflow-wrap: anywhere">{{ selected.account_label }}，{{ selected.folder_name }}</span>
+                <span class="text-medium-emphasis">{{ t('账号') }}</span>
+                <span style="overflow-wrap: anywhere">{{ selected.account_label }}{{ t('，') }}{{ selected.folder_name }}</span>
               </div>
 
               <div class="d-flex align-center ga-1 border-y py-1 mb-2">
                 <v-btn icon variant="text" :disabled="opBusy" @click="toggleSeen">
                   <v-icon :icon="selected.flags & 1 ? 'mdi-email' : 'mdi-email-open'" />
                   <v-tooltip activator="parent" location="bottom">
-                    {{ selected.flags & 1 ? '标为未读' : '标为已读' }}
+                    {{ selected.flags & 1 ? t('标为未读') : t('标为已读') }}
                   </v-tooltip>
                 </v-btn>
                 <v-btn icon variant="text" :disabled="opBusy || !detail" @click="replySelected">
                   <v-icon icon="mdi-reply" />
-                  <v-tooltip activator="parent" location="bottom">回复</v-tooltip>
+                  <v-tooltip activator="parent" location="bottom">{{ t('回复') }}</v-tooltip>
                 </v-btn>
                 <v-btn icon variant="text" :disabled="opBusy || !detail" @click="forwardSelected">
                   <v-icon icon="mdi-share" />
-                  <v-tooltip activator="parent" location="bottom">转发</v-tooltip>
+                  <v-tooltip activator="parent" location="bottom">{{ t('转发') }}</v-tooltip>
                 </v-btn>
                 <v-btn icon variant="text" :disabled="opBusy" @click="toggleStar">
                   <v-icon
@@ -1401,7 +1909,7 @@ onBeforeUnmount(() => {
                     :color="selected.flags & 2 ? 'amber-darken-2' : undefined"
                   />
                   <v-tooltip activator="parent" location="bottom">
-                    {{ selected.flags & 2 ? '取消星标' : '星标' }}
+                    {{ selected.flags & 2 ? t('取消星标') : t('星标') }}
                   </v-tooltip>
                 </v-btn>
                 <v-btn
@@ -1412,25 +1920,25 @@ onBeforeUnmount(() => {
                   @click="archiveFor(selected)"
                 >
                   <v-icon icon="mdi-archive" />
-                  <v-tooltip activator="parent" location="bottom">归档</v-tooltip>
+                  <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
                 </v-btn>
                 <v-btn icon variant="text" :disabled="opBusy" @click="deleteFor(selected)">
                   <v-icon icon="mdi-delete" />
                   <v-tooltip activator="parent" location="bottom">
-                    {{ scope === 'trash' || scope === 'junk' ? '彻底删除' : '删除' }}
+                    {{ scope === 'trash' || scope === 'junk' ? t('彻底删除') : t('删除') }}
                   </v-tooltip>
                 </v-btn>
               </div>
 
               <template v-if="detailState === 'loading'">
                 <v-skeleton-loader type="paragraph@4" class="py-4" />
-                <p class="text-body-2 text-medium-emphasis">正在从服务器取正文</p>
+                <p class="text-body-2 text-medium-emphasis">{{ t('正在从服务器取正文') }}</p>
               </template>
               <template v-else-if="detailState === 'error'">
                 <v-alert type="error" variant="tonal" density="compact" class="my-4">
-                  正文加载失败：{{ detailError }}
+                  {{ t('正文加载失败：{error}', { error: detailError }) }}
                   <div class="mt-2">
-                    <v-btn size="small" variant="outlined" @click="openMessage(selected)">重试</v-btn>
+                    <v-btn size="small" variant="outlined" @click="openMessage(selected)">{{ t('重试') }}</v-btn>
                   </div>
                 </v-alert>
               </template>
@@ -1451,18 +1959,18 @@ onBeforeUnmount(() => {
                 <div v-if="detail.html" style="overflow: hidden">
                   <iframe
                     ref="frameEl"
-                    title="邮件正文"
+                    :title="t('邮件正文')"
                     class="mt-2 d-block w-100 border-0"
-                    style="height: 480px"
+                    style="height: 480px; background: transparent"
                     sandbox="allow-same-origin"
-                    :srcdoc="FRAME_CSS + detail.html"
+                    :srcdoc="frameCss + detail.html"
                     @load="frameLoaded"
                   />
                 </div>
                 <div v-else-if="detail.text" class="py-3 text-body-2" style="white-space: pre-wrap; line-height: 1.6">
                   {{ detail.text }}
                 </div>
-                <p v-else class="py-6 text-body-2 text-medium-emphasis">这封邮件没有可显示的正文。</p>
+                <p v-else class="py-6 text-body-2 text-medium-emphasis">{{ t('这封邮件没有可显示的正文。') }}</p>
               </template>
               </div>
             </div>
@@ -1471,23 +1979,23 @@ onBeforeUnmount(() => {
       </v-main>
 
       <v-btn
-        v-if="!lgAndUp && !selected"
+        v-if="!lgAndUp && !selected && !convo"
         icon="mdi-pencil"
         color="primary"
         position="fixed"
         location="bottom right"
         class="fab-compose"
         style="width: 52px; height: 52px; flex: none"
-        aria-label="写信"
+        :aria-label="t('写信')"
         @click="openCompose({})"
       />
 
-      <v-dialog v-model="settingsOpen" :fullscreen="!lgAndUp" max-width="920" scrollable>
+      <v-dialog v-model="settingsOpen" :fullscreen="!lgAndUp" max-width="920" scrollable transition="false" @update:model-value="(v) => { if (!v) closeSettings() }">
         <v-card>
           <v-card-title class="d-flex align-center">
-            设置
+            {{ t('设置') }}
             <v-spacer />
-            <v-btn icon="mdi-close" size="small" variant="text" aria-label="关闭" @click="settingsOpen = false" />
+            <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" @click="closeSettings()" />
           </v-card-title>
           <v-card-text class="pa-0">
             <Accounts
@@ -1496,10 +2004,13 @@ onBeforeUnmount(() => {
               :statuses="statuses"
               :theme-mode="themeMode"
               :threaded="threaded"
+              :undo-seconds="undoSeconds"
               :version="appVersion"
               @changed="refreshAccounts"
               @update:theme-mode="setThemeMode"
               @update:threaded="onThreadedChange"
+              @update:undo-seconds="onUndoSecondsChange"
+              @app-settings="onAppSettings"
             />
           </v-card-text>
         </v-card>
@@ -1507,27 +2018,27 @@ onBeforeUnmount(() => {
 
       <v-dialog v-model="helpOpen" max-width="420">
         <v-card>
-          <v-card-title>键盘快捷键</v-card-title>
+          <v-card-title>{{ t('键盘快捷键') }}</v-card-title>
           <v-card-text>
             <v-table density="compact">
               <tbody>
-                <tr><td class="font-mono">j / k</td><td>下移 / 上移</td></tr>
-                <tr><td class="font-mono">Enter</td><td>打开邮件（线程则展开）</td></tr>
-                <tr><td class="font-mono">e</td><td>归档</td></tr>
-                <tr><td class="font-mono">Delete</td><td>删除</td></tr>
-                <tr><td class="font-mono">s</td><td>星标 / 取消星标</td></tr>
-                <tr><td class="font-mono">r</td><td>回复</td></tr>
-                <tr><td class="font-mono">a</td><td>当前文件夹全部标为已读</td></tr>
-                <tr><td class="font-mono">c</td><td>写新邮件</td></tr>
-                <tr><td class="font-mono">/</td><td>聚焦搜索框</td></tr>
-                <tr><td class="font-mono">?</td><td>本帮助</td></tr>
+                <tr><td class="font-mono">j / k</td><td>{{ t('下移 / 上移') }}</td></tr>
+                <tr><td class="font-mono">Enter</td><td>{{ t('打开邮件（线程打开会话）') }}</td></tr>
+                <tr><td class="font-mono">e</td><td>{{ t('归档') }}</td></tr>
+                <tr><td class="font-mono">Delete</td><td>{{ t('删除') }}</td></tr>
+                <tr><td class="font-mono">s</td><td>{{ t('星标 / 取消星标') }}</td></tr>
+                <tr><td class="font-mono">r</td><td>{{ t('回复') }}</td></tr>
+                <tr><td class="font-mono">a</td><td>{{ t('当前文件夹全部标为已读') }}</td></tr>
+                <tr><td class="font-mono">c</td><td>{{ t('写新邮件') }}</td></tr>
+                <tr><td class="font-mono">/</td><td>{{ t('聚焦搜索框') }}</td></tr>
+                <tr><td class="font-mono">?</td><td>{{ t('本帮助') }}</td></tr>
               </tbody>
             </v-table>
           </v-card-text>
         </v-card>
       </v-dialog>
 
-      <Compose v-model="composeOpen" :accounts="accounts" :initial="composeInit" @done="refreshData" />
+      <Compose v-model="composeOpen" :accounts="accounts" :initial="composeInit" :undo-seconds="undoSeconds" :max-attachment-mb="maxAttachmentMB" @done="onComposeDone" />
     </template>
   </v-app>
 </template>
@@ -1562,13 +2073,51 @@ body {
 }
 .search-menu-btn {
   position: absolute;
-  left: 3px;
+  left: 4px;
   top: 50%;
   transform: translateY(-50%);
   z-index: 2;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(var(--v-theme-on-surface), 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.search-menu-btn:active {
+  background: rgba(var(--v-theme-on-surface), 0.12);
+}
+.search-menu-btn {
+  overflow: hidden;
+}
+.search-menu-btn .v-icon {
+  position: relative;
+  z-index: 1;
+}
+.menu-ripple {
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(var(--v-theme-on-surface), 0.28);
+  transform: scale(0);
+  opacity: 1;
+  animation: menu-ripple 0.45s ease-out forwards;
+  pointer-events: none;
+}
+@keyframes menu-ripple {
+  to {
+    transform: scale(1);
+    opacity: 0;
+  }
 }
 .search-field .v-field__input {
-  padding-inline-start: 46px;
+  padding-inline-start: 48px;
 }
 .appbar-search {
   flex: 0 0 auto;
@@ -1656,7 +2205,35 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
 }
+@media (hover: none) {
+  .v-tooltip {
+    display: none !important;
+  }
+}
+.mail-row-wrap {
+  position: relative;
+  overflow: hidden;
+}
+.swipe-bg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 18px;
+  opacity: 0;
+}
+.swipe-bg-left {
+  background: #2e7d32;
+  justify-content: flex-start;
+}
+.swipe-bg-right {
+  background: rgb(var(--v-theme-error));
+  justify-content: flex-end;
+}
 .mail-row {
+  position: relative;
+  overflow: hidden;
+  background: rgb(var(--v-theme-surface));
   display: flex;
   flex-direction: row;
   gap: 10px;
@@ -1666,22 +2243,42 @@ body {
   cursor: pointer;
   text-align: left;
 }
+.convo-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.convo-card {
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 12px;
+  background: rgb(var(--v-theme-surface));
+  overflow: hidden;
+}
+.convo-card-head {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.convo-card-body {
+  padding: 2px 12px 12px;
+}
 .mail-avatar {
   flex: none;
   margin-top: 2px;
 }
-.mail-row:hover {
-  background: rgba(var(--v-theme-on-surface), 0.04);
+@media (hover: hover) {
+  .mail-row:hover {
+    background: rgba(var(--v-theme-on-surface), 0.04);
+  }
 }
 .mail-row-active {
   background: rgba(var(--v-theme-primary), 0.1);
 }
-.mail-row-sub {
-  flex-direction: column;
-  gap: 2px;
-  padding-left: 24px;
-  background: rgba(var(--v-theme-on-surface), 0.02);
-}
+
 .unread-dot {
   width: 8px;
   height: 8px;

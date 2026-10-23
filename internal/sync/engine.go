@@ -36,13 +36,16 @@ type Change struct {
 	Inserted  []int64
 	Flagged   []int64
 	Removed   []int64
+	Initial   bool
 }
 
 type Manager struct {
-	st      *store.Store
-	mu      sync.Mutex
-	workers map[int64]*worker
-	status  map[int64]*Status
+	st          *store.Store
+	mu          sync.Mutex
+	workers     map[int64]*worker
+	status      map[int64]*Status
+	live        map[int64]bool
+	folderLocks map[int64]*sync.Mutex
 
 	OnChange func(Change)
 }
@@ -63,6 +66,7 @@ func NewManager(st *store.Store) *Manager {
 		st:      st,
 		workers: make(map[int64]*worker),
 		status:  make(map[int64]*Status),
+		live:    make(map[int64]bool),
 	}
 }
 
@@ -121,7 +125,7 @@ func (m *Manager) Status(accountID int64) Status {
 	if bodyBytes, attBytes, err := m.st.CacheUsage(); err == nil {
 		out.CacheBytesUsed = bodyBytes + attBytes
 	}
-	out.CacheBudgetBytes = store.CacheBudgetBytes
+	out.CacheBudgetBytes = m.st.CacheBudgetBytes()
 	return out
 }
 
@@ -173,6 +177,36 @@ func (m *Manager) run(ctx context.Context, acct mail.Account) {
 	}
 }
 
+type folderRef struct {
+	id   int64
+	name string
+}
+
+func (m *Manager) folderMu(id int64) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.folderLocks == nil {
+		m.folderLocks = make(map[int64]*sync.Mutex)
+	}
+	mu, ok := m.folderLocks[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		m.folderLocks[id] = mu
+	}
+	return mu
+}
+
+func (m *Manager) syncFolderLocked(cl *mail.Client, acct mail.Account, r folderRef) Change {
+	mu := m.folderMu(r.id)
+	mu.Lock()
+	defer mu.Unlock()
+	change, err := m.syncFolder(cl, acct, r.id, r.name)
+	if err != nil {
+		log.Printf("sync account %d folder %s: %v", acct.ID, r.name, err)
+	}
+	return change
+}
+
 func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 	wake := make(chan struct{}, 1)
 	notify := func() {
@@ -186,6 +220,9 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 		Fetch:   func(*imapclient.FetchMessageData) { notify() },
 		Expunge: func(uint32) { notify() },
 	}
+	m.mu.Lock()
+	m.live[acct.ID] = false
+	m.mu.Unlock()
 	m.setStatus(acct.ID, &Status{State: "connecting"})
 	cl, err := mail.Connect(acct, handler)
 	if err != nil {
@@ -193,34 +230,34 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 	}
 	defer cl.Close()
 
-	folders, err := cl.ListFolders()
+	listRefs := func() ([]folderRef, *folderRef, error) {
+		folders, err := cl.ListFolders()
+		if err != nil {
+			return nil, nil, err
+		}
+		refs := make([]folderRef, 0, len(folders))
+		var inbox *folderRef
+		for _, f := range folders {
+			id, err := m.st.UpsertFolder(acct.ID, f.Name, f.SpecialUse)
+			if err != nil {
+				return nil, nil, err
+			}
+			r := folderRef{id: id, name: f.Name}
+			refs = append(refs, r)
+			if f.SpecialUse == "inbox" && inbox == nil {
+				rr := r
+				inbox = &rr
+			}
+		}
+		return refs, inbox, nil
+	}
+	refs, inboxRef, err := listRefs()
 	if err != nil {
 		return fmt.Errorf("list folders: %w", err)
 	}
-	type folderRef struct {
-		id   int64
-		name string
-	}
-	refs := make([]folderRef, 0, len(folders))
-	var inboxRef *folderRef
-	for _, f := range folders {
-		id, err := m.st.UpsertFolder(acct.ID, f.Name, f.SpecialUse)
-		if err != nil {
-			return fmt.Errorf("upsert folder: %w", err)
-		}
-		refs = append(refs, folderRef{id: id, name: f.Name})
-		if f.SpecialUse == "inbox" && inboxRef == nil {
-			r := folderRef{id: id, name: f.Name}
-			inboxRef = &r
-		}
-	}
 
 	m.setStatus(acct.ID, &Status{State: "syncing", Folders: len(refs)})
-	syncOne := func(r folderRef) {
-		if err := m.syncFolder(cl, acct, r.id, r.name); err != nil {
-			log.Printf("sync account %d folder %s: %v", acct.ID, r.name, err)
-		}
-	}
+	syncOne := func(r folderRef) { m.syncFolderLocked(cl, acct, r) }
 	if inboxRef != nil {
 		syncOne(*inboxRef)
 	}
@@ -237,6 +274,10 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 		Folders:    len(refs),
 		Messages:   n,
 	})
+	m.mu.Lock()
+	m.live[acct.ID] = true
+	m.mu.Unlock()
+	m.repairThreads(ctx, cl, acct)
 	m.prewarm(ctx, cl, acct)
 
 	syncAll := func() {
@@ -248,9 +289,8 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 		m.prewarm(ctx, cl, acct)
 	}
 
-	hasIdle := cl.HasCap(imap.CapIdle)
-	for {
-		if inboxRef == nil || !hasIdle {
+	if !cl.HasCap(imap.CapIdle) {
+		for {
 			select {
 			case <-ctx.Done():
 				return nil
@@ -259,11 +299,147 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 			case <-time.After(60 * time.Second):
 				syncAll()
 			}
-			continue
 		}
-		if _, err := cl.Select(inboxRef.name); err != nil {
-			return fmt.Errorf("select inbox: %w", err)
+	}
+
+	wctx, wcancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	watched := make(map[int64]context.CancelFunc)
+	var watchedMu sync.Mutex
+	kick := make(chan struct{}, 1)
+	startWatcher := func(r folderRef) {
+		watchedMu.Lock()
+		defer watchedMu.Unlock()
+		if _, ok := watched[r.id]; ok {
+			return
 		}
+		fctx, fcancel := context.WithCancel(wctx)
+		watched[r.id] = fcancel
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.watchFolder(fctx, acct, r, kick)
+		}()
+	}
+	stopWatcher := func(id int64) {
+		watchedMu.Lock()
+		defer watchedMu.Unlock()
+		if c, ok := watched[id]; ok {
+			c()
+			delete(watched, id)
+		}
+	}
+	for _, r := range refs {
+		startWatcher(r)
+	}
+	defer func() {
+		wcancel()
+		wg.Wait()
+	}()
+
+	sweep := time.NewTicker(10 * time.Minute)
+	defer sweep.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-kick:
+			m.prewarm(ctx, cl, acct)
+		case <-sweep.C:
+			if newRefs, _, err := listRefs(); err == nil {
+				seen := make(map[int64]bool, len(newRefs))
+				for _, r := range newRefs {
+					seen[r.id] = true
+				}
+				for _, r := range refs {
+					if !seen[r.id] {
+						stopWatcher(r.id)
+					}
+				}
+				refs = newRefs
+				m.setStatus(acct.ID, &Status{State: "idle", Folders: len(refs)})
+				for _, r := range refs {
+					startWatcher(r)
+				}
+			} else {
+				log.Printf("sync account %d list folders: %v", acct.ID, err)
+			}
+			syncAll()
+		}
+	}
+}
+
+func (m *Manager) watchFolder(ctx context.Context, acct mail.Account, r folderRef, kick chan<- struct{}) {
+	backoff := 5 * time.Second
+	for {
+		err := m.watchSession(ctx, acct, r, kick)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Printf("sync account %d folder %s watch: %v (retry in %s)", acct.ID, r.name, err, backoff)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if err != nil {
+			backoff *= 2
+			if backoff > time.Minute {
+				backoff = time.Minute
+			}
+		} else {
+			backoff = 5 * time.Second
+		}
+	}
+}
+
+func (m *Manager) watchSession(ctx context.Context, acct mail.Account, r folderRef, kick chan<- struct{}) error {
+	wake := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+	handler := &imapclient.UnilateralDataHandler{
+		Mailbox: func(*imapclient.UnilateralDataMailbox) { notify() },
+		Fetch:   func(*imapclient.FetchMessageData) { notify() },
+		Expunge: func(uint32) { notify() },
+	}
+	cl, err := mail.Connect(acct, handler)
+	if err != nil {
+		return err
+	}
+	defer cl.Close()
+
+	syncMine := func() {
+		change := m.syncFolderLocked(cl, acct, r)
+		m.setStatus(acct.ID, &Status{State: "idle", LastSyncAt: time.Now().Unix()})
+		if len(change.Inserted) > 0 {
+			select {
+			case kick <- struct{}{}:
+			default:
+			}
+		}
+	}
+	syncMine()
+
+	if !cl.HasCap(imap.CapIdle) {
+		for {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-wake:
+				syncMine()
+			case <-time.After(60 * time.Second):
+				syncMine()
+			}
+		}
+	}
+
+	for {
 		idleCmd, err := cl.Idle()
 		if err != nil {
 			return fmt.Errorf("idle: %w", err)
@@ -271,40 +447,35 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 		done := make(chan error, 1)
 		go func() { done <- idleCmd.Wait() }()
 		poll := time.NewTimer(2 * time.Minute)
-		sweep := time.NewTimer(10 * time.Minute)
-		stop := false
-		for !stop {
+		var idleErr error
+		gotDone := false
+	idleWait:
+		for {
 			select {
 			case <-ctx.Done():
 				idleCmd.Close()
 				<-done
+				poll.Stop()
 				return nil
 			case <-wake:
-				stop = true
+				break idleWait
 			case <-poll.C:
-				stop = true
-			case <-sweep.C:
-				idleCmd.Close()
-				<-done
-				syncAll()
-				stop = true
-				continue
+				break idleWait
 			case err := <-done:
-				if err != nil {
-					return fmt.Errorf("idle wait: %w", err)
-				}
-				stop = true
-				continue
+				idleErr = err
+				gotDone = true
+				break idleWait
 			}
-			idleCmd.Close()
-			<-done
 		}
 		poll.Stop()
-		sweep.Stop()
-		if err := m.syncFolder(cl, acct, inboxRef.id, inboxRef.name); err != nil {
-			log.Printf("sync account %d inbox: %v", acct.ID, err)
+		idleCmd.Close()
+		if !gotDone {
+			<-done
 		}
-		m.prewarm(ctx, cl, acct)
+		if idleErr != nil {
+			return fmt.Errorf("idle wait: %w", idleErr)
+		}
+		syncMine()
 	}
 }
 
@@ -319,25 +490,28 @@ func addrsJSON(addrs []mail.Addr) string {
 	return string(b)
 }
 
-func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64, name string) error {
-	change := Change{AccountID: acct.ID, FolderID: folderID}
+func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64, name string) (Change, error) {
+	m.mu.Lock()
+	live := m.live[acct.ID]
+	m.mu.Unlock()
+	change := Change{AccountID: acct.ID, FolderID: folderID, Initial: !live}
 	defer func() { m.emit(change) }()
 	state, err := m.st.FolderState(folderID)
 	if err != nil {
-		return err
+		return change, err
 	}
 	sel, err := cl.Select(name)
 	if err != nil {
-		return err
+		return change, err
 	}
 	uidNext := uint32(sel.UIDNext)
 	if state.UIDValidity != 0 && state.UIDValidity != sel.UIDValidity {
 		if err := m.st.WipeFolder(folderID); err != nil {
-			return err
+			return change, err
 		}
 		state, err = m.st.FolderState(folderID)
 		if err != nil {
-			return err
+			return change, err
 		}
 	}
 
@@ -355,7 +529,7 @@ func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64,
 			set.AddRange(imap.UID(start), imap.UID(end))
 			msgs, err := cl.FetchEnvelopes(set)
 			if err != nil {
-				return fmt.Errorf("fetch envelopes %d:%d: %w", start, end, err)
+				return change, fmt.Errorf("fetch envelopes %d:%d: %w", start, end, err)
 			}
 			for _, msg := range msgs {
 				row := &store.MessageRow{
@@ -374,7 +548,7 @@ func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64,
 				}
 				id, inserted, err := m.st.UpsertMessage(acct.ID, folderID, row)
 				if err != nil {
-					return fmt.Errorf("upsert message: %w", err)
+					return change, fmt.Errorf("upsert message: %w", err)
 				}
 				if inserted {
 					change.Inserted = append(change.Inserted, id)
@@ -394,12 +568,12 @@ func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64,
 	if cl.HasCap(imap.CapCondStore) && state.HighestModSeq > 0 && state.UIDNext > 0 {
 		changed, err := cl.FetchFlags(state.HighestModSeq)
 		if err != nil {
-			return fmt.Errorf("fetch changed flags: %w", err)
+			return change, fmt.Errorf("fetch changed flags: %w", err)
 		}
 		for _, msg := range changed {
 			didChange, err := m.st.UpdateMessageFlags(folderID, msg.UID, msg.Flags, msg.ModSeq)
 			if err != nil {
-				return err
+				return change, err
 			}
 			if didChange {
 				if id, ok := m.st.LocalID(folderID, msg.UID); ok {
@@ -413,14 +587,14 @@ func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64,
 	} else {
 		all, err := cl.FetchFlags(0)
 		if err != nil {
-			return fmt.Errorf("fetch flags: %w", err)
+			return change, fmt.Errorf("fetch flags: %w", err)
 		}
 		seen := make(map[uint32]bool, len(all))
 		for _, msg := range all {
 			seen[msg.UID] = true
 			didChange, err := m.st.UpdateMessageFlags(folderID, msg.UID, msg.Flags, msg.ModSeq)
 			if err != nil {
-				return err
+				return change, err
 			}
 			if didChange {
 				if id, ok := m.st.LocalID(folderID, msg.UID); ok {
@@ -433,7 +607,7 @@ func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64,
 		}
 		local, err := m.st.FolderUIDs(folderID)
 		if err != nil {
-			return err
+			return change, err
 		}
 		for uid := range local {
 			if !seen[uid] {
@@ -441,11 +615,12 @@ func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64,
 					change.Removed = append(change.Removed, id)
 				}
 				if err := m.st.DeleteMessage(folderID, uid); err != nil {
-					return err
+					return change, err
 				}
 			}
 		}
 	}
 
-	return m.st.UpdateFolderSync(folderID, sel.UIDValidity, uidNext, highestModSeq, int(sel.NumMessages))
+	err = m.st.UpdateFolderSync(folderID, sel.UIDValidity, uidNext, highestModSeq, int(sel.NumMessages))
+	return change, err
 }

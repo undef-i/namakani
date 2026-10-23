@@ -30,14 +30,15 @@ export const updateAccount = (id, a) =>
 export const deleteAccount = (id) => req('/api/accounts/' + id, { method: 'DELETE' })
 export const testAccount = (id) => post('/api/accounts/' + id + '/test')
 export const getSyncStatus = (id) => req('/api/accounts/' + id + '/sync')
+export const getAppSettings = () => req('/api/settings/app')
+export const saveAppSettings = (b) =>
+  req('/api/settings/app', { method: 'PUT', body: JSON.stringify(b) })
 export const getTelegram = () => req('/api/settings/telegram')
 export const saveTelegram = (b) =>
   req('/api/settings/telegram', { method: 'PUT', body: JSON.stringify(b) })
 export const discoverTelegram = (bot_token) => post('/api/settings/telegram/discover', { bot_token })
 export const testTelegram = (b) => post('/api/settings/telegram/test', b)
 export const getWebPush = () => req('/api/settings/webpush')
-export const saveWebPush = (b) =>
-  req('/api/settings/webpush', { method: 'PUT', body: JSON.stringify(b) })
 export const testWebPush = () => post('/api/settings/webpush/test')
 export const subscribePush = (sub) => post('/api/push/subscribe', sub)
 export const unsubscribePush = (endpoint) => post('/api/push/unsubscribe', { endpoint })

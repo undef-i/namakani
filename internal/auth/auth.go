@@ -42,7 +42,7 @@ func SetupMaster(st *store.Store, password string) error {
 	if err := st.SetSetting("kdf_salt", base64.StdEncoding.EncodeToString(salt)); err != nil {
 		return err
 	}
-	verifier := hashWithSalt(password, salt)
+	verifier := verifierOf(hashWithSalt(password, salt))
 	return st.SetSetting("master_verifier", base64.StdEncoding.EncodeToString(verifier))
 }
 
@@ -69,10 +69,15 @@ func VerifyMaster(st *store.Store, password string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	key := hashWithSalt(password, salt)
-	if subtle.ConstantTimeCompare(key, want) != 1 {
+	if subtle.ConstantTimeCompare(verifierOf(key), want) != 1 {
 		return nil, false, nil
 	}
 	return key, true, nil
+}
+
+func verifierOf(key []byte) []byte {
+	sum := sha256.Sum256(key)
+	return sum[:]
 }
 
 func tokenHash(token string) string {

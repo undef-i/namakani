@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
+import { intlLocale, t } from '../i18n'
 import { useEditor, EditorContent } from '@tiptap/vue-3'
 import StarterKit from '@tiptap/starter-kit'
 import Underline from '@tiptap/extension-underline'
@@ -11,12 +12,14 @@ import Link from '@tiptap/extension-link'
 import Image from '@tiptap/extension-image'
 import * as api from '../api.js'
 
-const MAX_ATTACH_TOTAL = 20 * 1024 * 1024
+const maxAttachTotal = computed(() => props.maxAttachmentMB * 1024 * 1024)
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   accounts: { type: Array, default: () => [] },
   initial: { type: Object, default: () => ({}) },
+  undoSeconds: { type: Number, default: 5 },
+  maxAttachmentMB: { type: Number, default: 20 },
 })
 const emit = defineEmits(['update:modelValue', 'done'])
 
@@ -35,7 +38,30 @@ const bccChips = ref([])
 const toSearch = ref('')
 const ccSearch = ref('')
 const bccSearch = ref('')
-const showCc = ref(false)
+
+function chipEnter(chips, search) {
+  return (e) => {
+    if (e.ctrlKey || e.metaKey) return
+    const input = e.target
+    if (
+      input.getAttribute &&
+      input.getAttribute('aria-expanded') === 'true' &&
+      input.getAttribute('aria-activedescendant')
+    ) {
+      return
+    }
+    e.preventDefault()
+    e.stopPropagation()
+    const s = search.value.trim()
+    if (s) {
+      if (!chips.value.includes(s)) chips.value = [...chips.value, s]
+      search.value = ''
+    }
+  }
+}
+const onToEnter = chipEnter(toChips, toSearch)
+const onCcEnter = chipEnter(ccChips, ccSearch)
+const onBccEnter = chipEnter(bccChips, bccSearch)
 const subject = ref('')
 const html = ref('')
 const plainText = ref('')
@@ -61,6 +87,7 @@ const schedInfo = ref('')
 const schedInfoShow = ref(false)
 const undoShow = ref(false)
 const undoLeft = ref(0)
+const showCc = ref(false)
 const contacts = ref([])
 const contactsError = ref(false)
 let saveTimer = null
@@ -72,7 +99,7 @@ let undoTimer = null
 let pendingPayload = null
 
 const title = computed(() =>
-  props.initial.draft_id ? '编辑草稿' : props.initial.reply_to_id ? '回复邮件' : '写信',
+  props.initial.draft_id ? t('编辑草稿') : props.initial.reply_to_id ? t('回复邮件') : t('写信'),
 )
 
 const contactItems = computed(() =>
@@ -148,9 +175,9 @@ function invalidOf(arr) {
   return arr.filter((c) => !chipValid(c))
 }
 
-const toInvalid = computed(() => invalidOf(allChips(toChips.value, toSearch.value)))
-const ccInvalid = computed(() => invalidOf(allChips(ccChips.value, ccSearch.value)))
-const bccInvalid = computed(() => invalidOf(allChips(bccChips.value, bccSearch.value)))
+const toInvalid = computed(() => invalidOf(toChips.value))
+const ccInvalid = computed(() => invalidOf(ccChips.value))
+const bccInvalid = computed(() => invalidOf(bccChips.value))
 
 function snapshot() {
   return JSON.stringify({
@@ -199,11 +226,14 @@ function fmtClock(d) {
 }
 
 function fmtDateTime(d) {
-  const pad = (n) => String(n).padStart(2, '0')
-  return (
-    d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
-    pad(d.getHours()) + ':' + pad(d.getMinutes())
-  )
+  return new Intl.DateTimeFormat(intlLocale(), {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(d)
 }
 
 async function loadContacts() {
@@ -238,10 +268,10 @@ watch(open, (isOpen) => {
   toChips.value = splitAddrStr(init.to ?? '')
   ccChips.value = splitAddrStr(init.cc ?? '')
   bccChips.value = splitAddrStr(init.bcc ?? '')
+  showCc.value = ccChips.value.length > 0 || bccChips.value.length > 0
   toSearch.value = ''
   ccSearch.value = ''
   bccSearch.value = ''
-  showCc.value = ccChips.value.length > 0 || bccChips.value.length > 0
   subject.value = init.subject ?? ''
   attachments.value = []
   draftId.value = init.draft_id ?? 0
@@ -307,8 +337,8 @@ async function addFiles(files) {
   attachError.value = ''
   let total = attachments.value.reduce((s, a) => s + a.size, 0)
   for (const f of files) {
-    if (total + f.size > MAX_ATTACH_TOTAL) {
-      attachError.value = '附件总大小超过 20 MB 上限，已跳过 ' + f.name
+    if (total + f.size > maxAttachTotal.value) {
+      attachError.value = t('附件总大小超过 {mb} MB 上限，已跳过 {name}', { mb: props.maxAttachmentMB, name: f.name })
       continue
     }
     const dataUrl = await new Promise((resolve, reject) => {
@@ -425,9 +455,13 @@ watch([accountId, toChips, ccChips, bccChips, subject, html, attachments], () =>
 }, { deep: true })
 
 function validateRecipients() {
-  const bad = [...toInvalid.value, ...ccInvalid.value, ...bccInvalid.value]
+  const bad = [
+    ...invalidOf(allChips(toChips.value, toSearch.value)),
+    ...invalidOf(allChips(ccChips.value, ccSearch.value)),
+    ...invalidOf(allChips(bccChips.value, bccSearch.value)),
+  ]
   if (bad.length > 0) {
-    error.value = '地址格式不对：' + bad.join('，')
+    error.value = t('地址格式不对：{list}', { list: bad.join(t('，')) })
     return false
   }
   if (
@@ -438,7 +472,7 @@ function validateRecipients() {
     !ccSearch.value.trim() &&
     !bccSearch.value.trim()
   ) {
-    error.value = '至少填写一个收件人'
+    error.value = t('至少填写一个收件人')
     return false
   }
   return true
@@ -476,7 +510,13 @@ function doSend() {
   clearTimeout(saveTimer)
   pendingPayload = payload()
   open.value = false
-  undoLeft.value = 8
+  if (!props.undoSeconds || props.undoSeconds <= 0) {
+    const p = pendingPayload
+    pendingPayload = null
+    if (p) realSend(p)
+    return
+  }
+  undoLeft.value = props.undoSeconds
   undoShow.value = true
   clearInterval(undoTimer)
   undoTimer = setInterval(() => {
@@ -506,7 +546,7 @@ async function scheduleAt(date) {
   error.value = ''
   if (!validateRecipients()) return
   if (!(date.getTime() > Date.now())) {
-    error.value = '定时发送时间必须在将来'
+    error.value = t('定时发送时间必须在将来')
     return
   }
   busy.value = true
@@ -514,7 +554,7 @@ async function scheduleAt(date) {
   try {
     await api.scheduleSend({ ...payload(), send_at: Math.floor(date.getTime() / 1000) })
     open.value = false
-    schedInfo.value = '已安排在 ' + fmtDateTime(date) + ' 发送'
+    schedInfo.value = t('已安排在 {time} 发送', { time: fmtDateTime(date) })
     schedInfoShow.value = true
     emit('done')
   } catch (e) {
@@ -554,7 +594,7 @@ async function discardCompose() {
     try {
       await api.deleteMessage(draftId.value)
     } catch (e) {
-      error.value = '删除草稿失败：' + e.message
+      error.value = t('删除草稿失败：{error}', { error: e.message })
       busy.value = false
       return
     }
@@ -594,7 +634,7 @@ async function closeCompose() {
       draftId.value = res.id
       lastSavedJSON = snapshot()
     } catch (e) {
-      error.value = '草稿保存失败：' + e.message
+      error.value = t('草稿保存失败：{error}', { error: e.message })
       busy.value = false
       return
     }
@@ -635,12 +675,12 @@ function onKeydown(e) {
           icon
           size="small"
           variant="text"
-          :aria-label="maximized ? '还原' : '全屏'"
+          :aria-label="maximized ? t('还原') : t('全屏')"
           @click.stop="maximized = !maximized"
         >
           <v-icon :icon="maximized ? 'mdi-arrow-collapse' : 'mdi-arrow-expand'" />
         </v-btn>
-        <v-btn icon="mdi-close" size="small" variant="text" aria-label="关闭" :disabled="busy" @click.stop="closeCompose" />
+        <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" :disabled="busy" @click.stop="closeCompose" />
       </div>
 
       <v-card-text v-if="done">
@@ -649,73 +689,98 @@ function onKeydown(e) {
 
       <div v-show="!done" class="compose-main">
         <div class="compose-body">
-          <div class="compose-pad">
-            <v-select
-              v-model="accountId"
-              label="发信账号"
-              variant="outlined"
-              density="comfortable"
-              :items="accounts.map((a) => ({ title: a.label + '（' + a.email + '）', value: String(a.id) }))"
-              class="mb-2"
-            />
-            <v-combobox
-              v-model="toChips"
-              v-model:search="toSearch"
-              :items="contactItems"
-              label="收件人"
-              variant="outlined"
-              density="comfortable"
-              multiple
-              chips
-              closable-chips
-              :delimiters="[',']"
-              :error-messages="toInvalid.length ? ['地址格式不对：' + toInvalid.join('，')] : []"
-              class="mb-2"
-            />
-            <p v-if="contactsError" class="text-caption text-error mb-2">
-              联系人加载失败，地址联想不可用
-              <v-btn variant="text" size="x-small" @click="loadContacts">重试</v-btn>
-            </p>
-            <template v-if="showCc">
+          <div class="cform">
+            <div class="crow">
+              <span class="clabel">{{ t('发件人') }}</span>
+              <v-select
+                v-model="accountId"
+                variant="plain"
+                density="compact"
+                hide-details
+                :items="accounts.map((a) => ({ title: (a.from_name || a.label) + ' <' + a.email + '>', value: String(a.id) }))"
+                class="cfield"
+              />
+            </div>
+            <div class="crow">
+              <span class="clabel">{{ t('收件人') }}</span>
               <v-combobox
+                @keydown.capture.enter="onToEnter"
+                v-model="toChips"
+                v-model:search="toSearch"
+                :items="contactItems"
+                variant="plain"
+                density="compact"
+                hide-details
+                multiple
+                chips
+                closable-chips
+                :delimiters="[',']"
+                :error="toInvalid.length > 0"
+                class="cfield"
+              />
+              <v-btn
+                icon="mdi-chevron-down"
+                size="x-small"
+                variant="text"
+                :aria-label="t('抄送和密送')"
+                class="chev-btn"
+                :class="{ 'chev-open': showCc }"
+                @click="showCc = !showCc"
+              />
+            </div>
+            <p v-if="toInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: toInvalid.join(t('，')) }) }}</p>
+            <p v-if="contactsError" class="cerr">
+              {{ t('联系人加载失败，地址联想不可用') }}
+              <v-btn variant="text" size="x-small" @click="loadContacts">{{ t('重试') }}</v-btn>
+            </p>
+            <div v-if="showCc" class="crow">
+              <span class="clabel">{{ t('抄送') }}</span>
+              <v-combobox
+                @keydown.capture.enter="onCcEnter"
                 v-model="ccChips"
                 v-model:search="ccSearch"
                 :items="contactItems"
-                label="抄送"
-                variant="outlined"
-                density="comfortable"
+                variant="plain"
+                density="compact"
+                hide-details
                 multiple
                 chips
                 closable-chips
                 :delimiters="[',']"
-                :error-messages="ccInvalid.length ? ['地址格式不对：' + ccInvalid.join('，')] : []"
-                class="mb-2"
+                :error="ccInvalid.length > 0"
+                class="cfield"
               />
+            </div>
+            <p v-if="showCc && ccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: ccInvalid.join(t('，')) }) }}</p>
+            <div v-if="showCc" class="crow">
+              <span class="clabel">{{ t('密送') }}</span>
               <v-combobox
+                @keydown.capture.enter="onBccEnter"
                 v-model="bccChips"
                 v-model:search="bccSearch"
                 :items="contactItems"
-                label="密送"
-                variant="outlined"
-                density="comfortable"
+                variant="plain"
+                density="compact"
+                hide-details
                 multiple
                 chips
                 closable-chips
                 :delimiters="[',']"
-                :error-messages="bccInvalid.length ? ['地址格式不对：' + bccInvalid.join('，')] : []"
-                class="mb-2"
+                :error="bccInvalid.length > 0"
+                class="cfield"
               />
-            </template>
-            <v-btn
-              v-else
-              variant="text"
-              size="small"
-              class="mb-2 px-0"
-              @click="showCc = true"
-            >
-              添加抄送 / 密送
-            </v-btn>
-            <v-text-field v-model="subject" label="主题" variant="outlined" density="comfortable" class="mb-2" />
+            </div>
+            <p v-if="showCc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
+            <div class="crow">
+              <v-text-field
+                v-model="subject"
+                :placeholder="t('主题')"
+                variant="plain"
+                density="compact"
+                hide-details
+                class="cfield"
+              />
+            </div>
           </div>
 
           <div class="compose-editor">
@@ -724,7 +789,7 @@ function onKeydown(e) {
                 icon="mdi-undo"
                 size="small"
                 variant="text"
-                aria-label="撤销"
+                :aria-label="t('撤销')"
                 :disabled="!editor?.can().undo()"
                 @click="editor?.chain().focus().undo().run()"
               />
@@ -732,7 +797,7 @@ function onKeydown(e) {
                 icon="mdi-redo"
                 size="small"
                 variant="text"
-                aria-label="重做"
+                :aria-label="t('重做')"
                 :disabled="!editor?.can().redo()"
                 @click="editor?.chain().focus().redo().run()"
               />
@@ -741,31 +806,31 @@ function onKeydown(e) {
                 icon="mdi-format-bold"
                 size="small"
                 :variant="editor?.isActive('bold') ? 'tonal' : 'text'"
-                aria-label="加粗"
+                :aria-label="t('加粗')"
                 @click="editor?.chain().focus().toggleBold().run()"
               />
               <v-btn
                 icon="mdi-format-italic"
                 size="small"
                 :variant="editor?.isActive('italic') ? 'tonal' : 'text'"
-                aria-label="斜体"
+                :aria-label="t('斜体')"
                 @click="editor?.chain().focus().toggleItalic().run()"
               />
               <v-btn
                 icon="mdi-format-underline"
                 size="small"
                 :variant="editor?.isActive('underline') ? 'tonal' : 'text'"
-                aria-label="下划线"
+                :aria-label="t('下划线')"
                 @click="editor?.chain().focus().toggleUnderline().run()"
               />
               <v-btn
                 icon="mdi-format-strikethrough"
                 size="small"
                 :variant="editor?.isActive('strike') ? 'tonal' : 'text'"
-                aria-label="删除线"
+                :aria-label="t('删除线')"
                 @click="editor?.chain().focus().toggleStrike().run()"
               />
-              <label class="color-pick" aria-label="文字颜色">
+              <label class="color-pick" :aria-label="t('文字颜色')">
                 <v-icon icon="mdi-format-color-text" size="20" />
                 <input type="color" @input="setColor($event.target.value)" />
               </label>
@@ -774,21 +839,21 @@ function onKeydown(e) {
                 icon="mdi-format-align-left"
                 size="small"
                 :variant="editor?.isActive({ textAlign: 'left' }) ? 'tonal' : 'text'"
-                aria-label="左对齐"
+                :aria-label="t('左对齐')"
                 @click="editor?.chain().focus().setTextAlign('left').run()"
               />
               <v-btn
                 icon="mdi-format-align-center"
                 size="small"
                 :variant="editor?.isActive({ textAlign: 'center' }) ? 'tonal' : 'text'"
-                aria-label="居中"
+                :aria-label="t('居中')"
                 @click="editor?.chain().focus().setTextAlign('center').run()"
               />
               <v-btn
                 icon="mdi-format-align-right"
                 size="small"
                 :variant="editor?.isActive({ textAlign: 'right' }) ? 'tonal' : 'text'"
-                aria-label="右对齐"
+                :aria-label="t('右对齐')"
                 @click="editor?.chain().focus().setTextAlign('right').run()"
               />
               <v-divider vertical class="mx-1" />
@@ -796,21 +861,21 @@ function onKeydown(e) {
                 icon="mdi-format-list-bulleted"
                 size="small"
                 :variant="editor?.isActive('bulletList') ? 'tonal' : 'text'"
-                aria-label="无序列表"
+                :aria-label="t('无序列表')"
                 @click="editor?.chain().focus().toggleBulletList().run()"
               />
               <v-btn
                 icon="mdi-format-list-numbered"
                 size="small"
                 :variant="editor?.isActive('orderedList') ? 'tonal' : 'text'"
-                aria-label="有序列表"
+                :aria-label="t('有序列表')"
                 @click="editor?.chain().focus().toggleOrderedList().run()"
               />
               <v-btn
                 icon="mdi-format-quote-close"
                 size="small"
                 :variant="editor?.isActive('blockquote') ? 'tonal' : 'text'"
-                aria-label="引用"
+                :aria-label="t('引用')"
                 @click="editor?.chain().focus().toggleBlockquote().run()"
               />
               <v-menu v-model="linkMenu" :close-on-content-click="false" location="bottom start" z-index="2600">
@@ -820,13 +885,13 @@ function onKeydown(e) {
                     icon="mdi-link"
                     size="small"
                     :variant="editor?.isActive('link') ? 'tonal' : 'text'"
-                    aria-label="插入链接"
+                    :aria-label="t('插入链接')"
                   />
                 </template>
                 <v-card width="300" class="pa-3">
                   <v-text-field
                     v-model="linkUrl"
-                    label="链接地址"
+                    :label="t('链接地址')"
                     density="compact"
                     variant="outlined"
                     hide-details
@@ -834,8 +899,8 @@ function onKeydown(e) {
                     @keydown.enter.prevent="applyLink"
                   />
                   <div class="d-flex ga-2">
-                    <v-btn size="small" color="primary" @click="applyLink">确定</v-btn>
-                    <v-btn size="small" variant="text" @click="removeLink">移除链接</v-btn>
+                    <v-btn size="small" color="primary" @click="applyLink">{{ t('确定') }}</v-btn>
+                    <v-btn size="small" variant="text" @click="removeLink">{{ t('移除链接') }}</v-btn>
                   </div>
                 </v-card>
               </v-menu>
@@ -843,7 +908,7 @@ function onKeydown(e) {
                 icon="mdi-image"
                 size="small"
                 variant="text"
-                aria-label="插入图片"
+                :aria-label="t('插入图片')"
                 @click="imageInput?.click()"
               />
               <input ref="imageInput" type="file" accept="image/*" class="d-none" @change="onImageChosen" />
@@ -851,7 +916,7 @@ function onKeydown(e) {
                 icon="mdi-format-clear"
                 size="small"
                 variant="text"
-                aria-label="清除格式"
+                :aria-label="t('清除格式')"
                 @click="editor?.chain().focus().unsetAllMarks().clearNodes().run()"
               />
             </div>
@@ -861,10 +926,10 @@ function onKeydown(e) {
           <div class="compose-pad">
             <div class="d-flex align-center ga-2 mt-2 mb-2">
               <v-btn variant="outlined" size="small" :disabled="busy" @click="fileInput?.click()">
-                添加附件
+                {{ t('添加附件') }}
               </v-btn>
               <input ref="fileInput" type="file" multiple class="d-none" @change="onFilesChosen" />
-              <span class="text-caption text-medium-emphasis">也可拖拽文件到窗口，或粘贴图片</span>
+              <span class="text-caption text-medium-emphasis">{{ t('也可拖拽文件到窗口，或粘贴图片') }}</span>
             </div>
             <v-list v-if="attachments.length > 0" density="compact" class="mb-2">
               <v-list-item v-for="(a, i) in attachments" :key="a.filename + ':' + i">
@@ -872,7 +937,7 @@ function onKeydown(e) {
                 <v-list-item-subtitle>{{ fmtSize(a.size) }}</v-list-item-subtitle>
                 <template #append>
                   <v-btn variant="text" size="small" :disabled="busy" @click="removeAttachment(i)">
-                    移除
+                    {{ t('移除') }}
                   </v-btn>
                 </template>
               </v-list-item>
@@ -891,31 +956,31 @@ function onKeydown(e) {
             icon="mdi-trash-can-outline"
             variant="text"
             color="error"
-            aria-label="删除草稿"
+            :aria-label="t('删除草稿')"
             :disabled="busy || sending || undoShow"
             @click="discardCompose"
           >
             <v-icon icon="mdi-trash-can-outline" />
-            <v-tooltip activator="parent" location="top">删除草稿</v-tooltip>
+            <v-tooltip activator="parent" location="top">{{ t('删除草稿') }}</v-tooltip>
           </v-btn>
           <span v-if="savedAt" class="text-caption text-medium-emphasis ml-1">
-            草稿已保存 {{ savedAt }}
+            {{ t('草稿已保存 {time}', { time: savedAt }) }}
           </span>
           <v-spacer />
           <v-btn-group color="primary" variant="elevated" density="comfortable" class="ml-2">
             <v-btn :disabled="busy" :loading="sending" @click="doSend">
-              {{ sending ? '发送中' : '发送' }}
+              {{ sending ? t('发送中') : t('发送') }}
             </v-btn>
             <v-menu v-model="schedMenu" :close-on-content-click="false" location="top end" z-index="2600">
               <template #activator="{ props: mp }">
-                <v-btn v-bind="mp" icon="mdi-chevron-down" :disabled="busy" aria-label="定时发送" />
+                <v-btn v-bind="mp" icon="mdi-chevron-down" :disabled="busy" :aria-label="t('定时发送')" />
               </template>
               <v-card width="280" class="pa-2">
                 <v-list density="compact">
-                  <v-list-item title="1 小时后" @click="scheduleOption('h1')" />
-                  <v-list-item title="今晚 20:00" @click="scheduleOption('tonight')" />
-                  <v-list-item title="明早 08:00" @click="scheduleOption('tomorrow')" />
-                  <v-list-item title="自定义时间" @click="schedCustom = true" />
+                  <v-list-item :title="t('1 小时后')" @click="scheduleOption('h1')" />
+                  <v-list-item :title="t('今晚 20:00')" @click="scheduleOption('tonight')" />
+                  <v-list-item :title="t('明早 08:00')" @click="scheduleOption('tomorrow')" />
+                  <v-list-item :title="t('自定义时间')" @click="schedCustom = true" />
                 </v-list>
                 <template v-if="schedCustom">
                   <v-text-field
@@ -927,7 +992,7 @@ function onKeydown(e) {
                     class="ma-2"
                   />
                   <v-btn block color="primary" size="small" class="mb-1" @click="scheduleCustomGo">
-                    安排发送
+                    {{ t('安排发送') }}
                   </v-btn>
                 </template>
               </v-card>
@@ -938,17 +1003,17 @@ function onKeydown(e) {
 
       <v-card-actions v-if="done">
         <v-spacer />
-        <v-btn color="primary" @click="closeAfterDone">关闭</v-btn>
+        <v-btn color="primary" @click="closeAfterDone">{{ t('关闭') }}</v-btn>
       </v-card-actions>
 
-      <div v-if="dragOver" class="compose-drop">松开鼠标添加附件</div>
+      <div v-if="dragOver" class="compose-drop">{{ t('松开鼠标添加附件') }}</div>
     </v-card>
   </div>
 
   <v-snackbar v-model="undoShow" :timeout="-1" location="bottom left">
-    正在发送，{{ undoLeft }} 秒后发出
+    {{ t('正在发送，{n} 秒后发出', { n: undoLeft }) }}
     <template #actions>
-      <v-btn color="warning" variant="text" @click="undoSend">撤销</v-btn>
+      <v-btn color="warning" variant="text" @click="undoSend">{{ t('撤销') }}</v-btn>
     </template>
   </v-snackbar>
 
@@ -1017,18 +1082,68 @@ function onKeydown(e) {
   padding-left: 16px;
   padding-right: 16px;
 }
+.cform {
+  padding: 0 16px;
+}
+.crow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+.clabel {
+  flex: none;
+  width: 44px;
+  font-size: 13px;
+  color: rgba(var(--v-theme-on-surface), 0.6);
+}
+.cfield {
+  flex: 1;
+  min-width: 0;
+}
+.cfield .v-field__input {
+  min-height: 30px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  font-size: 14px;
+}
+.cfield .v-chip {
+  height: 24px;
+  font-size: 12.5px;
+}
+.cfield .v-field--variant-plain .v-field__append-inner,
+.cfield .v-field--variant-plain .v-field__clearable {
+  padding-top: 4px;
+}
+.cerr {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: rgb(var(--v-theme-error));
+}
+.chev-btn {
+  flex: none;
+}
+.chev-btn .v-icon {
+  transition: transform 0.15s ease;
+}
+.chev-open .v-icon {
+  transform: rotate(180deg);
+}
 .compose-actions {
   flex: none;
   border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 .compose-editor {
-  margin: 0 16px;
-  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  border-radius: 8px;
+  margin: 0;
+  border: none;
 }
 .compose-root-mobile .compose-pad {
   padding-left: 12px;
   padding-right: 12px;
+}
+.compose-root-mobile .cform {
+  padding: 0 12px;
 }
 .compose-root-mobile .compose-editor {
   margin: 0;
@@ -1040,14 +1155,14 @@ function onKeydown(e) {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  padding: 4px 6px;
+  padding: 4px 10px;
   border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 .compose-editarea .ProseMirror {
   min-height: 180px;
   max-height: 40dvh;
   overflow-y: auto;
-  padding: 10px 12px;
+  padding: 12px 16px;
   outline: none;
   font-size: 14px;
   line-height: 1.55;

@@ -1,9 +1,13 @@
 package mail
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/textproto"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,17 +24,19 @@ const (
 )
 
 type Account struct {
-	ID       int64
-	Label    string
-	Email    string
-	ImapHost string
-	ImapPort int
-	ImapTLS  string
-	SMTPHost string
-	SMTPPort int
-	SMTPTLS  string
-	Username string
-	Password string
+	ID            int64
+	Label         string
+	FromName      string
+	Email         string
+	ImapHost      string
+	ImapPort      int
+	ImapTLS       string
+	SMTPHost      string
+	SMTPPort      int
+	SMTPTLS       string
+	Username      string
+	Password      string
+	TLSSkipVerify bool
 }
 
 type Addr struct {
@@ -63,9 +69,9 @@ type Client struct {
 	Caps imap.CapSet
 }
 
-func TLSConfigFor(host string) *tls.Config {
+func TLSConfigFor(host string, skipVerify bool) *tls.Config {
 	cfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
-	if strings.HasSuffix(host, ".dn42") {
+	if skipVerify {
 		cfg.InsecureSkipVerify = true
 	}
 	return cfg
@@ -74,7 +80,7 @@ func TLSConfigFor(host string) *tls.Config {
 func Connect(a Account, handler *imapclient.UnilateralDataHandler) (*Client, error) {
 	addr := net.JoinHostPort(a.ImapHost, fmt.Sprint(a.ImapPort))
 	opts := &imapclient.Options{
-		TLSConfig:             TLSConfigFor(a.ImapHost),
+		TLSConfig:             TLSConfigFor(a.ImapHost, a.TLSSkipVerify),
 		UnilateralDataHandler: handler,
 	}
 	var (
@@ -209,6 +215,62 @@ func (cl *Client) FetchRaw(uid uint32) ([]byte, error) {
 		return nil, fmt.Errorf("message %d not found on server", uid)
 	}
 	return raw, nil
+}
+
+type ThreadHeaders struct {
+	References []string
+	InReplyTo  string
+}
+
+var msgIDTokenRe = regexp.MustCompile(`<([^<>\s]+)>`)
+
+func (cl *Client) FetchThreadHeaders(uids []uint32) (map[uint32]ThreadHeaders, error) {
+	out := make(map[uint32]ThreadHeaders, len(uids))
+	if len(uids) == 0 {
+		return out, nil
+	}
+	set := imap.UIDSet{}
+	for _, u := range uids {
+		set.AddNum(imap.UID(u))
+	}
+	section := &imap.FetchItemBodySection{
+		Specifier:    imap.PartSpecifierHeader,
+		HeaderFields: []string{"References", "In-Reply-To"},
+		Peek:         true,
+	}
+	opts := &imap.FetchOptions{UID: true, BodySection: []*imap.FetchItemBodySection{section}}
+	cmd := cl.c.Fetch(set, opts)
+	for {
+		data := cmd.Next()
+		if data == nil {
+			break
+		}
+		buf, err := data.Collect()
+		if err != nil {
+			cmd.Close()
+			return nil, err
+		}
+		raw := buf.FindBodySection(section)
+		if raw == nil {
+			continue
+		}
+		hdr, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw))).ReadMIMEHeader()
+		if err != nil {
+			continue
+		}
+		var th ThreadHeaders
+		for _, m := range msgIDTokenRe.FindAllStringSubmatch(hdr.Get("References"), -1) {
+			th.References = append(th.References, m[1])
+		}
+		if m := msgIDTokenRe.FindStringSubmatch(hdr.Get("In-Reply-To")); m != nil {
+			th.InReplyTo = m[1]
+		}
+		out[uint32(buf.UID)] = th
+	}
+	if err := cmd.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (cl *Client) StoreFlag(uid uint32, flag imap.Flag, add bool) error {

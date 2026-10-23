@@ -27,6 +27,8 @@ type ParsedBody struct {
 	Text        string
 	HTML        string
 	Attachments []Attachment
+	References  []string
+	InReplyTo   string
 }
 
 type partData struct {
@@ -130,6 +132,18 @@ func ParseBody(raw []byte) (*ParsedBody, error) {
 	out := &ParsedBody{Text: text, HTML: html}
 	for _, p := range parts {
 		out.Attachments = append(out.Attachments, p.att)
+	}
+	if mr, err := mail.CreateReader(bytes.NewReader(raw)); err == nil {
+		if refs, err := mr.Header.MsgIDList("References"); err == nil {
+			for _, r := range refs {
+				out.References = append(out.References, string(r))
+			}
+		}
+		if ids, err := mr.Header.MsgIDList("In-Reply-To"); err == nil && len(ids) > 0 {
+			out.InReplyTo = string(ids[len(ids)-1])
+		} else {
+			out.InReplyTo = strings.Trim(mr.Header.Get("In-Reply-To"), "<> \t")
+		}
 	}
 	return out, nil
 }

@@ -29,15 +29,18 @@ import (
 )
 
 type Server struct {
-	st        *store.Store
-	uiFS      fs.FS
-	mgr       *syncmgr.Manager
-	hub       *hub
-	serverKey []byte
-	mu        sync.Mutex
-	keys      map[string][]byte
-	tgSeenMu  sync.Mutex
-	tgSeen    map[string]tgChat
+	st            *store.Store
+	uiFS          fs.FS
+	mgr           *syncmgr.Manager
+	hub           *hub
+	serverKey     []byte
+	mu            sync.Mutex
+	keys          map[string][]byte
+	loginMu       sync.Mutex
+	loginFails    int
+	loginLastFail time.Time
+	tgSeenMu      sync.Mutex
+	tgSeen        map[string]tgChat
 }
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
@@ -80,12 +83,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/drafts", s.authOnly(s.handleSaveDraft))
 	mux.HandleFunc("GET /api/search", s.authOnly(s.handleSearch))
 	mux.HandleFunc("GET /api/events", s.authOnly(s.handleEvents))
+	mux.HandleFunc("GET /api/settings/app", s.authOnly(s.handleGetAppSettings))
+	mux.HandleFunc("PUT /api/settings/app", s.authOnly(s.handlePutAppSettings))
 	mux.HandleFunc("GET /api/settings/telegram", s.authOnly(s.handleGetTelegram))
 	mux.HandleFunc("PUT /api/settings/telegram", s.authOnly(s.handlePutTelegram))
 	mux.HandleFunc("POST /api/settings/telegram/discover", s.authOnly(s.handleTelegramDiscover))
 	mux.HandleFunc("POST /api/settings/telegram/test", s.authOnly(s.handleTelegramTest))
 	mux.HandleFunc("GET /api/settings/webpush", s.authOnly(s.handleGetWebPush))
-	mux.HandleFunc("PUT /api/settings/webpush", s.authOnly(s.handlePutWebPush))
 	mux.HandleFunc("POST /api/settings/webpush/test", s.authOnly(s.handleWebPushTest))
 	mux.HandleFunc("POST /api/push/subscribe", s.authOnly(s.handlePushSubscribe))
 	mux.HandleFunc("POST /api/push/unsubscribe", s.authOnly(s.handlePushUnsubscribe))
@@ -163,12 +167,17 @@ func (s *Server) authOnly(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
+func requestIsHTTPS(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "wm_session",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   requestIsHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(auth.SessionTTL / time.Second),
 	})
@@ -179,11 +188,11 @@ func (s *Server) renewSession(w http.ResponseWriter, r *http.Request) {
 	if token == "" {
 		return
 	}
-	s.setSessionCookie(w, token)
+	s.setSessionCookie(w, r, token)
 	_ = auth.TouchSession(s.st, token)
 }
 
-func (s *Server) startSession(w http.ResponseWriter, key []byte) error {
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request, key []byte) error {
 	wrapped := ""
 	if s.serverKey != nil {
 		sealed, err := auth.Encrypt(s.serverKey, string(key))
@@ -199,7 +208,7 @@ func (s *Server) startSession(w http.ResponseWriter, key []byte) error {
 	s.mu.Lock()
 	s.keys[token] = key
 	s.mu.Unlock()
-	s.setSessionCookie(w, token)
+	s.setSessionCookie(w, r, token)
 	return nil
 }
 
@@ -215,7 +224,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	if authed {
 		s.renewSession(w, r)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"setup": setup, "authed": authed, "version": BuildVersion})
+	out := map[string]any{"setup": setup, "authed": authed, "version": BuildVersion}
+	if authed {
+		out["app_settings"] = s.st.AppSettings()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 type passwordReq struct {
@@ -246,12 +259,41 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "setup verify failed")
 		return
 	}
-	if err := s.startSession(w, key); err != nil {
+	if err := s.startSession(w, r, key); err != nil {
 		writeErr(w, http.StatusInternalServerError, "session failed")
 		return
 	}
 	s.startAllWorkers(key)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) loginWait() time.Duration {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	if s.loginFails < 5 {
+		return 0
+	}
+	exp := s.loginFails - 5
+	if exp > 8 {
+		exp = 8
+	}
+	if w := time.Until(s.loginLastFail.Add(time.Duration(1<<exp) * time.Second)); w > 0 {
+		return w
+	}
+	return 0
+}
+
+func (s *Server) noteLoginFailure() {
+	s.loginMu.Lock()
+	s.loginFails++
+	s.loginLastFail = time.Now()
+	s.loginMu.Unlock()
+}
+
+func (s *Server) resetLoginFailures() {
+	s.loginMu.Lock()
+	s.loginFails = 0
+	s.loginMu.Unlock()
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -260,16 +302,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "password required")
 		return
 	}
+	if s.loginWait() > 0 {
+		writeErr(w, http.StatusTooManyRequests, "too many failed attempts, try again later")
+		return
+	}
 	key, ok, err := auth.VerifyMaster(s.st, req.Password)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "login failed")
 		return
 	}
 	if !ok {
+		s.noteLoginFailure()
 		writeErr(w, http.StatusUnauthorized, "wrong password")
 		return
 	}
-	if err := s.startSession(w, key); err != nil {
+	s.resetLoginFailures()
+	if err := s.startSession(w, r, key); err != nil {
 		writeErr(w, http.StatusInternalServerError, "session failed")
 		return
 	}
@@ -284,36 +332,40 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	delete(s.keys, token)
 	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "wm_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: "wm_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 type accountIn struct {
-	Label     string `json:"label"`
-	Email     string `json:"email"`
-	ImapHost  string `json:"imap_host"`
-	ImapPort  any    `json:"imap_port"`
-	ImapTLS   string `json:"imap_tls"`
-	SmtpHost  string `json:"smtp_host"`
-	SmtpPort  any    `json:"smtp_port"`
-	SmtpTLS   string `json:"smtp_tls"`
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	Signature string `json:"signature"`
+	Label         string `json:"label"`
+	Email         string `json:"email"`
+	ImapHost      string `json:"imap_host"`
+	ImapPort      any    `json:"imap_port"`
+	ImapTLS       string `json:"imap_tls"`
+	SmtpHost      string `json:"smtp_host"`
+	SmtpPort      any    `json:"smtp_port"`
+	SmtpTLS       string `json:"smtp_tls"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	Signature     string `json:"signature"`
+	FromName      string `json:"from_name"`
+	TLSSkipVerify bool   `json:"tls_skip_verify"`
 }
 
 type accountOut struct {
-	ID        int64  `json:"id"`
-	Label     string `json:"label"`
-	Email     string `json:"email"`
-	ImapHost  string `json:"imap_host"`
-	ImapPort  int    `json:"imap_port"`
-	ImapTLS   string `json:"imap_tls"`
-	SmtpHost  string `json:"smtp_host"`
-	SmtpPort  int    `json:"smtp_port"`
-	SmtpTLS   string `json:"smtp_tls"`
-	Username  string `json:"username"`
-	Signature string `json:"signature"`
+	ID            int64  `json:"id"`
+	Label         string `json:"label"`
+	Email         string `json:"email"`
+	ImapHost      string `json:"imap_host"`
+	ImapPort      int    `json:"imap_port"`
+	ImapTLS       string `json:"imap_tls"`
+	SmtpHost      string `json:"smtp_host"`
+	SmtpPort      int    `json:"smtp_port"`
+	SmtpTLS       string `json:"smtp_tls"`
+	Username      string `json:"username"`
+	Signature     string `json:"signature"`
+	FromName      string `json:"from_name"`
+	TLSSkipVerify bool   `json:"tls_skip_verify"`
 }
 
 func validateAccount(in *accountIn, passwordRequired bool) (imapPort, smtpPort int, err error) {
@@ -341,7 +393,7 @@ func validateAccount(in *accountIn, passwordRequired bool) (imapPort, smtpPort i
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.st.DB.Query(`SELECT id, label, email, imap_host, imap_port, imap_tls,
-		smtp_host, smtp_port, smtp_tls, username, signature FROM accounts ORDER BY sort, id`)
+		smtp_host, smtp_port, smtp_tls, username, signature, from_name, tls_skip_verify FROM accounts ORDER BY sort, id`)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list failed")
 		return
@@ -351,7 +403,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var a accountOut
 		if err := rows.Scan(&a.ID, &a.Label, &a.Email, &a.ImapHost, &a.ImapPort, &a.ImapTLS,
-			&a.SmtpHost, &a.SmtpPort, &a.SmtpTLS, &a.Username, &a.Signature); err != nil {
+			&a.SmtpHost, &a.SmtpPort, &a.SmtpTLS, &a.Username, &a.Signature, &a.FromName, &a.TLSSkipVerify); err != nil {
 			writeErr(w, http.StatusInternalServerError, "list failed")
 			return
 		}
@@ -378,10 +430,10 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.st.DB.Exec(`INSERT INTO accounts(label, email, imap_host, imap_port, imap_tls,
-		smtp_host, smtp_port, smtp_tls, username, enc_password, signature, created_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		smtp_host, smtp_port, smtp_tls, username, enc_password, signature, from_name, tls_skip_verify, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
-		in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, enc, in.Signature, time.Now().Unix())
+		in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, enc, in.Signature, in.FromName, in.TLSSkipVerify, time.Now().Unix())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "insert failed")
 		return
@@ -411,18 +463,18 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, imap_host=?, imap_port=?, imap_tls=?,
-			smtp_host=?, smtp_port=?, smtp_tls=?, username=?, enc_password=?, signature=? WHERE id=?`,
+			smtp_host=?, smtp_port=?, smtp_tls=?, username=?, enc_password=?, signature=?, from_name=?, tls_skip_verify=? WHERE id=?`,
 			in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
-			in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, enc, in.Signature, id)
+			in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, enc, in.Signature, in.FromName, in.TLSSkipVerify, id)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "update failed")
 			return
 		}
 	} else {
 		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, imap_host=?, imap_port=?, imap_tls=?,
-			smtp_host=?, smtp_port=?, smtp_tls=?, username=?, signature=? WHERE id=?`,
+			smtp_host=?, smtp_port=?, smtp_tls=?, username=?, signature=?, from_name=?, tls_skip_verify=? WHERE id=?`,
 			in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
-			in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, in.Signature, id)
+			in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, in.Signature, in.FromName, in.TLSSkipVerify, id)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "update failed")
 			return
@@ -450,10 +502,10 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) loadMailAccount(id int64, key []byte) (mail.Account, error) {
 	var a mail.Account
 	var enc string
-	err := s.st.DB.QueryRow(`SELECT label, email, imap_host, imap_port, imap_tls,
-		smtp_host, smtp_port, smtp_tls, username, enc_password FROM accounts WHERE id = ?`, id).
-		Scan(&a.Label, &a.Email, &a.ImapHost, &a.ImapPort, &a.ImapTLS,
-			&a.SMTPHost, &a.SMTPPort, &a.SMTPTLS, &a.Username, &enc)
+	err := s.st.DB.QueryRow(`SELECT label, from_name, email, imap_host, imap_port, imap_tls,
+		smtp_host, smtp_port, smtp_tls, username, enc_password, tls_skip_verify FROM accounts WHERE id = ?`, id).
+		Scan(&a.Label, &a.FromName, &a.Email, &a.ImapHost, &a.ImapPort, &a.ImapTLS,
+			&a.SMTPHost, &a.SMTPPort, &a.SMTPTLS, &a.Username, &enc, &a.TLSSkipVerify)
 	if err != nil {
 		return a, err
 	}
@@ -855,6 +907,9 @@ func (s *Server) ensureBody(key []byte, messageID int64, route store.MessageRout
 			PartPath: a.PartPath, Filename: a.Filename, Mime: a.Mime,
 			Size: a.Size, ContentID: a.ContentID, Inline: a.Inline,
 		})
+	}
+	if len(parsed.References) > 0 || parsed.InReplyTo != "" {
+		_ = s.st.RecomputeThreadKey(route.AccountID, messageID, parsed.References, parsed.InReplyTo)
 	}
 	atts, err := s.st.ReplaceAttachments(messageID, rows)
 	if err != nil {
@@ -1380,7 +1435,7 @@ func (s *Server) prepareOutgoing(key []byte, req composeReq, requireRcpts bool) 
 	if requireRcpts && len(rcpts) == 0 {
 		return nil, fmt.Errorf("至少填写一个收件人")
 	}
-	from := mail.Addr{Name: acct.Label, Email: acct.Email}
+	from := mail.Addr{Name: acct.FromName, Email: acct.Email}
 
 	attachments := make([]mail.OutgoingAttachment, 0, len(req.Attachments))
 	totalAttach := 0
@@ -1390,8 +1445,8 @@ func (s *Server) prepareOutgoing(key []byte, req composeReq, requireRcpts bool) 
 			return nil, fmt.Errorf("附件 %s 的数据无效", a.Filename)
 		}
 		totalAttach += len(data)
-		if totalAttach > mail.MaxAttachmentTotalBytes {
-			return nil, fmt.Errorf("附件总大小超过 %d MB 上限", mail.MaxAttachmentTotalBytes/1024/1024)
+		if int64(totalAttach) > s.st.AppSettings().MaxAttachmentMB<<20 {
+			return nil, fmt.Errorf("附件总大小超过 %d MB 上限", s.st.AppSettings().MaxAttachmentMB)
 		}
 		attachments = append(attachments, mail.OutgoingAttachment{
 			Filename: a.Filename, ContentType: a.ContentType, Data: data,
@@ -1704,4 +1759,37 @@ func (s *Server) spaHandler() http.Handler {
 		f.Close()
 		fileServer.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) handleGetAppSettings(w http.ResponseWriter, r *http.Request) {
+	used, err := s.st.CacheUsedBytes()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "cache usage failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"settings":           s.st.AppSettings(),
+		"cache_used_bytes":   used,
+		"cache_budget_bytes": s.st.CacheBudgetBytes(),
+	})
+}
+
+func (s *Server) handlePutAppSettings(w http.ResponseWriter, r *http.Request) {
+	var req store.AppSettings
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad settings")
+		return
+	}
+	if req.CacheBudgetGB < 0 || req.CacheBudgetGB > 1024 ||
+		req.SyncBatch < 1 || req.SyncBatch > 1000 ||
+		req.MaxAttachmentMB < 1 || req.MaxAttachmentMB > 200 ||
+		req.PushWindowMinutes < 0 || req.PushWindowMinutes > 43200 {
+		writeErr(w, http.StatusBadRequest, "settings out of range")
+		return
+	}
+	if err := s.st.SaveAppSettings(req); err != nil {
+		writeErr(w, http.StatusInternalServerError, "save settings failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

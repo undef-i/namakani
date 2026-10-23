@@ -7,8 +7,6 @@ import (
 	"github.com/emersion/go-message/mail"
 )
 
-const MaxAttachmentTotalBytes = 20 * 1024 * 1024
-
 type OutgoingAttachment struct {
 	Filename    string
 	ContentType string

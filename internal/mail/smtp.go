@@ -12,7 +12,7 @@ import (
 
 func SendSMTP(acct Account, from string, rcpts []string, msg []byte) error {
 	addr := net.JoinHostPort(acct.SMTPHost, strconv.Itoa(acct.SMTPPort))
-	tlsConf := TLSConfigFor(acct.SMTPHost)
+	tlsConf := TLSConfigFor(acct.SMTPHost, acct.TLSSkipVerify)
 
 	var (
 		c   *smtp.Client

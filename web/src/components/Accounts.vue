@@ -1,5 +1,6 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { intlLocale, lang, setLang, t } from '../i18n'
 import * as api from '../api.js'
 
 const props = defineProps({
@@ -8,44 +9,60 @@ const props = defineProps({
   statuses: { type: Object, default: () => ({}) },
   themeMode: { type: String, default: 'system' },
   threaded: { type: Boolean, default: false },
+  undoSeconds: { type: Number, default: 5 },
   version: { type: String, default: '' },
 })
-const emit = defineEmits(['changed', 'update:themeMode', 'update:threaded'])
+const emit = defineEmits(['changed', 'update:themeMode', 'update:threaded', 'update:undoSeconds', 'appSettings'])
+
+const undoItems = computed(() => [
+  { title: t('关闭（立即发送）'), value: 0 },
+  { title: t('{n} 秒', { n: 5 }), value: 5 },
+  { title: t('{n} 秒', { n: 10 }), value: 10 },
+  { title: t('{n} 秒', { n: 20 }), value: 20 },
+  { title: t('{n} 秒', { n: 30 }), value: 30 },
+])
 
 function fmtListTime(ts) {
   const d = new Date(ts * 1000)
   const now = new Date()
-  const pad = (n) => String(n).padStart(2, '0')
-  if (d.toDateString() === now.toDateString()) return pad(d.getHours()) + ':' + pad(d.getMinutes())
-  if (d.getFullYear() === now.getFullYear()) return d.getMonth() + 1 + '/' + d.getDate()
-  return d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate()
+  if (d.toDateString() === now.toDateString())
+    return new Intl.DateTimeFormat(intlLocale(), { hour: '2-digit', minute: '2-digit', hour12: false }).format(d)
+  if (d.getFullYear() === now.getFullYear())
+    return new Intl.DateTimeFormat(intlLocale(), { month: 'numeric', day: 'numeric' }).format(d)
+  return new Intl.DateTimeFormat(intlLocale(), { year: 'numeric', month: 'numeric', day: 'numeric' }).format(d)
 }
 
 function fmtDateTime(ts) {
-  const d = new Date(ts * 1000)
-  const pad = (n) => String(n).padStart(2, '0')
-  return (
-    d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
-    pad(d.getHours()) + ':' + pad(d.getMinutes())
-  )
+  return new Intl.DateTimeFormat(intlLocale(), {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(ts * 1000))
 }
 
 function statusText(a) {
   const st = props.statuses[a.id]
   if (!st) return ''
-  if (st.state === 'idle') return '已同步 ' + fmtListTime(st.last_sync_at)
-  if (st.state === 'syncing') return '同步中'
-  if (st.state === 'connecting') return '连接中'
-  if (st.state === 'error') return '同步失败'
-  return '未同步'
+  if (st.state === 'idle') return t('已同步 {time}', { time: fmtListTime(st.last_sync_at) })
+  if (st.state === 'syncing') return t('同步中')
+  if (st.state === 'connecting') return t('连接中')
+  if (st.state === 'error') return t('同步失败')
+  return t('未同步')
 }
 
 function cacheText(a) {
   const st = props.statuses[a.id]
   if (!st || !(st.cache_bodies_total > 0)) return ''
   return (
-    '正文缓存 ' + st.cache_bodies_cached + '/' + st.cache_bodies_total +
-    '，附件 ' + st.cache_attachments_cached + '/' + st.cache_attachments_total
+    t('正文缓存 {a}/{b}，附件 {c}/{d}', {
+      a: st.cache_bodies_cached,
+      b: st.cache_bodies_total,
+      c: st.cache_attachments_cached,
+      d: st.cache_attachments_total,
+    })
   )
 }
 
@@ -62,13 +79,15 @@ const emptyForm = () => ({
   username: '',
   password: '',
   signature: '',
+  from_name: '',
+  tls_skip_verify: false,
 })
 
-const tlsItems = [
+const tlsItems = computed(() => [
   { title: 'TLS', value: 'tls' },
   { title: 'STARTTLS', value: 'starttls' },
-  { title: '明文', value: 'none' },
-]
+  { title: t('明文'), value: 'none' },
+])
 
 const dialogOpen = ref(false)
 const editing = ref(null)
@@ -124,25 +143,23 @@ async function confirmDelete() {
 }
 
 async function runTest(a) {
-  testState[a.id] = { busy: true, ok: false, text: '连接中' }
+  testState[a.id] = { busy: true, ok: false, text: t('连接中') }
   try {
     const res = await api.testAccount(a.id)
     testState[a.id] = {
       busy: false,
       ok: true,
       text:
-        '连接成功：' +
-        res.folders.length +
-        ' 个文件夹，能力 ' +
-        res.capabilities.length +
-        ' 项（含 ' +
-        res.capabilities
-          .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
-          .join('/') +
-        '）',
+        t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
+          folders: res.folders.length,
+          caps: res.capabilities.length,
+          sample: res.capabilities
+            .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
+            .join('/'),
+        }),
     }
   } catch (err) {
-    testState[a.id] = { busy: false, ok: false, text: '连接失败：' + err.message }
+    testState[a.id] = { busy: false, ok: false, text: t('连接失败：{error}', { error: err.message }) }
   }
 }
 
@@ -184,9 +201,9 @@ async function saveTG() {
     })
     tg.value.has_token = !!s.has_token
     tg.value.bot_token = ''
-    showSnack('已保存')
+    showSnack(t('已保存'))
   } catch (err) {
-    showSnack('保存失败：' + err.message)
+    showSnack(t('保存失败：{error}', { error: err.message }))
   } finally {
     tgBusy.value = ''
   }
@@ -196,9 +213,9 @@ async function testTG() {
   tgBusy.value = 'test'
   try {
     await api.testTelegram({ bot_token: tg.value.bot_token, chat_id: tg.value.chat_id })
-    showSnack('测试消息已发送')
+    showSnack(t('测试消息已发送'))
   } catch (err) {
-    showSnack('发送失败：' + err.message)
+    showSnack(t('发送失败：{error}', { error: err.message }))
   } finally {
     tgBusy.value = ''
   }
@@ -211,7 +228,7 @@ const wpSupported =
   'PushManager' in window &&
   'Notification' in window
 
-const wp = ref({ enabled: false, public_key: '', subscriptions: 0 })
+const wp = ref({ public_key: '', subscriptions: 0 })
 const wpStatus = ref('loading')
 const wpMsg = ref('')
 const wpBusy = ref(false)
@@ -254,7 +271,6 @@ async function loadWP() {
   try {
     const s = await api.getWebPush()
     wp.value = {
-      enabled: !!s.enabled,
       public_key: s.public_key || '',
       subscriptions: s.subscriptions || 0,
     }
@@ -269,7 +285,7 @@ async function loadWP() {
 async function subscribeThisInner() {
   let perm = Notification.permission
   if (perm === 'default') perm = await Notification.requestPermission()
-  if (perm !== 'granted') throw new Error('通知权限未授予，无法开启推送')
+  if (perm !== 'granted') throw new Error(t('通知权限未授予，无法开启推送'))
   const reg = await navigator.serviceWorker.ready
   let sub = await reg.pushManager.getSubscription()
   if (!sub) {
@@ -297,23 +313,21 @@ async function unsubscribeThisInner() {
   thisEndpoint = ''
 }
 
-async function toggleWPEnabled(v) {
+async function toggleThisBrowser(v) {
   wpBusy.value = true
   wpMsg.value = ''
   try {
     if (v) {
-      if (wpSupported) await subscribeThisInner()
-    } else if (thisSub.value === true) {
+      await subscribeThisInner()
+    } else {
       await unsubscribeThisInner()
     }
-    const s = await api.saveWebPush({ enabled: v })
-    wp.value.enabled = !!s.enabled
+    const s = await api.getWebPush()
     wp.value.subscriptions = s.subscriptions || 0
   } catch (err) {
-    showSnack('保存失败：' + err.message)
+    showSnack(t('保存失败：{error}', { error: err.message }))
     try {
       const s = await api.getWebPush()
-      wp.value.enabled = !!s.enabled
       wp.value.subscriptions = s.subscriptions || 0
       await checkThisBrowser()
     } catch {
@@ -329,9 +343,9 @@ async function testWP() {
   try {
     const res = await api.testWebPush()
     wp.value.subscriptions = res.subscriptions || 0
-    showSnack('测试推送已发出（送达 ' + res.sent + ' 个订阅）')
+    showSnack(t('测试推送已发出（送达 {n} 个订阅）', { n: res.sent }))
   } catch (err) {
-    showSnack('发送失败：' + err.message)
+    showSnack(t('发送失败：{error}', { error: err.message }))
   } finally {
     wpBusy.value = false
   }
@@ -363,7 +377,57 @@ async function cancelSch(it) {
   }
 }
 
+const appSetState = ref('loading')
+const appSetError = ref('')
+const appSetBusy = ref(false)
+const appSet = ref({ cache_budget_gb: 4, sync_batch: 100, max_attachment_mb: 20, push_window_minutes: 15 })
+const appSetUsed = ref(0)
+const appSetBudgetBytes = ref(0)
+const appSetLeft = computed(() => Math.max(0, appSetBudgetBytes.value - appSetUsed.value))
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B'
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB'
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB'
+}
+
+async function loadAppSet() {
+  appSetState.value = 'loading'
+  try {
+    const res = await api.getAppSettings()
+    appSet.value = { ...res.settings }
+    appSetUsed.value = res.cache_used_bytes
+    appSetBudgetBytes.value = res.cache_budget_bytes
+    appSetState.value = 'ready'
+  } catch (err) {
+    appSetError.value = err.message
+    appSetState.value = 'error'
+  }
+}
+
+async function saveAppSet() {
+  appSetBusy.value = true
+  try {
+    const payload = {
+      cache_budget_gb: Number(appSet.value.cache_budget_gb),
+      sync_batch: Number(appSet.value.sync_batch),
+      max_attachment_mb: Number(appSet.value.max_attachment_mb),
+      push_window_minutes: Number(appSet.value.push_window_minutes),
+    }
+    await api.saveAppSettings(payload)
+    emit('appSettings', payload)
+    showSnack(t('已保存'))
+    loadAppSet()
+  } catch (err) {
+    showSnack(t('保存失败：{error}', { error: err.message }))
+  } finally {
+    appSetBusy.value = false
+  }
+}
+
 onMounted(() => {
+  loadAppSet()
   loadTG()
   loadWP()
   loadScheduled()
@@ -373,8 +437,8 @@ onMounted(() => {
 <template>
   <div class="mx-auto w-100 pa-4" style="max-width: 880px">
     <div class="d-flex align-center justify-space-between mb-3">
-      <h2 class="text-h6">邮箱账号</h2>
-      <v-btn color="primary" prepend-icon="mdi-plus" @click="openCreate">添加账号</v-btn>
+      <h2 class="text-h6">{{ t('邮箱账号') }}</h2>
+      <v-btn color="primary" prepend-icon="mdi-plus" @click="openCreate">{{ t('添加账号') }}</v-btn>
     </div>
 
     <template v-if="accountsStatus === 'loading'">
@@ -382,12 +446,12 @@ onMounted(() => {
     </template>
     <template v-else-if="accountsStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact">
-        账号加载失败
-        <v-btn variant="text" size="small" @click="emit('changed')">重试</v-btn>
+        {{ t('账号加载失败') }}
+        <v-btn variant="text" size="small" @click="emit('changed')">{{ t('重试') }}</v-btn>
       </v-alert>
     </template>
     <p v-else-if="accounts.length === 0" class="text-body-2 text-medium-emphasis">
-      还没有账号。添加第一个邮箱后，它的邮件会自动同步进聚合收件箱。
+      {{ t('还没有账号。添加第一个邮箱后，它的邮件会自动同步进聚合收件箱。') }}
     </p>
     <div v-else class="d-flex flex-column ga-3">
       <v-card v-for="a in accounts" :key="a.id" variant="outlined" rounded="lg">
@@ -398,12 +462,12 @@ onMounted(() => {
               <div class="text-body-2 text-medium-emphasis text-truncate">{{ a.email }}</div>
             </div>
             <v-spacer />
-            <v-btn icon="mdi-connection" variant="text" size="small" title="测试连接" @click="runTest(a)" />
-            <v-btn icon="mdi-pencil" variant="text" size="small" title="编辑" @click="openEdit(a)" />
-            <v-btn icon="mdi-delete" variant="text" size="small" title="删除" @click="askDelete(a)" />
+            <v-btn icon="mdi-connection" variant="text" size="small" :title="t('测试连接')" @click="runTest(a)" />
+            <v-btn icon="mdi-pencil" variant="text" size="small" :title="t('编辑')" @click="openEdit(a)" />
+            <v-btn icon="mdi-delete" variant="text" size="small" :title="t('删除')" @click="askDelete(a)" />
           </div>
           <div class="text-body-2 text-medium-emphasis mt-2" style="overflow-wrap: anywhere">
-            IMAP {{ a.imap_host }}:{{ a.imap_port }} ({{ a.imap_tls }})，SMTP {{ a.smtp_host }}:{{ a.smtp_port }} ({{ a.smtp_tls }})
+            IMAP {{ a.imap_host }}:{{ a.imap_port }} ({{ a.imap_tls }}){{ t('，') }}SMTP {{ a.smtp_host }}:{{ a.smtp_port }} ({{ a.smtp_tls }})
           </div>
           <div
             v-if="statuses[a.id]"
@@ -411,7 +475,7 @@ onMounted(() => {
             :class="statuses[a.id].state === 'error' ? 'text-error font-weight-medium' : 'text-medium-emphasis'"
             style="overflow-wrap: anywhere"
           >
-            {{ statusText(a) }}<template v-if="cacheText(a)">，{{ cacheText(a) }}</template>
+            {{ statusText(a) }}<template v-if="cacheText(a)">{{ t('，') }}{{ cacheText(a) }}</template>
           </div>
           <div
             v-if="testState[a.id]"
@@ -427,9 +491,9 @@ onMounted(() => {
 
     <v-divider class="my-6" />
 
-    <h2 class="text-h6 mb-3">外观</h2>
+    <h2 class="text-h6 mb-3">{{ t('外观') }}</h2>
     <div style="max-width: 640px">
-      <div class="text-body-2 mb-2">深色模式</div>
+      <div class="text-body-2 mb-2">{{ t('深色模式') }}</div>
       <v-btn-toggle
         :model-value="themeMode"
         mandatory
@@ -439,44 +503,122 @@ onMounted(() => {
         class="mb-4"
         @update:model-value="emit('update:themeMode', $event)"
       >
-        <v-btn value="system" prepend-icon="mdi-theme-light-dark">跟随系统</v-btn>
-        <v-btn value="light" prepend-icon="mdi-weather-sunny">浅色</v-btn>
-        <v-btn value="dark" prepend-icon="mdi-weather-night">深色</v-btn>
+        <v-btn value="system" prepend-icon="mdi-theme-light-dark">{{ t('跟随系统') }}</v-btn>
+        <v-btn value="light" prepend-icon="mdi-weather-sunny">{{ t('浅色') }}</v-btn>
+        <v-btn value="dark" prepend-icon="mdi-weather-night">{{ t('深色') }}</v-btn>
       </v-btn-toggle>
       <v-switch
         :model-value="threaded"
-        label="按线程显示邮件"
+        :label="t('按线程显示邮件')"
         color="primary"
         hide-details
+        class="mb-2"
         @update:model-value="emit('update:threaded', $event)"
+      />
+      <v-select
+        :model-value="undoSeconds"
+        :items="undoItems"
+        :label="t('撤销发送等待')"
+        variant="outlined"
+        density="comfortable"
+        hide-details
+        style="max-width: 260px"
+        @update:model-value="emit('update:undoSeconds', $event)"
+      />
+      <v-select
+        :model-value="lang"
+        :items="[
+          { title: '中文', value: 'zh' },
+          { title: 'English', value: 'en' },
+        ]"
+        :label="t('语言')"
+        variant="outlined"
+        density="comfortable"
+        hide-details
+        style="max-width: 260px"
+        class="mt-4"
+        @update:model-value="setLang"
       />
     </div>
 
     <v-divider class="my-6" />
 
-    <h2 class="text-h6 mb-3">定时发送</h2>
+    <h2 class="text-h6 mb-3">{{ t('同步与缓存') }}</h2>
+    <v-skeleton-loader v-if="appSetState === 'loading'" type="article" />
+    <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" class="mb-3">
+      {{ t('设置加载失败：{error}', { error: appSetError }) }}
+      <v-btn variant="text" size="small" @click="loadAppSet">{{ t('重试') }}</v-btn>
+    </v-alert>
+    <div v-else style="max-width: 640px">
+      <p class="text-body-2 text-medium-emphasis mb-3">
+        {{ t('已用 {used}，剩余 {left}', { used: fmtBytes(appSetUsed), left: fmtBytes(appSetLeft) }) }}
+      </p>
+      <div class="d-flex flex-wrap ga-3 mb-3">
+        <v-text-field
+          v-model.number="appSet.cache_budget_gb"
+          type="number"
+          :label="t('缓存预算 (GB)')"
+          variant="outlined"
+          density="comfortable"
+          hide-details
+          style="max-width: 200px"
+        />
+        <v-text-field
+          v-model.number="appSet.sync_batch"
+          type="number"
+          :label="t('同步批量')"
+          variant="outlined"
+          density="comfortable"
+          hide-details
+          style="max-width: 200px"
+        />
+        <v-text-field
+          v-model.number="appSet.max_attachment_mb"
+          type="number"
+          :label="t('附件上限 (MB)')"
+          variant="outlined"
+          density="comfortable"
+          hide-details
+          style="max-width: 200px"
+        />
+        <v-text-field
+          v-model.number="appSet.push_window_minutes"
+          type="number"
+          :label="t('推送窗口 (分钟)')"
+          variant="outlined"
+          density="comfortable"
+          hide-details
+          style="max-width: 200px"
+        />
+      </div>
+      <v-btn color="primary" :loading="appSetBusy" @click="saveAppSet">{{ t('保存') }}</v-btn>
+    </div>
+
+    <v-divider class="my-6" />
+
+    <h2 class="text-h6 mb-3">{{ t('定时发送') }}</h2>
     <template v-if="schStatus === 'loading'">
       <v-skeleton-loader type="list-item-two-line@2" max-width="640" />
     </template>
     <template v-else-if="schStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact" max-width="640">
-        定时发送加载失败：{{ schError }}
-        <v-btn variant="text" size="small" @click="loadScheduled">重试</v-btn>
+        {{ t('定时发送加载失败：{error}', { error: schError }) }}
+        <v-btn variant="text" size="small" @click="loadScheduled">{{ t('重试') }}</v-btn>
       </v-alert>
     </template>
     <template v-else>
-      <p v-if="sch.length === 0" class="text-body-2 text-medium-emphasis">没有定时发送的邮件。</p>
+      <p v-if="sch.length === 0" class="text-body-2 text-medium-emphasis">{{ t('没有定时发送的邮件。') }}</p>
       <v-list v-else density="comfortable" class="pa-0" style="max-width: 640px">
         <v-list-item v-for="it in sch" :key="it.id" class="px-0">
-          <v-list-item-title class="text-body-2">{{ it.subject || '(无主题)' }}</v-list-item-title>
+          <v-list-item-title class="text-body-2">{{ it.subject || t('(无主题)') }}</v-list-item-title>
           <v-list-item-subtitle>
-            发给 {{ it.to }}，计划 {{ fmtDateTime(it.send_at) }}
-            <template v-if="it.status === 'sent'">，已发送</template>
-            <template v-else-if="it.status === 'failed'">，发送失败<template v-if="it.error">（{{ it.error }}）</template></template>
-            <template v-else>，待发送</template>
+            {{ t('发给 {to}，计划 {time}', { to: it.to, time: fmtDateTime(it.send_at) }) }}
+            <template v-if="it.status === 'sent'">{{ t('，已发送') }}</template>
+            <template v-else-if="it.status === 'failed'">{{ t('，发送失败') }}<template v-if="it.error">（{{ it.error }}）</template></template>
+            <template v-else>{{ t('，待发送') }}</template>
           </v-list-item-subtitle>
           <template v-if="it.status === 'pending'" #append>
-            <v-btn variant="text" size="small" color="error" @click="cancelSch(it)">取消</v-btn>
+            <v-btn variant="text" size="small" color="error" @click="cancelSch(it)">{{ t('取消') }}</v-btn>
           </template>
         </v-list-item>
       </v-list>
@@ -484,18 +626,18 @@ onMounted(() => {
 
     <v-divider class="my-6" />
 
-    <h2 class="text-h6 mb-3">Telegram 推送</h2>
+    <h2 class="text-h6 mb-3">{{ t('Telegram 推送') }}</h2>
     <template v-if="tgStatus === 'loading'">
       <v-skeleton-loader type="article" max-width="640" />
     </template>
     <template v-else-if="tgStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact" max-width="640">
-        设置加载失败：{{ tgMsg }}
-        <v-btn variant="text" size="small" @click="loadTG">重试</v-btn>
+        {{ t('设置加载失败：{error}', { error: tgMsg }) }}
+        <v-btn variant="text" size="small" @click="loadTG">{{ t('重试') }}</v-btn>
       </v-alert>
     </template>
     <div v-else style="max-width: 640px">
-      <v-switch v-model="tg.enabled" label="启用新邮件推送" color="primary" hide-details class="mb-2" />
+      <v-switch v-model="tg.enabled" :label="t('启用新邮件推送')" color="primary" hide-details class="mb-2" />
       <v-text-field
         v-model="tg.bot_token"
         label="Bot Token"
@@ -503,7 +645,7 @@ onMounted(() => {
         variant="outlined"
         density="comfortable"
         autocomplete="off"
-        :placeholder="tg.has_token ? '已保存，留空不改' : '如 123456:ABC-DEF...'"
+        :placeholder="tg.has_token ? t('已保存，留空不改') : t('如 123456:ABC-DEF...')"
         class="mb-2"
       />
       <v-text-field
@@ -512,83 +654,84 @@ onMounted(() => {
         variant="outlined"
         density="comfortable"
         autocomplete="off"
-        placeholder="如 123456789"
+        :placeholder="t('如 123456789')"
         class="mb-2"
       />
       <div class="d-flex align-center ga-2">
         <v-btn color="primary" :disabled="tgBusy !== ''" :loading="tgBusy === 'save'" @click="saveTG">
-          保存
+          {{ t('保存') }}
         </v-btn>
         <v-btn variant="outlined" :disabled="tgBusy !== ''" :loading="tgBusy === 'test'" @click="testTG">
-          发送测试消息
+          {{ t('发送测试消息') }}
         </v-btn>
       </div>
     </div>
 
     <v-divider class="my-6" />
 
-    <h2 class="text-h6 mb-3">浏览器推送</h2>
+    <h2 class="text-h6 mb-3">{{ t('浏览器推送') }}</h2>
     <template v-if="wpStatus === 'loading'">
       <v-skeleton-loader type="article" max-width="640" />
     </template>
     <template v-else-if="wpStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact" max-width="640">
-        设置加载失败：{{ wpMsg }}
-        <v-btn variant="text" size="small" @click="loadWP">重试</v-btn>
+        {{ t('设置加载失败：{error}', { error: wpMsg }) }}
+        <v-btn variant="text" size="small" @click="loadWP">{{ t('重试') }}</v-btn>
       </v-alert>
     </template>
     <div v-else style="max-width: 640px">
       <v-switch
-        :model-value="wp.enabled"
-        label="启用浏览器推送"
+        :model-value="thisSub === true"
+        :label="t('本浏览器接收推送')"
         color="primary"
         hide-details
         class="mb-2"
         :disabled="wpBusy || !wpSupported"
-        @update:model-value="toggleWPEnabled"
+        @update:model-value="toggleThisBrowser"
       />
       <p class="text-body-2 mb-2">
-        当前共有 {{ wp.subscriptions }} 个浏览器订阅。
-        <template v-if="thisSub === true">本浏览器已订阅。</template>
-        <template v-else-if="thisSub === false">本浏览器未订阅。</template>
+        {{ t('当前共有 {n} 个浏览器订阅。', { n: wp.subscriptions }) }}
+        <template v-if="thisSub === true">{{ t('本浏览器已订阅。') }}</template>
+        <template v-else-if="thisSub === false">{{ t('本浏览器未订阅。') }}</template>
       </p>
       <v-alert v-if="!wpSupported" type="warning" variant="tonal" density="compact" class="mb-2">
-        当前浏览器不支持 Web Push。
+        {{ t('当前浏览器不支持 Web Push。') }}
       </v-alert>
       <div class="d-flex align-center ga-2">
-        <v-btn variant="outlined" :disabled="wpBusy || !wpSupported" @click="testWP">发送测试推送</v-btn>
+        <v-btn variant="outlined" :disabled="wpBusy || !wpSupported" @click="testWP">{{ t('发送测试推送') }}</v-btn>
       </div>
     </div>
 
     <v-divider class="my-6" />
     <div class="text-center text-caption text-medium-emphasis pb-10">
-      <div>Namakani 邮箱</div>
-      <div v-if="version" class="mt-1">版本 {{ version }}</div>
+      <div>Namakani</div>
+      <div v-if="version" class="mt-1">{{ t('版本 {version}', { version }) }}</div>
       <div class="mt-1">© 2026 namakani</div>
     </div>
   </div>
 
   <v-dialog v-model="dialogOpen" max-width="560">
     <v-card>
-      <v-card-title>{{ editing ? '编辑账号' : '添加账号' }}</v-card-title>
+      <v-card-title>{{ editing ? t('编辑账号') : t('添加账号') }}</v-card-title>
       <v-card-text>
         <v-form @submit.prevent="save">
-          <v-text-field v-model="form.label" label="名称" variant="outlined" density="comfortable" placeholder="如 工作邮箱" required class="mb-2" />
-          <v-text-field v-model="form.email" label="邮箱" type="email" variant="outlined" density="comfortable" required class="mb-2" />
-          <v-text-field v-model="form.username" label="用户名" variant="outlined" density="comfortable" required class="mb-2" />
+          <v-text-field v-model="form.label" :label="t('名称')" variant="outlined" density="comfortable" :placeholder="t('如 工作邮箱')" required class="mb-2" />
+          <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="outlined" density="comfortable" required class="mb-2" />
+          <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="outlined" density="comfortable" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
+          <v-text-field v-model="form.username" :label="t('用户名')" variant="outlined" density="comfortable" required class="mb-2" />
           <v-text-field
             v-model="form.password"
-            label="密码"
+            :label="t('密码')"
             type="password"
             variant="outlined"
             density="comfortable"
-            :placeholder="editing ? '留空 = 不修改' : ''"
+            :placeholder="editing ? t('留空 = 不修改') : ''"
             :required="!editing"
             class="mb-2"
           />
           <v-textarea
             v-model="form.signature"
-            label="签名（纯文本，写信时自动加到正文末尾）"
+            :label="t('签名（纯文本，写信时自动加到正文末尾）')"
             variant="outlined"
             density="comfortable"
             rows="3"
@@ -596,45 +739,46 @@ onMounted(() => {
           />
           <v-row dense class="mb-2">
             <v-col cols="12" sm="6">
-              <v-text-field v-model="form.imap_host" label="IMAP 服务器" variant="outlined" density="comfortable" placeholder="imap.example.com" required hide-details />
+              <v-text-field v-model="form.imap_host" :label="t('IMAP 服务器')" variant="outlined" density="comfortable" placeholder="imap.example.com" required hide-details />
             </v-col>
             <v-col cols="6" sm="3">
-              <v-text-field v-model.number="form.imap_port" label="端口" type="number" variant="outlined" density="comfortable" required hide-details />
+              <v-text-field v-model.number="form.imap_port" :label="t('端口')" type="number" variant="outlined" density="comfortable" required hide-details />
             </v-col>
             <v-col cols="6" sm="3">
-              <v-select v-model="form.imap_tls" :items="tlsItems" label="加密" variant="outlined" density="comfortable" hide-details />
+              <v-select v-model="form.imap_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
             </v-col>
             <v-col cols="12" sm="6">
-              <v-text-field v-model="form.smtp_host" label="SMTP 服务器" variant="outlined" density="comfortable" placeholder="smtp.example.com" required hide-details />
+              <v-text-field v-model="form.smtp_host" :label="t('SMTP 服务器')" variant="outlined" density="comfortable" placeholder="smtp.example.com" required hide-details />
             </v-col>
             <v-col cols="6" sm="3">
-              <v-text-field v-model.number="form.smtp_port" label="端口" type="number" variant="outlined" density="comfortable" required hide-details />
+              <v-text-field v-model.number="form.smtp_port" :label="t('端口')" type="number" variant="outlined" density="comfortable" required hide-details />
             </v-col>
             <v-col cols="6" sm="3">
-              <v-select v-model="form.smtp_tls" :items="tlsItems" label="加密" variant="outlined" density="comfortable" hide-details />
+              <v-select v-model="form.smtp_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
             </v-col>
           </v-row>
+          <v-switch v-model="form.tls_skip_verify" :label="t('跳过证书校验')" color="primary" hide-details class="mb-2" />
           <v-alert v-if="formError" type="error" variant="tonal" density="compact">{{ formError }}</v-alert>
         </v-form>
       </v-card-text>
       <v-card-actions>
         <v-spacer />
-        <v-btn variant="text" @click="dialogOpen = false">取消</v-btn>
-        <v-btn color="primary" @click="save">保存</v-btn>
+        <v-btn variant="text" @click="dialogOpen = false">{{ t('取消') }}</v-btn>
+        <v-btn color="primary" @click="save">{{ t('保存') }}</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
 
   <v-dialog v-model="deleteOpen" max-width="440">
     <v-card>
-      <v-card-title>删除账号</v-card-title>
+      <v-card-title>{{ t('删除账号') }}</v-card-title>
       <v-card-text>
-        删除账号「{{ deleteTarget?.label }}」？本地同步的邮件会一并删除，服务器上的邮件不受影响。
+        {{ t('删除账号「{label}」？本地同步的邮件会一并删除，服务器上的邮件不受影响。', { label: deleteTarget?.label }) }}
       </v-card-text>
       <v-card-actions>
         <v-spacer />
-        <v-btn variant="text" @click="deleteOpen = false">取消</v-btn>
-        <v-btn color="error" @click="confirmDelete">删除</v-btn>
+        <v-btn variant="text" @click="deleteOpen = false">{{ t('取消') }}</v-btn>
+        <v-btn color="error" @click="confirmDelete">{{ t('删除') }}</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>

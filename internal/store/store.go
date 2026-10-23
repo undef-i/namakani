@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -13,6 +14,8 @@ type Store struct {
 	DB             *sql.DB
 	dataDir        string
 	attachmentsDir string
+	appMu          sync.RWMutex
+	app            AppSettings
 }
 
 func (s *Store) DataDir() string { return s.dataDir }
@@ -55,6 +58,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 	smtp_host   TEXT NOT NULL,
 	smtp_port   INTEGER NOT NULL,
 	smtp_tls    TEXT NOT NULL,
+	tls_skip_verify INTEGER NOT NULL DEFAULT 0,
 	username    TEXT NOT NULL,
 	enc_password TEXT NOT NULL,
 	sort        INTEGER NOT NULL DEFAULT 0,
@@ -125,12 +129,17 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	hasFromName, err := columnExists(db, "accounts", "from_name")
+	if err != nil {
+		return nil, err
+	}
 	for _, col := range []struct{ table, name, ddl string }{
 		{"messages", "modseq", "ALTER TABLE messages ADD COLUMN modseq INTEGER NOT NULL DEFAULT 0"},
 		{"attachments", "content_id", "ALTER TABLE attachments ADD COLUMN content_id TEXT NOT NULL DEFAULT ''"},
 		{"attachments", "inline", "ALTER TABLE attachments ADD COLUMN inline INTEGER NOT NULL DEFAULT 0"},
 		{"sessions", "wrapped_key", "ALTER TABLE sessions ADD COLUMN wrapped_key TEXT NOT NULL DEFAULT ''"},
 		{"accounts", "signature", "ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''"},
+		{"accounts", "from_name", "ALTER TABLE accounts ADD COLUMN from_name TEXT NOT NULL DEFAULT ''"},
 	} {
 		has, err := columnExists(db, col.table, col.name)
 		if err != nil {
@@ -140,6 +149,11 @@ func Open(path string) (*Store, error) {
 			if _, err := db.Exec(col.ddl); err != nil {
 				return nil, fmt.Errorf("migrate %s.%s: %w", col.table, col.name, err)
 			}
+		}
+	}
+	if !hasFromName {
+		if _, err := db.Exec(`UPDATE accounts SET from_name = label`); err != nil {
+			return nil, fmt.Errorf("backfill from_name: %w", err)
 		}
 	}
 	var ftsSQL string
@@ -160,6 +174,7 @@ func Open(path string) (*Store, error) {
 	}
 	st := &Store{DB: db, dataDir: filepath.Dir(path),
 		attachmentsDir: filepath.Join(filepath.Dir(path), "attachments")}
+	st.loadAppSettings()
 	if err := st.BackfillThreadKeys(); err != nil {
 		return nil, fmt.Errorf("backfill thread keys: %w", err)
 	}

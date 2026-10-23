@@ -14,6 +14,7 @@ import (
 	syncmgr "namakani/internal/sync"
 )
 
+//go:embed all:web/dist
 var uiEmbed embed.FS
 
 func main() {
