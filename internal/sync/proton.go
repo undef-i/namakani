@@ -92,51 +92,7 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseI
 	}
 
 	events := make(chan *protonmail.Event, 4)
-	go func() {
-		last, err := sess.EventLatest()
-		if err != nil {
-			log.Printf("sync account %d proton events baseline: %v", acct.ID, err)
-			last = ""
-		}
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			ev, err := sess.EventSince(last)
-			if err != nil {
-				log.Printf("sync account %d proton events: %v", acct.ID, err)
-				if base, berr := sess.EventLatest(); berr == nil {
-					last = base
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(15 * time.Second):
-				}
-				continue
-			}
-			if ev == nil {
-				continue
-			}
-			changed := ev.ID != last || len(ev.Messages) > 0 || ev.Refresh != 0
-			if ev.ID != "" {
-				last = ev.ID
-			}
-			if !changed {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(15 * time.Second):
-				}
-				continue
-			}
-			select {
-			case events <- ev:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	go protonEventLoop(ctx, sess, acct.ID, events)
 
 	sweep := time.NewTicker(10 * time.Minute)
 	defer sweep.Stop()
@@ -168,6 +124,95 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseI
 				continue
 			}
 			syncNames(affected)
+		}
+	}
+}
+
+type protonEventSource interface {
+	EventLatest() (string, error)
+	EventSince(last string) (*protonmail.Event, error)
+}
+
+var (
+	protonEventIdleWait  = 5 * time.Second
+	protonEventErrBase   = 5 * time.Second
+	protonEventErrMax    = 60 * time.Second
+	protonEventRebaseAge = 5 * time.Minute
+)
+
+func protonEventLoop(ctx context.Context, src protonEventSource, accountID int64, out chan<- *protonmail.Event) {
+	last, err := src.EventLatest()
+	if err != nil {
+		log.Printf("sync account %d proton events baseline: %v", accountID, err)
+		last = ""
+	}
+	wait := func(d time.Duration) bool {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+			return true
+		}
+	}
+	var failSince time.Time
+	fails := 0
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		ev, err := src.EventSince(last)
+		if err != nil {
+			log.Printf("sync account %d proton events: %v", accountID, err)
+			if fails == 0 {
+				failSince = time.Now()
+			}
+			fails++
+			if time.Since(failSince) >= protonEventRebaseAge {
+				if base, berr := src.EventLatest(); berr == nil && base != "" && base != last {
+					last = base
+					select {
+					case out <- &protonmail.Event{Refresh: protonmail.EventRefreshMail}:
+					case <-ctx.Done():
+						return
+					}
+				}
+				fails = 0
+			}
+			backoff := protonEventErrBase
+			for i := 1; i < fails && backoff < protonEventErrMax; i++ {
+				backoff *= 2
+			}
+			if backoff > protonEventErrMax {
+				backoff = protonEventErrMax
+			}
+			if !wait(backoff) {
+				return
+			}
+			continue
+		}
+		fails = 0
+		if ev == nil {
+			if !wait(protonEventIdleWait) {
+				return
+			}
+			continue
+		}
+		changed := ev.ID != last || len(ev.Messages) > 0 || ev.Refresh != 0
+		if ev.ID != "" {
+			last = ev.ID
+		}
+		if !changed {
+			if !wait(protonEventIdleWait) {
+				return
+			}
+			continue
+		}
+		select {
+		case out <- ev:
+		case <-ctx.Done():
+			return
 		}
 	}
 }
