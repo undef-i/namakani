@@ -68,8 +68,8 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account) error {
 	m.mu.Lock()
 	m.live[acct.ID] = true
 	m.mu.Unlock()
-	m.repairThreads(ctx, sess, acct)
 	m.prewarm(ctx, sess, acct)
+	m.repairThreads(ctx, sess, acct)
 
 	syncNames := func(names map[string]bool) {
 		for _, r := range refs {

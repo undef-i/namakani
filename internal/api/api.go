@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -765,9 +766,10 @@ type accountTestIn struct {
 }
 
 type testSideResult struct {
-	OK      bool   `json:"ok"`
-	Folders int    `json:"folders,omitempty"`
-	Error   string `json:"error,omitempty"`
+	OK           bool     `json:"ok"`
+	Folders      int      `json:"folders,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	Error        string   `json:"error,omitempty"`
 }
 
 func (s *Server) handleTestAccountForm(w http.ResponseWriter, r *http.Request) {
@@ -839,12 +841,14 @@ func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountT
 		imapRes.Error = err.Error()
 	} else {
 		folders, ferr := cl.ListFolders()
+		caps := cl.Capabilities()
 		cl.Close()
 		if ferr != nil {
 			imapRes.Error = "list folders: " + ferr.Error()
 		} else {
 			imapRes.OK = true
 			imapRes.Folders = len(folders)
+			imapRes.Capabilities = caps
 		}
 	}
 	smtpRes := testSideResult{}
@@ -869,7 +873,8 @@ func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accoun
 		s.testProtonStored(w, key, in.ID)
 		return
 	}
-	if _, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken); err != nil {
+	bridgePassword, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken)
+	if err != nil {
 		if err == proton.ErrTOTPRequired {
 			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
 			return
@@ -882,7 +887,19 @@ func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accoun
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	acct := mail.Account{Kind: "proton", Email: in.Email, Username: in.Email, Password: bridgePassword}
+	cl, err := proton.Connect(s.st, acct)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer cl.Close()
+	folders, err := cl.ListFolders()
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
 }
 
 func (s *Server) testProtonStored(w http.ResponseWriter, key []byte, id int64) {
@@ -902,7 +919,7 @@ func (s *Server) testProtonStored(w http.ResponseWriter, key []byte, id int64) {
 		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
 }
 
 func (s *Server) testTutaAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
@@ -919,7 +936,8 @@ func (s *Server) testTutaAccount(w http.ResponseWriter, key []byte, in *accountT
 		return
 	}
 	start := time.Now()
-	if _, _, err := tuta.Authorize(in.Email, in.Password, in.TOTP); err != nil {
+	cl, err := tuta.LoginSession(in.Email, in.Password, in.TOTP)
+	if err != nil {
 		if err == tuta.ErrTOTPRequired {
 			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
 			return
@@ -929,7 +947,13 @@ func (s *Server) testTutaAccount(w http.ResponseWriter, key []byte, in *accountT
 		return
 	}
 	log.Printf("tuta: test authorize ok in %s", time.Since(start).Round(time.Millisecond))
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	folders, err := listFoldersBounded(cl, listFoldersTimeout)
+	if err != nil {
+		log.Printf("tuta: test list folders failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
+		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
 }
 
 const listFoldersTimeout = 45 * time.Second
@@ -973,7 +997,7 @@ func (s *Server) testTutaStored(w http.ResponseWriter, key []byte, id int64) {
 		return
 	}
 	log.Printf("tuta: test stored account %d ok in %s (%d folders)", id, time.Since(start).Round(time.Millisecond), len(folders))
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
 }
 
 func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
@@ -2055,6 +2079,9 @@ func (s *Server) fileSentCopy(acct mail.Account, sess uidAssigner, sentID string
 
 func (s *Server) deleteMessageEverywhere(key []byte, messageID int64) error {
 	route, err := s.st.MessageRoute(messageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -2069,7 +2096,10 @@ func (s *Server) deleteMessageEverywhere(key []byte, messageID int64) error {
 	if err := cl.DeleteMessage(route.UID); err != nil {
 		return err
 	}
-	return s.st.DeleteLocalMessage(messageID)
+	if err := s.st.DeleteLocalMessage(messageID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return nil
 }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {

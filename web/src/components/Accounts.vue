@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { intlLocale, lang, setLang, t } from '../i18n'
 import * as api from '../api.js'
 
@@ -102,7 +102,6 @@ const needsCaptcha = ref(false)
 const captchaUrl = ref('')
 const deleteTarget = ref(null)
 const deleteOpen = ref(false)
-const testState = reactive({})
 
 function openCreate() {
   editing.value = null
@@ -111,6 +110,7 @@ function openCreate() {
   needsTotp.value = false
   needsCaptcha.value = false
   captchaUrl.value = ''
+  resetTestState()
   dialogOpen.value = true
 }
 
@@ -121,17 +121,28 @@ function openEdit(a) {
   needsTotp.value = false
   needsCaptcha.value = false
   captchaUrl.value = ''
+  resetTestState()
   dialogOpen.value = true
 }
 
 const testBusy = ref(false)
 const testOk = ref(false)
+const testResult = ref('')
 const pendingMode = ref('save')
+let testRun = 0
+
+function resetTestState() {
+  testRun++
+  testBusy.value = false
+  testOk.value = false
+  testResult.value = ''
+}
 
 watch(
   form,
   () => {
     testOk.value = false
+    testResult.value = ''
   },
   { deep: true },
 )
@@ -146,9 +157,12 @@ async function submit(mode) {
   }
   delete payload.id
   const isTest = mode === 'test'
+  let run = 0
   if (isTest) {
+    run = ++testRun
     testBusy.value = true
     testOk.value = false
+    testResult.value = ''
   }
   try {
     let res
@@ -159,6 +173,7 @@ async function submit(mode) {
     } else {
       res = await api.createAccount(payload)
     }
+    if (isTest && run !== testRun) return
     if (res && res.needs_captcha) {
       if (form.value.captcha_token) showSnack(t('验证已过期，已生成新的验证链接'))
       form.value.captcha_token = res.captcha_token
@@ -178,13 +193,14 @@ async function submit(mode) {
     dialogOpen.value = false
     emit('changed')
   } catch (err) {
+    if (isTest && run !== testRun) return
     if (isTest) {
       formError.value = t('连接失败：{error}', { error: err.message })
     } else {
       formError.value = err.message
     }
   } finally {
-    if (isTest) testBusy.value = false
+    if (isTest && run === testRun) testBusy.value = false
   }
 }
 
@@ -204,12 +220,11 @@ function reportTestResult(res) {
   needsCaptcha.value = false
   needsTotp.value = false
   formError.value = ''
+  testResult.value = ''
   if (form.value.kind === 'proton' || form.value.kind === 'tuta') {
     testOk.value = true
     if (res && res.folders != null) {
-      showSnack(t('连接成功（{n} 个文件夹）', { n: res.folders }), 6000)
-    } else {
-      showSnack(t('连接成功'))
+      showTestSuccess(res.folders, res.capabilities)
     }
     return
   }
@@ -221,8 +236,19 @@ function reportTestResult(res) {
     formError.value = parts.join('；')
   } else {
     testOk.value = true
-    showSnack(t('连接成功（{n} 个文件夹）', { n: res.imap.folders }), 6000)
+    showTestSuccess(res.imap.folders, res.imap.capabilities)
   }
+}
+
+function showTestSuccess(folders, capabilities) {
+  const caps = capabilities || []
+  testResult.value = t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
+    folders,
+    caps: caps.length,
+    sample: caps
+      .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
+      .join('/'),
+  })
 }
 
 function askDelete(a) {
@@ -236,27 +262,6 @@ async function confirmDelete() {
   deleteTarget.value = null
   deleteOpen.value = false
   emit('changed')
-}
-
-async function runTest(a) {
-  testState[a.id] = { busy: true, ok: false, error: '', text: t('连接中') }
-  try {
-    const res = await api.testAccount(a.id)
-    testState[a.id] = {
-      busy: false,
-      ok: true,
-      error: '',
-      text: t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
-        folders: res.folders.length,
-        caps: res.capabilities.length,
-        sample: res.capabilities
-          .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
-          .join('/'),
-      }),
-    }
-  } catch (err) {
-    testState[a.id] = { busy: false, ok: false, error: err.message, text: '' }
-  }
 }
 
 
@@ -538,7 +543,21 @@ onMounted(() => {
     </div>
 
     <template v-if="accountsStatus === 'loading'">
-      <v-skeleton-loader type="card@2" />
+      <div class="d-flex flex-column ga-3">
+        <v-card v-for="i in 2" :key="i" variant="outlined" rounded="lg">
+          <v-card-text>
+            <div class="d-flex align-start ga-2">
+              <div class="flex-grow-1" style="min-width: 0">
+                <v-skeleton-loader type="text" width="40%" />
+                <v-skeleton-loader type="text" width="62%" />
+              </div>
+              <v-skeleton-loader type="avatar" width="32" height="32" />
+              <v-skeleton-loader type="avatar" width="32" height="32" />
+            </div>
+            <v-skeleton-loader type="text" width="55%" class="mt-2" />
+          </v-card-text>
+        </v-card>
+      </div>
     </template>
     <template v-else-if="accountsStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact">
@@ -558,15 +577,6 @@ onMounted(() => {
               <div class="text-body-2 text-medium-emphasis text-truncate">{{ a.email }}</div>
             </div>
             <v-spacer />
-            <v-btn
-              :icon="testState[a.id]?.ok ? 'mdi-check' : 'mdi-connection'"
-              :color="testState[a.id]?.ok ? 'success' : undefined"
-              :loading="!!testState[a.id]?.busy"
-              variant="text"
-              size="small"
-              :title="testState[a.id]?.ok ? t('连接成功') : t('测试连接')"
-              @click="runTest(a)"
-            />
             <v-btn icon="mdi-pencil" variant="text" size="small" :title="t('编辑')" @click="openEdit(a)" />
             <v-btn icon="mdi-delete" variant="text" size="small" :title="t('删除')" @click="askDelete(a)" />
           </div>
@@ -582,16 +592,6 @@ onMounted(() => {
             style="overflow-wrap: anywhere"
           >
             {{ statusText(a) }}<template v-if="cacheText(a)">{{ t('，') }}{{ cacheText(a) }}</template>
-          </div>
-          <div
-            v-if="testState[a.id]?.error"
-            class="text-body-2 mt-1 text-error"
-            style="overflow-wrap: anywhere"
-          >
-            {{ t('连接失败：{error}', { error: testState[a.id].error }) }}
-          </div>
-          <div v-if="testState[a.id]?.text" class="text-body-2 mt-1" style="overflow-wrap: anywhere">
-            {{ testState[a.id].text }}
           </div>
         </v-card-text>
       </v-card>
@@ -844,7 +844,7 @@ onMounted(() => {
           <template v-if="form.kind === 'proton'">
             <v-text-field
               v-model="form.password"
-              :label="t('Proton Mail 登录密码')"
+              :label="t('登录密码')"
               type="password"
               variant="outlined"
               density="comfortable"
@@ -879,7 +879,7 @@ onMounted(() => {
           <template v-else-if="form.kind === 'tuta'">
             <v-text-field
               v-model="form.password"
-              :label="t('Tuta Mail 登录密码')"
+              :label="t('登录密码')"
               type="password"
               variant="outlined"
               density="comfortable"
@@ -936,12 +936,12 @@ onMounted(() => {
               :prepend-icon="testOk ? 'mdi-check' : 'mdi-connection'"
               :color="testOk ? 'success' : undefined"
               :loading="testBusy"
-              :disabled="testOk"
               @click="testConnection"
             >
               {{ testOk ? t('连接成功') : t('测试连接') }}
             </v-btn>
           </div>
+          <div v-if="testResult" class="text-body-2 text-success mb-2">{{ testResult }}</div>
           <v-alert v-if="formError" type="error" variant="tonal" density="compact">{{ formError }}</v-alert>
         </v-form>
       </v-card-text>

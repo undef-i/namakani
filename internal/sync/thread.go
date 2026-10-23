@@ -58,9 +58,14 @@ func (m *Manager) repairThreads(ctx context.Context, cl mail.Conn, acct mail.Acc
 				log.Printf("thread repair account %d: fetch %s: %v", acct.ID, fname, err)
 				break
 			}
+			var checked []int64
 			for _, r := range batch {
 				th, ok := hdrs[r.UID]
-				if !ok || (len(th.References) == 0 && th.InReplyTo == "") {
+				if !ok {
+					continue
+				}
+				checked = append(checked, r.ID)
+				if len(th.References) == 0 && th.InReplyTo == "" {
 					continue
 				}
 				if err := m.st.RecomputeThreadKey(acct.ID, r.ID, th.References, th.InReplyTo); err != nil {
@@ -68,6 +73,9 @@ func (m *Manager) repairThreads(ctx context.Context, cl mail.Conn, acct mail.Acc
 					continue
 				}
 				fixed++
+			}
+			if err := m.st.MarkThreadChecked(checked); err != nil {
+				log.Printf("thread repair account %d: mark checked: %v", acct.ID, err)
 			}
 		}
 	}

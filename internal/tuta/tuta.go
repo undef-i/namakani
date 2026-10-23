@@ -145,18 +145,26 @@ func newSession() *Session {
 	}
 }
 
-func Authorize(email, password, totp string) (userID, accessToken string, err error) {
+func LoginSession(email, password, totp string) (*Session, error) {
 	s := newSession()
 	s.acct.Email = email
 	s.acct.Username = email
 	start := time.Now()
 	endPhase := s.beginPhase(loginPhaseTimeout)
-	err = s.login(password, totp)
+	err := s.login(password, totp)
 	endPhase()
 	if err != nil {
 		log.Printf("tuta: authorize failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
-		return "", "", err
+		return nil, err
 	}
 	log.Printf("tuta: authorize ok in %s", time.Since(start).Round(time.Millisecond))
+	return s, nil
+}
+
+func Authorize(email, password, totp string) (userID, accessToken string, err error) {
+	s, err := LoginSession(email, password, totp)
+	if err != nil {
+		return "", "", err
+	}
 	return s.userID, s.accessToken, nil
 }

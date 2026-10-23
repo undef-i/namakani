@@ -65,8 +65,8 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account) error {
 	m.mu.Lock()
 	m.live[acct.ID] = true
 	m.mu.Unlock()
-	m.repairThreads(ctx, sess, acct)
 	m.prewarm(ctx, sess, acct)
+	m.repairThreads(ctx, sess, acct)
 
 	syncAll := func() {
 		if newRefs, _, err := listRefs(); err == nil {

@@ -43,6 +43,7 @@ const selected = ref(null)
 const detail = ref(null)
 const detailState = ref('idle')
 const detailError = ref('')
+const actionError = ref('')
 const opBusy = ref(false)
 let detailToken = 0
 
@@ -803,13 +804,39 @@ function patchLocalFlags(id, flags) {
   }
 }
 
+function bumpFolderUnread(m, delta) {
+  if (!m.folder_id) return
+  folders.value = folders.value.map((f) =>
+    f.id === m.folder_id ? { ...f, unread: Math.max(0, f.unread + delta) } : f,
+  )
+}
+
+function bumpThreadUnread(id, delta) {
+  messages.value = messages.value.map((x) =>
+    x.id === id && x.thread_unread != null
+      ? { ...x, thread_unread: Math.max(0, x.thread_unread + delta) }
+      : x,
+  )
+}
+
 async function markSeen(m) {
   if (m.flags & 1) return
+  const prevFlags = m.flags
+  const row = messages.value.find((x) => x.id === m.id)
+  const counted = !!(row && !(row.flags & 1) && row.thread_unread != null)
+  actionError.value = ''
+  patchLocalFlags(m.id, prevFlags | 1)
+  if (counted) bumpThreadUnread(m.id, -1)
+  bumpFolderUnread(m, -1)
   try {
     const res = await api.setFlags(m.id, { seen: true })
     patchLocalFlags(m.id, res.flags)
     loadFolders()
-  } catch {
+  } catch (err) {
+    patchLocalFlags(m.id, prevFlags)
+    if (counted) bumpThreadUnread(m.id, 1)
+    bumpFolderUnread(m, 1)
+    actionError.value = t('标为已读失败：{error}', { error: err.message })
   }
 }
 
@@ -909,12 +936,12 @@ async function openMessage(m) {
   }
   selected.value = m
   detailError.value = ''
+  markSeen(m)
   const cached = detailCache.get(m.id)
   if (cached) {
     detail.value = cached
     detailState.value = 'ready'
     enrichSelected(cached)
-    markSeen(m)
     afterOpen(m)
     return
   }
@@ -928,7 +955,6 @@ async function openMessage(m) {
     detail.value = d
     detailState.value = 'ready'
     enrichSelected(d)
-    markSeen(m)
     afterOpen(m)
   } catch (err) {
     if (tk === detailToken) {
@@ -1069,25 +1095,6 @@ async function toggleSeen() {
     loadFolders()
   } finally {
     opBusy.value = false
-  }
-}
-
-async function toggleStar() {
-  if (!selected.value || opBusy.value) return
-  opBusy.value = true
-  try {
-    const res = await api.setFlags(selected.value.id, { flagged: !(selected.value.flags & 2) })
-    patchLocalFlags(selected.value.id, res.flags)
-  } finally {
-    opBusy.value = false
-  }
-}
-
-async function starFor(m) {
-  try {
-    const res = await api.setFlags(m.id, { flagged: !(m.flags & 2) })
-    patchLocalFlags(m.id, res.flags)
-  } catch {
   }
 }
 
@@ -1257,9 +1264,6 @@ function onGlobalKey(e) {
       break
     case 'Delete':
       if (m) deleteFor(m)
-      break
-    case 's':
-      if (m) starFor(m)
       break
     case 'r':
       if (m) replyToMessage(m)
@@ -1549,6 +1553,7 @@ onBeforeUnmount(() => {
                 {{ t('{n} 封', { n: scopeStats[scope].total }) }}<template v-if="scopeStats[scope].unread">{{ t('（{n} 未读）', { n: scopeStats[scope].unread }) }}</template>
               </span>
             </div>
+            <div v-if="actionError" class="px-3 py-1 text-caption text-error border-b">{{ actionError }}</div>
 
             <div class="list-body">
             <div
@@ -1651,26 +1656,15 @@ onBeforeUnmount(() => {
                         </span>
                         <v-icon v-if="m.has_attach" icon="mdi-paperclip" size="14" class="text-medium-emphasis" />
                         <span class="text-caption text-medium-emphasis text-no-wrap">{{ fmtListTime(m.date_ts) }}</span>
-                        <v-btn
-                          icon
-                          variant="text"
-                          size="x-small"
-                          density="compact"
-                          :aria-label="(m.flags & 2) ? t('取消星标') : t('星标')"
-                          @click.stop="starFor(m)"
-                        >
-                          <v-icon
-                            :icon="(m.flags & 2) ? 'mdi-star' : 'mdi-star-outline'"
-                            size="16"
-                            :color="(m.flags & 2) ? 'amber-darken-2' : 'medium-emphasis'"
-                          />
-                        </v-btn>
                       </div>
                       <div class="text-body-2 text-truncate" :class="{ 'font-weight-bold': !(m.flags & 1) }">
                         {{ m.subject || t('(无主题)') }}
                       </div>
                       <div class="text-caption text-medium-emphasis text-truncate">
-                        {{ m.account_label }}<template v-if="searching">{{ t('，') }}{{ m.folder_name }}</template><template v-if="m.snippet">{{ t('，') }}{{ m.snippet }}</template>
+                        {{ m.account_label }}<template v-if="searching">{{ t('，') }}{{ m.folder_name }}</template>
+                      </div>
+                      <div v-if="m.snippet" class="text-caption text-medium-emphasis text-truncate">
+                        {{ m.snippet }}
                       </div>
                     </div>
                   </div>
@@ -1777,15 +1771,6 @@ onBeforeUnmount(() => {
                           <v-btn icon variant="text" size="small" :disabled="!convoDetails[msg.id]" @click="forwardCard(msg)">
                             <v-icon icon="mdi-share" />
                             <v-tooltip activator="parent" location="bottom">{{ t('转发') }}</v-tooltip>
-                          </v-btn>
-                          <v-btn icon variant="text" size="small" :disabled="opBusy" @click="starFor(msg)">
-                            <v-icon
-                              :icon="msg.flags & 2 ? 'mdi-star' : 'mdi-star-outline'"
-                              :color="msg.flags & 2 ? 'amber-darken-2' : undefined"
-                            />
-                            <v-tooltip activator="parent" location="bottom">
-                              {{ msg.flags & 2 ? t('取消星标') : t('星标') }}
-                            </v-tooltip>
                           </v-btn>
                           <v-btn
                             v-if="scope !== 'archive' && scope !== 'trash'"
@@ -1905,15 +1890,6 @@ onBeforeUnmount(() => {
                   <v-icon icon="mdi-share" />
                   <v-tooltip activator="parent" location="bottom">{{ t('转发') }}</v-tooltip>
                 </v-btn>
-                <v-btn icon variant="text" :disabled="opBusy" @click="toggleStar">
-                  <v-icon
-                    :icon="selected.flags & 2 ? 'mdi-star' : 'mdi-star-outline'"
-                    :color="selected.flags & 2 ? 'amber-darken-2' : undefined"
-                  />
-                  <v-tooltip activator="parent" location="bottom">
-                    {{ selected.flags & 2 ? t('取消星标') : t('星标') }}
-                  </v-tooltip>
-                </v-btn>
                 <v-btn
                   v-if="scope !== 'archive' && scope !== 'trash'"
                   icon
@@ -2027,7 +2003,6 @@ onBeforeUnmount(() => {
                 <tr><td class="font-mono">Enter</td><td>{{ t('打开邮件（线程打开会话）') }}</td></tr>
                 <tr><td class="font-mono">e</td><td>{{ t('归档') }}</td></tr>
                 <tr><td class="font-mono">Delete</td><td>{{ t('删除') }}</td></tr>
-                <tr><td class="font-mono">s</td><td>{{ t('星标 / 取消星标') }}</td></tr>
                 <tr><td class="font-mono">r</td><td>{{ t('回复') }}</td></tr>
                 <tr><td class="font-mono">a</td><td>{{ t('当前文件夹全部标为已读') }}</td></tr>
                 <tr><td class="font-mono">c</td><td>{{ t('写新邮件') }}</td></tr>

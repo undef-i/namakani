@@ -156,6 +156,7 @@ func Open(path string) (*Store, error) {
 	}
 	for _, col := range []struct{ table, name, ddl string }{
 		{"messages", "modseq", "ALTER TABLE messages ADD COLUMN modseq INTEGER NOT NULL DEFAULT 0"},
+		{"messages", "thread_checked", "ALTER TABLE messages ADD COLUMN thread_checked INTEGER NOT NULL DEFAULT 0"},
 		{"attachments", "content_id", "ALTER TABLE attachments ADD COLUMN content_id TEXT NOT NULL DEFAULT ''"},
 		{"attachments", "inline", "ALTER TABLE attachments ADD COLUMN inline INTEGER NOT NULL DEFAULT 0"},
 		{"sessions", "wrapped_key", "ALTER TABLE sessions ADD COLUMN wrapped_key TEXT NOT NULL DEFAULT ''"},

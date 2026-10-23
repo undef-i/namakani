@@ -36,7 +36,7 @@ type ThreadRepairRow struct {
 func (s *Store) ThreadRepairRows(accountID int64) ([]ThreadRepairRow, error) {
 	rows, err := s.DB.Query(`SELECT m.id, m.message_id, f.name, m.uid
 		FROM messages m JOIN folders f ON f.id = m.folder_id
-		WHERE m.account_id = ? AND m.message_id <> ''
+		WHERE m.account_id = ? AND m.message_id <> '' AND m.thread_checked = 0
 		AND (m.thread_key = m.message_id OR m.thread_key = '')
 		ORDER BY f.name, m.uid`, accountID)
 	if err != nil {
@@ -52,6 +52,20 @@ func (s *Store) ThreadRepairRows(accountID int64) ([]ThreadRepairRow, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) MarkThreadChecked(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	_, err := s.DB.Exec("UPDATE messages SET thread_checked = 1 WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+	return err
 }
 
 func (s *Store) RecomputeThreadKey(accountID, rowID int64, refs []string, inReplyTo string) error {

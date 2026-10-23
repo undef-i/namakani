@@ -276,8 +276,8 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 	m.mu.Lock()
 	m.live[acct.ID] = true
 	m.mu.Unlock()
-	m.repairThreads(ctx, cl, acct)
 	m.prewarm(ctx, cl, acct)
+	m.repairThreads(ctx, cl, acct)
 
 	syncAll := func() {
 		for _, r := range refs {
