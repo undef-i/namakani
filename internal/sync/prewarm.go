@@ -9,7 +9,7 @@ import (
 	"namakani/internal/store"
 )
 
-func (m *Manager) prewarm(ctx context.Context, cl *mail.Client, acct mail.Account) {
+func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) {
 	batch := m.st.AppSettings().SyncBatch
 	attBatch := batch / 2
 	if attBatch < 1 {
@@ -57,7 +57,7 @@ func (m *Manager) prewarm(ctx context.Context, cl *mail.Client, acct mail.Accoun
 	}
 }
 
-func (m *Manager) cacheBody(cl *mail.Client, acct mail.Account, c store.BodyCandidate) bool {
+func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandidate) bool {
 	if _, err := cl.Select(c.FolderName); err != nil {
 		log.Printf("prewarm account %d: select %s: %v", acct.ID, c.FolderName, err)
 		return false
@@ -103,7 +103,7 @@ func (m *Manager) cacheBody(cl *mail.Client, acct mail.Account, c store.BodyCand
 	return true
 }
 
-func (m *Manager) cacheAttachment(cl *mail.Client, acct mail.Account, c store.AttachmentCandidate) bool {
+func (m *Manager) cacheAttachment(cl mail.Conn, acct mail.Account, c store.AttachmentCandidate) bool {
 	if _, err := cl.Select(c.FolderName); err != nil {
 		return false
 	}

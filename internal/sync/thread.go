@@ -8,7 +8,7 @@ import (
 	"namakani/internal/store"
 )
 
-func (m *Manager) repairThreads(ctx context.Context, cl *mail.Client, acct mail.Account) {
+func (m *Manager) repairThreads(ctx context.Context, cl mail.Conn, acct mail.Account) {
 	size := m.st.AppSettings().SyncBatch
 	rows, err := m.st.ThreadRepairRows(acct.ID)
 	if err != nil {

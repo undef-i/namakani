@@ -117,6 +117,27 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 	subject, senders, recipients, body,
 	tokenize='trigram'
 );
+CREATE TABLE IF NOT EXISTS proton_uids (
+	account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	folder_name TEXT NOT NULL,
+	uid        INTEGER NOT NULL,
+	proton_id  TEXT NOT NULL,
+	PRIMARY KEY (account_id, folder_name, proton_id),
+	UNIQUE (account_id, folder_name, uid)
+);
+CREATE TABLE IF NOT EXISTS tuta_uids (
+	account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	folder_name TEXT NOT NULL,
+	uid        INTEGER NOT NULL,
+	tuta_id    TEXT NOT NULL,
+	PRIMARY KEY (account_id, folder_name, tuta_id),
+	UNIQUE (account_id, folder_name, uid)
+);
+CREATE TABLE IF NOT EXISTS tuta_sessions (
+	account_id   INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+	user_id      TEXT NOT NULL DEFAULT '',
+	access_token TEXT NOT NULL DEFAULT ''
+);
 `
 
 func Open(path string) (*Store, error) {
@@ -140,6 +161,7 @@ func Open(path string) (*Store, error) {
 		{"sessions", "wrapped_key", "ALTER TABLE sessions ADD COLUMN wrapped_key TEXT NOT NULL DEFAULT ''"},
 		{"accounts", "signature", "ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''"},
 		{"accounts", "from_name", "ALTER TABLE accounts ADD COLUMN from_name TEXT NOT NULL DEFAULT ''"},
+		{"accounts", "kind", "ALTER TABLE accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'imap'"},
 	} {
 		has, err := columnExists(db, col.table, col.name)
 		if err != nil {

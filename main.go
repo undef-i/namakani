@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"namakani/internal/api"
+	"namakani/internal/proton"
 	"namakani/internal/store"
 	syncmgr "namakani/internal/sync"
 )
@@ -25,6 +26,7 @@ func main() {
 	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
 		log.Fatalf("create data dir: %v", err)
 	}
+	proton.Init(*dataDir)
 	st, err := store.Open(filepath.Join(*dataDir, "namakani.db"))
 	if err != nil {
 		log.Fatalf("open store: %v", err)

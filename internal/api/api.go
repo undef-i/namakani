@@ -22,8 +22,10 @@ import (
 
 	"namakani/internal/auth"
 	"namakani/internal/mail"
+	"namakani/internal/proton"
 	"namakani/internal/store"
 	syncmgr "namakani/internal/sync"
+	"namakani/internal/tuta"
 
 	"github.com/emersion/go-imap/v2"
 )
@@ -337,19 +339,23 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 type accountIn struct {
-	Label         string `json:"label"`
-	Email         string `json:"email"`
-	ImapHost      string `json:"imap_host"`
-	ImapPort      any    `json:"imap_port"`
-	ImapTLS       string `json:"imap_tls"`
-	SmtpHost      string `json:"smtp_host"`
-	SmtpPort      any    `json:"smtp_port"`
-	SmtpTLS       string `json:"smtp_tls"`
-	Username      string `json:"username"`
-	Password      string `json:"password"`
-	Signature     string `json:"signature"`
-	FromName      string `json:"from_name"`
-	TLSSkipVerify bool   `json:"tls_skip_verify"`
+	Label           string `json:"label"`
+	Email           string `json:"email"`
+	ImapHost        string `json:"imap_host"`
+	ImapPort        any    `json:"imap_port"`
+	ImapTLS         string `json:"imap_tls"`
+	SmtpHost        string `json:"smtp_host"`
+	SmtpPort        any    `json:"smtp_port"`
+	SmtpTLS         string `json:"smtp_tls"`
+	Username        string `json:"username"`
+	Password        string `json:"password"`
+	Signature       string `json:"signature"`
+	FromName        string `json:"from_name"`
+	TLSSkipVerify   bool   `json:"tls_skip_verify"`
+	Kind            string `json:"kind"`
+	TOTP            string `json:"totp"`
+	MailboxPassword string `json:"mailbox_password"`
+	CaptchaToken    string `json:"captcha_token"`
 }
 
 type accountOut struct {
@@ -366,6 +372,7 @@ type accountOut struct {
 	Signature     string `json:"signature"`
 	FromName      string `json:"from_name"`
 	TLSSkipVerify bool   `json:"tls_skip_verify"`
+	Kind          string `json:"kind"`
 }
 
 func validateAccount(in *accountIn, passwordRequired bool) (imapPort, smtpPort int, err error) {
@@ -393,7 +400,7 @@ func validateAccount(in *accountIn, passwordRequired bool) (imapPort, smtpPort i
 
 func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.st.DB.Query(`SELECT id, label, email, imap_host, imap_port, imap_tls,
-		smtp_host, smtp_port, smtp_tls, username, signature, from_name, tls_skip_verify FROM accounts ORDER BY sort, id`)
+		smtp_host, smtp_port, smtp_tls, username, signature, from_name, tls_skip_verify, kind FROM accounts ORDER BY sort, id`)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list failed")
 		return
@@ -403,7 +410,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var a accountOut
 		if err := rows.Scan(&a.ID, &a.Label, &a.Email, &a.ImapHost, &a.ImapPort, &a.ImapTLS,
-			&a.SmtpHost, &a.SmtpPort, &a.SmtpTLS, &a.Username, &a.Signature, &a.FromName, &a.TLSSkipVerify); err != nil {
+			&a.SmtpHost, &a.SmtpPort, &a.SmtpTLS, &a.Username, &a.Signature, &a.FromName, &a.TLSSkipVerify, &a.Kind); err != nil {
 			writeErr(w, http.StatusInternalServerError, "list failed")
 			return
 		}
@@ -417,6 +424,14 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	var in accountIn
 	if err := decodeJSON(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if in.Kind == "proton" {
+		s.createProtonAccount(w, key, &in)
+		return
+	}
+	if in.Kind == "tuta" {
+		s.createTutaAccount(w, key, &in)
 		return
 	}
 	imapPort, smtpPort, err := validateAccount(&in, true)
@@ -448,6 +463,14 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	var in accountIn
 	if err := decodeJSON(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if in.Kind == "proton" {
+		s.updateProtonAccount(w, r, key, &in)
+		return
+	}
+	if in.Kind == "tuta" {
+		s.updateTutaAccount(w, r, key, &in)
 		return
 	}
 	imapPort, smtpPort, err := validateAccount(&in, false)
@@ -499,13 +522,197 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *accountIn) {
+	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" || in.Password == "" {
+		writeErr(w, http.StatusBadRequest, "label, email and password are required")
+		return
+	}
+	bridgePassword, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken)
+	if err == proton.ErrTOTPRequired {
+		writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
+		return
+	}
+	var capErr *proton.CaptchaError
+	if errors.As(err, &capErr) {
+		writeJSON(w, http.StatusOK, map[string]any{"needs_captcha": true, "captcha_url": capErr.URL, "captcha_token": capErr.Token})
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	enc, err := auth.Encrypt(key, bridgePassword)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "encrypt failed")
+		return
+	}
+	username := in.Username
+	if username == "" {
+		username = in.Email
+	}
+	res, err := s.st.DB.Exec(`INSERT INTO accounts(label, email, imap_host, imap_port, imap_tls,
+		smtp_host, smtp_port, smtp_tls, username, enc_password, signature, from_name, tls_skip_verify, kind, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		in.Label, in.Email, "", 0, "none",
+		"", 0, "none", username, enc, in.Signature, in.FromName, false, "proton", time.Now().Unix())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "insert failed")
+		return
+	}
+	id, _ := res.LastInsertId()
+	s.startWorkerFor(id, key)
+	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+}
+
+func (s *Server) updateProtonAccount(w http.ResponseWriter, r *http.Request, key []byte, in *accountIn) {
+	id := r.PathValue("id")
+	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" {
+		writeErr(w, http.StatusBadRequest, "label and email are required")
+		return
+	}
+	username := in.Username
+	if username == "" {
+		username = in.Email
+	}
+	if in.Password != "" {
+		bridgePassword, err := proton.Authorize(in.Email, in.Password, in.MailboxPassword, in.TOTP, in.CaptchaToken)
+		if err == proton.ErrTOTPRequired {
+			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
+			return
+		}
+		var capErr *proton.CaptchaError
+		if errors.As(err, &capErr) {
+			writeJSON(w, http.StatusOK, map[string]any{"needs_captcha": true, "captcha_url": capErr.URL, "captcha_token": capErr.Token})
+			return
+		}
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		enc, err := auth.Encrypt(key, bridgePassword)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "encrypt failed")
+			return
+		}
+		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, enc_password=?, signature=?, from_name=? WHERE id=?`,
+			in.Label, in.Email, username, enc, in.Signature, in.FromName, id)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "update failed")
+			return
+		}
+	} else {
+		_, err := s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, signature=?, from_name=? WHERE id=?`,
+			in.Label, in.Email, username, in.Signature, in.FromName, id)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "update failed")
+			return
+		}
+	}
+	if idNum, err := strconv.ParseInt(id, 10, 64); err == nil {
+		s.mgr.Stop(idNum)
+		s.startWorkerFor(idNum, key)
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accountIn) {
+	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" || in.Password == "" {
+		writeErr(w, http.StatusBadRequest, "label, email and password are required")
+		return
+	}
+	userID, accessToken, err := tuta.Authorize(in.Email, in.Password, in.TOTP)
+	if err == tuta.ErrTOTPRequired {
+		writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	enc, err := auth.Encrypt(key, in.Password)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "encrypt failed")
+		return
+	}
+	username := in.Username
+	if username == "" {
+		username = in.Email
+	}
+	res, err := s.st.DB.Exec(`INSERT INTO accounts(label, email, imap_host, imap_port, imap_tls,
+		smtp_host, smtp_port, smtp_tls, username, enc_password, signature, from_name, tls_skip_verify, kind, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		in.Label, in.Email, "", 0, "none",
+		"", 0, "none", username, enc, in.Signature, in.FromName, false, "tuta", time.Now().Unix())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "insert failed")
+		return
+	}
+	id, _ := res.LastInsertId()
+	if err := s.st.SaveTutaSession(id, userID, accessToken); err != nil {
+		writeErr(w, http.StatusInternalServerError, "session save failed")
+		return
+	}
+	s.startWorkerFor(id, key)
+	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
+}
+
+func (s *Server) updateTutaAccount(w http.ResponseWriter, r *http.Request, key []byte, in *accountIn) {
+	id := r.PathValue("id")
+	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" {
+		writeErr(w, http.StatusBadRequest, "label and email are required")
+		return
+	}
+	username := in.Username
+	if username == "" {
+		username = in.Email
+	}
+	idNum, _ := strconv.ParseInt(id, 10, 64)
+	if in.Password != "" {
+		userID, accessToken, err := tuta.Authorize(in.Email, in.Password, in.TOTP)
+		if err == tuta.ErrTOTPRequired {
+			writeJSON(w, http.StatusOK, map[string]bool{"needs_totp": true})
+			return
+		}
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		enc, err := auth.Encrypt(key, in.Password)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "encrypt failed")
+			return
+		}
+		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, enc_password=<redacted>, signature=?, from_name=? WHERE id=?`,
+			in.Label, in.Email, username, enc, in.Signature, in.FromName, id)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "update failed")
+			return
+		}
+		if idNum > 0 {
+			_ = s.st.SaveTutaSession(idNum, userID, accessToken)
+		}
+	} else {
+		_, err := s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, signature=?, from_name=? WHERE id=?`,
+			in.Label, in.Email, username, in.Signature, in.FromName, id)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "update failed")
+			return
+		}
+	}
+	if idNum > 0 {
+		s.mgr.Stop(idNum)
+		s.startWorkerFor(idNum, key)
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) loadMailAccount(id int64, key []byte) (mail.Account, error) {
 	var a mail.Account
 	var enc string
 	err := s.st.DB.QueryRow(`SELECT label, from_name, email, imap_host, imap_port, imap_tls,
-		smtp_host, smtp_port, smtp_tls, username, enc_password, tls_skip_verify FROM accounts WHERE id = ?`, id).
+		smtp_host, smtp_port, smtp_tls, username, enc_password, tls_skip_verify, kind FROM accounts WHERE id = ?`, id).
 		Scan(&a.Label, &a.FromName, &a.Email, &a.ImapHost, &a.ImapPort, &a.ImapTLS,
-			&a.SMTPHost, &a.SMTPPort, &a.SMTPTLS, &a.Username, &enc, &a.TLSSkipVerify)
+			&a.SMTPHost, &a.SMTPPort, &a.SMTPTLS, &a.Username, &enc, &a.TLSSkipVerify, &a.Kind)
 	if err != nil {
 		return a, err
 	}
@@ -557,17 +764,20 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	cl, err := mail.Connect(acct, nil)
+	var cl mail.Conn
+	if acct.Kind == "proton" {
+		cl, err = proton.Connect(s.st, acct)
+	} else if acct.Kind == "tuta" {
+		cl, err = tuta.Connect(s.st, acct)
+	} else {
+		cl, err = mail.Connect(acct, nil)
+	}
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	defer cl.Close()
-	caps := make([]string, 0, len(cl.Caps))
-	for cap := range cl.Caps {
-		caps = append(caps, string(cap))
-	}
-	sort.Strings(caps)
+	caps := cl.Capabilities()
 	folders, err := cl.ListFolders()
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
@@ -838,10 +1048,16 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *Server) openClient(key []byte, accountID int64) (*mail.Client, error) {
+func (s *Server) openConn(key []byte, accountID int64) (mail.Conn, error) {
 	acct, err := s.loadMailAccount(accountID, key)
 	if err != nil {
 		return nil, err
+	}
+	if acct.Kind == "proton" {
+		return proton.Connect(s.st, acct)
+	}
+	if acct.Kind == "tuta" {
+		return tuta.Connect(s.st, acct)
 	}
 	return mail.Connect(acct, nil)
 }
@@ -882,7 +1098,7 @@ func (s *Server) ensureBody(key []byte, messageID int64, route store.MessageRout
 		atts, err := s.st.ListAttachments(messageID)
 		return text, html, atts, err
 	}
-	cl, err := s.openClient(key, route.AccountID)
+	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
 		return "", "", nil, err
 	}
@@ -1018,7 +1234,7 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusInternalServerError, "route failed")
 		return
 	}
-	cl, err := s.openClient(key, route.AccountID)
+	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1080,7 +1296,7 @@ func (s *Server) handleSetFlags(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "flags failed")
 		return
 	}
-	cl, err := s.openClient(key, route.AccountID)
+	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1155,7 +1371,7 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	cl, err := s.openClient(key, route.AccountID)
+	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1207,7 +1423,7 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	var special string
 	_ = s.st.DB.QueryRow("SELECT special_use FROM folders WHERE id = ?", route.FolderID).Scan(&special)
 
-	cl, err := s.openClient(key, route.AccountID)
+	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -1325,7 +1541,7 @@ func (s *Server) handleMarkAllRead(w http.ResponseWriter, r *http.Request) {
 		if len(uids) == 0 {
 			continue
 		}
-		cl, err := s.openClient(key, fr.accountID)
+		cl, err := s.openConn(key, fr.accountID)
 		if err != nil {
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
@@ -1515,7 +1731,7 @@ func (s *Server) appendCopy(key []byte, accountID int64, special string,
 	if !ok {
 		return 0, fmt.Errorf("该账号没有 %s 文件夹", special)
 	}
-	cl, err := s.openClient(key, accountID)
+	cl, err := s.openConn(key, accountID)
 	if err != nil {
 		return 0, err
 	}
@@ -1548,12 +1764,52 @@ func (s *Server) appendCopy(key []byte, accountID int64, special string,
 	return id, nil
 }
 
+type uidAssigner interface {
+	AssignUID(folder, id string) (uint32, error)
+}
+
+func (s *Server) fileSentCopy(acct mail.Account, sess uidAssigner, sentID string, out *outgoing) (int64, error) {
+	folderID, folderName, ok, err := s.st.FolderBySpecial(acct.ID, "sent")
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, fmt.Errorf("该账号没有 %s 文件夹", "sent")
+	}
+	uid, err := sess.AssignUID(folderName, sentID)
+	if err != nil {
+		return 0, err
+	}
+	row := &store.MessageRow{
+		UID:       uid,
+		MessageID: out.messageID,
+		ThreadKey: s.st.ComputeThreadKey(acct.ID, out.messageID, out.inReplyTo),
+		Subject:   out.subject,
+		FromJSON:  mustJSON([]mail.Addr{out.from}),
+		ToJSON:    mustJSON(out.to),
+		CcJSON:    mustJSON(out.cc),
+		DateTS:    time.Now().Unix(),
+		Flags:     mail.FlagSeen,
+		Size:      int64(len(out.raw)),
+	}
+	id, _, err := s.st.UpsertMessage(acct.ID, folderID, row)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.st.SaveBody(id, out.text, out.html, mail.MakeSnippet(out.text, out.html)); err != nil {
+		return 0, err
+	}
+	_, _ = s.st.DB.Exec("UPDATE folders SET total = total + 1 WHERE id = ?", folderID)
+	_ = s.st.RefreshUnread(folderID)
+	return id, nil
+}
+
 func (s *Server) deleteMessageEverywhere(key []byte, messageID int64) error {
 	route, err := s.st.MessageRoute(messageID)
 	if err != nil {
 		return err
 	}
-	cl, err := s.openClient(key, route.AccountID)
+	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
 		return err
 	}
@@ -1579,13 +1835,42 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := mail.SendSMTP(out.acct, out.acct.Email, out.rcpts, out.raw); err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
+	var fileCopy func() (int64, error)
+	if out.acct.Kind == "proton" {
+		sess, err := proton.Connect(s.st, out.acct)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		sentProtonID, err := sess.SendRaw(out.raw)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		fileCopy = func() (int64, error) { return s.fileSentCopy(out.acct, sess, sentProtonID, out) }
+	} else if out.acct.Kind == "tuta" {
+		sess, err := tuta.Connect(s.st, out.acct)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		sentTutaID, err := sess.SendRaw(out.raw)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		fileCopy = func() (int64, error) { return s.fileSentCopy(out.acct, sess, sentTutaID, out) }
+	} else {
+		if err := mail.SendSMTP(out.acct, out.acct.Email, out.rcpts, out.raw); err != nil {
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		fileCopy = func() (int64, error) {
+			return s.appendCopy(key, req.AccountID, "sent", []imap.Flag{imap.FlagSeen}, mail.FlagSeen, out)
+		}
 	}
 	warnings := []string{}
-	if sentID, err := s.appendCopy(key, req.AccountID, "sent",
-		[]imap.Flag{imap.FlagSeen}, mail.FlagSeen, out); err != nil {
+	if sentID, err := fileCopy(); err != nil {
 		warnings = append(warnings, "邮件已发送，但存入「已发送」失败："+err.Error())
 	} else {
 		s.broadcastMessages([]int64{sentID})

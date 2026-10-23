@@ -196,7 +196,7 @@ func (m *Manager) folderMu(id int64) *sync.Mutex {
 	return mu
 }
 
-func (m *Manager) syncFolderLocked(cl *mail.Client, acct mail.Account, r folderRef) Change {
+func (m *Manager) syncFolderLocked(cl mail.Conn, acct mail.Account, r folderRef) Change {
 	mu := m.folderMu(r.id)
 	mu.Lock()
 	defer mu.Unlock()
@@ -208,6 +208,12 @@ func (m *Manager) syncFolderLocked(cl *mail.Client, acct mail.Account, r folderR
 }
 
 func (m *Manager) session(ctx context.Context, acct mail.Account) error {
+	if acct.Kind == "proton" {
+		return m.protonSession(ctx, acct)
+	}
+	if acct.Kind == "tuta" {
+		return m.tutaSession(ctx, acct)
+	}
 	wake := make(chan struct{}, 1)
 	notify := func() {
 		select {
@@ -490,7 +496,7 @@ func addrsJSON(addrs []mail.Addr) string {
 	return string(b)
 }
 
-func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64, name string) (Change, error) {
+func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, name string) (Change, error) {
 	m.mu.Lock()
 	live := m.live[acct.ID]
 	m.mu.Unlock()
@@ -525,9 +531,11 @@ func (m *Manager) syncFolder(cl *mail.Client, acct mail.Account, folderID int64,
 			if end >= uidNext {
 				end = uidNext - 1
 			}
-			set := imap.UIDSet{}
-			set.AddRange(imap.UID(start), imap.UID(end))
-			msgs, err := cl.FetchEnvelopes(set)
+			uids := make([]uint32, 0, end-start+1)
+			for u := start; u <= end; u++ {
+				uids = append(uids, u)
+			}
+			msgs, err := cl.FetchEnvelopes(uids)
 			if err != nil {
 				return change, fmt.Errorf("fetch envelopes %d:%d: %w", start, end, err)
 			}

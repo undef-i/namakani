@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/textproto"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ const (
 
 type Account struct {
 	ID            int64
+	Kind          string
 	Label         string
 	FromName      string
 	Email         string
@@ -177,12 +179,29 @@ func (cl *Client) ListFolders() ([]FolderInfo, error) {
 	return out, nil
 }
 
-func (cl *Client) Select(name string) (*imap.SelectData, error) {
-	return cl.c.Select(name, &imap.SelectOptions{ReadOnly: true}).Wait()
+func (cl *Client) Select(name string) (*SelectData, error) {
+	d, err := cl.c.Select(name, &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		return nil, err
+	}
+	return &SelectData{UIDValidity: d.UIDValidity, UIDNext: uint32(d.UIDNext), NumMessages: d.NumMessages}, nil
 }
 
-func (cl *Client) SelectRW(name string) (*imap.SelectData, error) {
-	return cl.c.Select(name, &imap.SelectOptions{ReadOnly: false}).Wait()
+func (cl *Client) SelectRW(name string) (*SelectData, error) {
+	d, err := cl.c.Select(name, &imap.SelectOptions{ReadOnly: false}).Wait()
+	if err != nil {
+		return nil, err
+	}
+	return &SelectData{UIDValidity: d.UIDValidity, UIDNext: uint32(d.UIDNext), NumMessages: d.NumMessages}, nil
+}
+
+func (cl *Client) Capabilities() []string {
+	out := make([]string, 0, len(cl.Caps))
+	for cap := range cl.Caps {
+		out = append(out, string(cap))
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (cl *Client) FetchRaw(uid uint32) ([]byte, error) {
@@ -462,7 +481,11 @@ func (cl *Client) fetch(uids imap.UIDSet, opts *imap.FetchOptions) ([]Msg, error
 	return out, nil
 }
 
-func (cl *Client) FetchEnvelopes(uids imap.UIDSet) ([]Msg, error) {
+func (cl *Client) FetchEnvelopes(uids []uint32) ([]Msg, error) {
+	set := imap.UIDSet{}
+	for _, u := range uids {
+		set.AddNum(imap.UID(u))
+	}
 	opts := &imap.FetchOptions{
 		UID:           true,
 		Envelope:      true,
@@ -474,7 +497,7 @@ func (cl *Client) FetchEnvelopes(uids imap.UIDSet) ([]Msg, error) {
 	if cl.HasCap(imap.CapCondStore) {
 		opts.ModSeq = true
 	}
-	return cl.fetch(uids, opts)
+	return cl.fetch(set, opts)
 }
 
 func (cl *Client) FetchFlags(changedSince uint64) ([]Msg, error) {

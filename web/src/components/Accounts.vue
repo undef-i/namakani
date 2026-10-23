@@ -81,6 +81,10 @@ const emptyForm = () => ({
   signature: '',
   from_name: '',
   tls_skip_verify: false,
+  kind: 'imap',
+  totp: '',
+  mailbox_password: '',
+  captcha_token: '',
 })
 
 const tlsItems = computed(() => [
@@ -93,6 +97,9 @@ const dialogOpen = ref(false)
 const editing = ref(null)
 const form = ref(emptyForm())
 const formError = ref('')
+const needsTotp = ref(false)
+const needsCaptcha = ref(false)
+const captchaUrl = ref('')
 const deleteTarget = ref(null)
 const deleteOpen = ref(false)
 const testState = reactive({})
@@ -101,13 +108,19 @@ function openCreate() {
   editing.value = null
   form.value = emptyForm()
   formError.value = ''
+  needsTotp.value = false
+  needsCaptcha.value = false
+  captchaUrl.value = ''
   dialogOpen.value = true
 }
 
 function openEdit(a) {
   editing.value = a.id
-  form.value = { ...a, password: '' }
+  form.value = { ...emptyForm(), ...a, password: '' }
   formError.value = ''
+  needsTotp.value = false
+  needsCaptcha.value = false
+  captchaUrl.value = ''
   dialogOpen.value = true
 }
 
@@ -120,8 +133,21 @@ async function save() {
   }
   delete payload.id
   try {
-    if (editing.value) await api.updateAccount(editing.value, payload)
-    else await api.createAccount(payload)
+    const res = editing.value
+      ? await api.updateAccount(editing.value, payload)
+      : await api.createAccount(payload)
+    if (res && res.needs_captcha) {
+      if (form.value.captcha_token) showSnack(t('验证已过期，已生成新的验证链接'))
+      form.value.captcha_token = res.captcha_token
+      captchaUrl.value = res.captcha_url
+      needsCaptcha.value = true
+      return
+    }
+    if (res && res.needs_totp) {
+      needsTotp.value = true
+      formError.value = t('该账号开启了两步验证，请输入验证码')
+      return
+    }
     dialogOpen.value = false
     emit('changed')
   } catch (err) {
@@ -466,7 +492,9 @@ onMounted(() => {
             <v-btn icon="mdi-pencil" variant="text" size="small" :title="t('编辑')" @click="openEdit(a)" />
             <v-btn icon="mdi-delete" variant="text" size="small" :title="t('删除')" @click="askDelete(a)" />
           </div>
-          <div class="text-body-2 text-medium-emphasis mt-2" style="overflow-wrap: anywhere">
+          <div v-if="a.kind === 'proton'" class="text-body-2 text-medium-emphasis mt-2">Proton Mail</div>
+          <div v-if="a.kind === 'tuta'" class="text-body-2 text-medium-emphasis mt-2">Tuta Mail</div>
+          <div v-else class="text-body-2 text-medium-emphasis mt-2" style="overflow-wrap: anywhere">
             IMAP {{ a.imap_host }}:{{ a.imap_port }} ({{ a.imap_tls }}){{ t('，') }}SMTP {{ a.smtp_host }}:{{ a.smtp_port }} ({{ a.smtp_tls }})
           </div>
           <div
@@ -715,13 +743,18 @@ onMounted(() => {
       <v-card-title>{{ editing ? t('编辑账号') : t('添加账号') }}</v-card-title>
       <v-card-text>
         <v-form @submit.prevent="save">
+          <v-btn-toggle v-model="form.kind" mandatory :disabled="!!editing" color="primary" density="compact" class="mb-3">
+            <v-btn value="imap">{{ t('IMAP/SMTP') }}</v-btn>
+            <v-btn value="proton">Proton Mail</v-btn>
+            <v-btn value="tuta">Tuta Mail</v-btn>
+          </v-btn-toggle>
           <v-text-field v-model="form.label" :label="t('名称')" variant="outlined" density="comfortable" :placeholder="t('如 工作邮箱')" required class="mb-2" />
           <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="outlined" density="comfortable" required class="mb-2" />
           <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="outlined" density="comfortable" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
-          <v-text-field v-model="form.username" :label="t('用户名')" variant="outlined" density="comfortable" required class="mb-2" />
+          <v-text-field v-if="form.kind === 'imap'" v-model="form.username" :label="t('用户名')" variant="outlined" density="comfortable" required class="mb-2" />
           <v-text-field
             v-model="form.password"
-            :label="t('密码')"
+            :label="form.kind === 'proton' ? t('Proton Mail 登录密码') : form.kind === 'tuta' ? t('Tuta Mail 登录密码') : t('密码')"
             type="password"
             variant="outlined"
             density="comfortable"
@@ -729,6 +762,30 @@ onMounted(() => {
             :required="!editing"
             class="mb-2"
           />
+          <v-text-field
+            v-if="form.kind === 'proton'"
+            v-model="form.mailbox_password"
+            :label="t('邮箱密码（可选）')"
+            type="password"
+            variant="outlined"
+            density="comfortable"
+            :placeholder="t('留空 = 与登录密码相同')"
+            class="mb-2"
+          />
+          <v-text-field
+            v-if="(form.kind === 'proton' || form.kind === 'tuta') && needsTotp"
+            v-model="form.totp"
+            :label="t('两步验证码')"
+            variant="outlined"
+            density="comfortable"
+            class="mb-2"
+          />
+          <div v-if="form.kind === 'proton' && needsCaptcha" class="d-flex flex-column flex-sm-row align-stretch align-sm-center ga-2 mb-2">
+            <v-btn :href="captchaUrl" target="_blank" rel="noopener" color="primary" variant="tonal" prepend-icon="mdi-open-in-new">
+              {{ t('打开人机验证') }}
+            </v-btn>
+            <v-btn variant="outlined" @click="save">{{ t('已完成验证') }}</v-btn>
+          </div>
           <v-textarea
             v-model="form.signature"
             :label="t('签名（纯文本，写信时自动加到正文末尾）')"
@@ -737,7 +794,7 @@ onMounted(() => {
             rows="3"
             class="mb-2"
           />
-          <v-row dense class="mb-2">
+          <v-row v-if="form.kind === 'imap'" dense class="mb-2">
             <v-col cols="12" sm="6">
               <v-text-field v-model="form.imap_host" :label="t('IMAP 服务器')" variant="outlined" density="comfortable" placeholder="imap.example.com" required hide-details />
             </v-col>
@@ -757,7 +814,7 @@ onMounted(() => {
               <v-select v-model="form.smtp_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
             </v-col>
           </v-row>
-          <v-switch v-model="form.tls_skip_verify" :label="t('跳过证书校验')" color="primary" hide-details class="mb-2" />
+          <v-switch v-if="form.kind === 'imap'" v-model="form.tls_skip_verify" :label="t('跳过证书校验')" color="primary" hide-details class="mb-2" />
           <v-alert v-if="formError" type="error" variant="tonal" density="compact">{{ formError }}</v-alert>
         </v-form>
       </v-card-text>

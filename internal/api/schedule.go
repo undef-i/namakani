@@ -11,6 +11,8 @@ import (
 
 	"namakani/internal/auth"
 	"namakani/internal/mail"
+	"namakani/internal/proton"
+	"namakani/internal/tuta"
 
 	"github.com/emersion/go-imap/v2"
 )
@@ -250,13 +252,42 @@ func (s *Server) fireScheduled(key []byte, id int64) {
 		mark("failed", err.Error())
 		return
 	}
-	if err := mail.SendSMTP(out.acct, out.acct.Email, out.rcpts, out.raw); err != nil {
-		mark("failed", err.Error())
-		return
+	var fileCopy func() (int64, error)
+	if out.acct.Kind == "proton" {
+		sess, err := proton.Connect(s.st, out.acct)
+		if err != nil {
+			mark("failed", err.Error())
+			return
+		}
+		sentProtonID, err := sess.SendRaw(out.raw)
+		if err != nil {
+			mark("failed", err.Error())
+			return
+		}
+		fileCopy = func() (int64, error) { return s.fileSentCopy(out.acct, sess, sentProtonID, out) }
+	} else if out.acct.Kind == "tuta" {
+		sess, err := tuta.Connect(s.st, out.acct)
+		if err != nil {
+			mark("failed", err.Error())
+			return
+		}
+		sentTutaID, err := sess.SendRaw(out.raw)
+		if err != nil {
+			mark("failed", err.Error())
+			return
+		}
+		fileCopy = func() (int64, error) { return s.fileSentCopy(out.acct, sess, sentTutaID, out) }
+	} else {
+		if err := mail.SendSMTP(out.acct, out.acct.Email, out.rcpts, out.raw); err != nil {
+			mark("failed", err.Error())
+			return
+		}
+		fileCopy = func() (int64, error) {
+			return s.appendCopy(key, req.AccountID, "sent", []imap.Flag{imap.FlagSeen}, mail.FlagSeen, out)
+		}
 	}
 	note := ""
-	if sentID, err := s.appendCopy(key, req.AccountID, "sent",
-		[]imap.Flag{imap.FlagSeen}, mail.FlagSeen, out); err != nil {
+	if sentID, err := fileCopy(); err != nil {
 		note = "邮件已发送，但存入「已发送」失败：" + err.Error()
 	} else {
 		s.broadcastMessages([]int64{sentID})
