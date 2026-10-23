@@ -6,7 +6,7 @@ import (
 
 func TestRichBlocksWithSnippet(t *testing.T) {
 	it := tgItem{ID: 42, Subject: "Hello", From: "A <a@b.c>", Account: "acc@x.y", Snippet: "preview text"}
-	blocks := tgRichBlocks(it, "https://t.me/testbot?startapp=42")
+	blocks := tgRichBlocks(it)
 	if len(blocks) != 3 {
 		t.Fatalf("blocks=%d want 3", len(blocks))
 	}
@@ -18,13 +18,9 @@ func TestRichBlocksWithSnippet(t *testing.T) {
 	if !ok || len(headParts) != 1 {
 		t.Fatalf("head text shape: %#v", head["text"])
 	}
-	link, ok := headParts[0].(map[string]any)
-	if !ok || link["type"] != "url" || link["url"] != "https://t.me/testbot?startapp=42" {
-		t.Fatalf("bad title link: %#v", headParts[0])
-	}
-	bold, ok := link["text"].(map[string]any)
+	bold, ok := headParts[0].(map[string]any)
 	if !ok || bold["type"] != "bold" || bold["text"] != "Hello" {
-		t.Fatalf("bad title text: %#v", link["text"])
+		t.Fatalf("bad title text: %#v", headParts[0])
 	}
 	footer, ok := blocks[2].(map[string]any)
 	if !ok || footer["type"] != "footer" {
@@ -43,18 +39,9 @@ func TestRichBlocksWithSnippet(t *testing.T) {
 	}
 }
 
-func TestTitleLink(t *testing.T) {
-	if got := tgTitleLink("testbot", 42); got != "https://t.me/testbot?startapp=42" {
-		t.Fatalf("title link=%q", got)
-	}
-	if got := tgTitleLink("", 42); got != "https://namakani.example.com/#/mail/42" {
-		t.Fatalf("title link without username=%q", got)
-	}
-}
-
 func TestRichBlocksEmptySnippet(t *testing.T) {
 	it := tgItem{ID: 1, Subject: "S", From: "F", Account: "acc@x.y"}
-	blocks := tgRichBlocks(it, "https://t.me/testbot?startapp=1")
+	blocks := tgRichBlocks(it)
 	footer := blocks[2].(map[string]any)
 	if footer["text"] != "acc@x.y" {
 		t.Fatalf("footer text=%#v want plain account", footer["text"])

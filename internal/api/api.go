@@ -44,12 +44,10 @@ type Server struct {
 	loginLastFail time.Time
 	tgSeenMu      sync.Mutex
 	tgSeen        map[string]tgChat
-	tgBotMu       sync.Mutex
-	tgBotUser     map[string]string
 }
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
-	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), tgBotUser: make(map[string]string)}
+	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat)}
 	go s.tgSupervise()
 	go s.scheduleLoop()
 	if key, err := auth.LoadOrCreateServerKey(filepath.Join(st.DataDir(), "server.key")); err == nil {
