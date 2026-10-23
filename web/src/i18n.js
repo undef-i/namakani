@@ -35,6 +35,8 @@ const en = {
   搜索主题: 'Search subject, sender, body',
   '搜索主题、发件人、正文': 'Search subject, sender, body',
   清除搜索: 'Clear search',
+  搜索中: 'Searching',
+  'Telegram 登录失败：{error}': 'Telegram sign-in failed: {error}',
   写信: 'Compose',
   '文件夹加载失败：{error}': 'Failed to load folders: {error}',
   '暂无文件夹（同步后出现）': 'No folders yet (they appear after sync)',

@@ -420,6 +420,16 @@ func (s *Server) tgPushOne(cfg tgConfig, it tgItem) {
 	_, err := tgCall(cfg.Token, "sendRichMessage", map[string]any{
 		"chat_id":      cfg.ChatID,
 		"rich_message": map[string]any{"blocks": tgRichBlocks(it)},
+		"reply_markup": map[string]any{
+			"inline_keyboard": [][]any{
+				{
+					map[string]any{
+						"text":    "打开邮件",
+						"web_app": map[string]any{"url": tgDeepLink(it.ID)},
+					},
+				},
+			},
+		},
 	})
 	if err != nil {
 		log.Printf("namakani: telegram rich push failed: %v", err)

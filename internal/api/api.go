@@ -93,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings/telegram", s.authOnly(s.handlePutTelegram))
 	mux.HandleFunc("POST /api/settings/telegram/discover", s.authOnly(s.handleTelegramDiscover))
 	mux.HandleFunc("POST /api/settings/telegram/test", s.authOnly(s.handleTelegramTest))
+	mux.HandleFunc("POST /api/telegram/webapp-auth", s.handleTelegramWebAppAuth)
 	mux.HandleFunc("GET /api/settings/webpush", s.authOnly(s.handleGetWebPush))
 	mux.HandleFunc("POST /api/settings/webpush/test", s.authOnly(s.handleWebPushTest))
 	mux.HandleFunc("POST /api/push/subscribe", s.authOnly(s.handlePushSubscribe))

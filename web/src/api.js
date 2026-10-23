@@ -38,6 +38,7 @@ export const saveTelegram = (b) =>
   req('/api/settings/telegram', { method: 'PUT', body: JSON.stringify(b) })
 export const discoverTelegram = (bot_token) => post('/api/settings/telegram/discover', { bot_token })
 export const testTelegram = (b) => post('/api/settings/telegram/test', b)
+export const telegramWebAppAuth = (initData) => post('/api/telegram/webapp-auth', { init_data: initData })
 export const getWebPush = () => req('/api/settings/webpush')
 export const testWebPush = () => post('/api/settings/webpush/test')
 export const subscribePush = (sub) => post('/api/push/subscribe', sub)

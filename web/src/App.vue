@@ -22,11 +22,11 @@ const theme = useTheme()
 const vuetifyLocale = useLocale()
 watch(lang, (v) => (vuetifyLocale.current.value = v === 'zh' ? 'zhHans' : 'en'), { immediate: true })
 const lgAndUp = computed(() => display.lgAndUp.value)
-const wideLayout = computed(() => display.width.value >= 1440)
 
 const view = ref('loading')
 const appVersion = ref('')
 const bootError = ref('')
+const tgAuthError = ref('')
 const authMode = ref('login')
 const accounts = ref([])
 const accountsStatus = ref('loading')
@@ -36,6 +36,26 @@ const foldersError = ref('')
 const messages = ref([])
 const listStatus = ref('loading')
 const listError = ref('')
+const listSnap = ref({ kind: 'folder', scope: 'inbox' })
+const listBusy = ref(false)
+let listGen = 0
+const tombstones = new Map()
+
+function snapCtxKey(snap) {
+  return snap.kind === 'search' ? 'search|' + snap.query : 'folder|' + snap.scope
+}
+
+function dropTombstoned(batch, snap) {
+  const ctx = snapCtxKey(snap)
+  return batch.filter((m) => tombstones.get(m.id) !== ctx)
+}
+
+function clearTombstonesFor(snap) {
+  const ctx = snapCtxKey(snap)
+  for (const [id, c] of tombstones) {
+    if (c === ctx) tombstones.delete(id)
+  }
+}
 const statuses = ref({})
 const settingsOpen = ref(location.hash === '#/settings')
 const scope = ref('inbox')
@@ -131,7 +151,9 @@ function enrichSelected(d) {
   }
 }
 
-const scopeLabel = computed(() => SCOPES.value.find((s) => s.key === scope.value)?.label ?? scope.value)
+const snapScopeLabel = computed(
+  () => SCOPES.value.find((s) => s.key === listSnap.value.scope)?.label ?? listSnap.value.scope,
+)
 const scopeStats = computed(() => {
   const map = {}
   for (const f of folders.value) {
@@ -237,6 +259,11 @@ function fmtAddrList(list) {
 
 
 async function loadMessages(soft = false) {
+  const target = searching.value
+    ? { kind: 'search', query: searchQuery.value.trim() }
+    : { kind: 'folder', scope: scope.value }
+  const gen = ++listGen
+  listBusy.value = true
   const keepReady = soft && listStatus.value === 'ready'
   if (!keepReady) listStatus.value = 'loading'
   listError.value = ''
@@ -246,17 +273,25 @@ async function loadMessages(soft = false) {
   convoDetails.value = {}
   cursorIdx.value = 0
   try {
-    if (searching.value) {
-      messages.value = await api.searchMessages(searchQuery.value)
+    let batch
+    if (target.kind === 'search') {
+      batch = await api.searchMessages(target.query)
+    } else {
+      batch = await api.getMessages(target.scope, 0, PAGE_SIZE, threaded.value)
+    }
+    if (gen !== listGen) return
+    messages.value = dropTombstoned(batch, target)
+    clearTombstonesFor(target)
+    if (target.kind === 'search') {
       listHasMore.value = false
     } else {
-      const batch = await api.getMessages(scope.value, 0, PAGE_SIZE, threaded.value)
-      messages.value = batch
       listOffset = batch.length
       listHasMore.value = batch.length === PAGE_SIZE
     }
+    listSnap.value = target
     listStatus.value = 'ready'
   } catch (err) {
+    if (gen !== listGen) return
     if (keepReady) {
       listStatus.value = 'ready'
       return
@@ -265,16 +300,23 @@ async function loadMessages(soft = false) {
     listHasMore.value = false
     listStatus.value = 'error'
     listError.value = err.message
+  } finally {
+    if (gen === listGen) listBusy.value = false
   }
 }
 
 async function loadMore() {
   if (searching.value || listStatus.value !== 'ready' || loadingMore.value || !listHasMore.value) return
   loadingMore.value = true
+  const gen = listGen
   try {
     const batch = await api.getMessages(scope.value, listOffset, PAGE_SIZE, threaded.value)
+    if (gen !== listGen) return
     const seen = new Set(messages.value.map((m) => m.id))
-    messages.value = [...messages.value, ...batch.filter((m) => !seen.has(m.id))]
+    messages.value = [
+      ...messages.value,
+      ...dropTombstoned(batch, listSnap.value).filter((m) => !seen.has(m.id)),
+    ]
     listOffset += batch.length
     listHasMore.value = batch.length === PAGE_SIZE
   } catch {
@@ -285,12 +327,17 @@ async function loadMore() {
 
 async function reloadLoaded() {
   if (searching.value || listStatus.value === 'loading') return
+  const gen = ++listGen
   try {
     const n = Math.max(PAGE_SIZE, messages.value.length)
     const batch = await api.getMessages(scope.value, 0, n, threaded.value)
-    messages.value = batch
+    if (gen !== listGen) return
+    const snap = { kind: 'folder', scope: scope.value }
+    messages.value = dropTombstoned(batch, snap)
+    clearTombstonesFor(snap)
     listOffset = batch.length
     listHasMore.value = batch.length === n
+    listSnap.value = snap
   } catch {
   }
 }
@@ -535,6 +582,8 @@ async function settleSwipe(m, action) {
 
 function onSearchInput() {
   clearTimeout(searchTimer)
+  listGen++
+  listBusy.value = true
   searchTimer = setTimeout(() => {
     searching.value = searchQuery.value.trim().length > 0
     clearSelection()
@@ -543,6 +592,7 @@ function onSearchInput() {
 }
 
 function clearSearch() {
+  clearTimeout(searchTimer)
   searchQuery.value = ''
   searching.value = false
   loadMessages(true)
@@ -550,7 +600,7 @@ function clearSearch() {
 
 function openCompose(init) {
   composeInit.value = init
-  drawerOpen.value = false
+  if (!lgAndUp.value) drawerOpen.value = false
   composeOpen.value = true
 }
 
@@ -611,6 +661,7 @@ function rowMatchesScope(item) {
 }
 
 function insertFlat(item) {
+  if (tombstones.get(item.id) === snapCtxKey(listSnap.value)) return
   const i = messages.value.findIndex((m) => m.id === item.id)
   if (i >= 0) {
     messages.value[i] = { ...messages.value[i], ...item }
@@ -622,6 +673,7 @@ function insertFlat(item) {
 }
 
 function insertThreaded(item) {
+  if (tombstones.get(item.id) === snapCtxKey(listSnap.value)) return
   const key = item.thread_key || 'id:' + item.id
   const i = messages.value.findIndex(
     (m) => m.account_id === item.account_id && (m.thread_key || 'id:' + m.id) === key,
@@ -764,7 +816,7 @@ function disconnectEvents() {
 function selectScope(key) {
   scope.value = key
   clearSelection()
-  drawerOpen.value = false
+  if (!lgAndUp.value) drawerOpen.value = false
   searchQuery.value = ''
   searching.value = false
   loadMessages()
@@ -1145,6 +1197,8 @@ function forwardSelected() {
 }
 
 function afterRemoval(id) {
+  tombstones.set(id, snapCtxKey(listSnap.value))
+  listGen++
   if (convo.value) {
     const left = convo.value.msgs.filter((m) => m.id !== id)
     if (left.length === 0) {
@@ -1303,10 +1357,11 @@ function menuRipple(e) {
 }
 
 function toggleDrawer() {
+  if (lgAndUp.value) return
   drawerOpen.value = !drawerOpen.value
 }
-watch(wideLayout, (w) => {
-  drawerOpen.value = w
+watch(lgAndUp, (up) => {
+  drawerOpen.value = up
 }, { immediate: true })
 
 let readerTouch = null
@@ -1334,7 +1389,7 @@ function onReaderTouchEnd(e) {
 
 function openAccounts() {
   openSettings()
-  drawerOpen.value = false
+  if (!lgAndUp.value) drawerOpen.value = false
 }
 
 async function enter() {
@@ -1356,8 +1411,21 @@ async function enter() {
 async function boot() {
   view.value = 'loading'
   try {
-    const st = await api.getState()
+    let st = await api.getState()
     appVersion.value = st.version || ''
+    if (st.setup && !st.authed) {
+      const tg = window.Telegram?.WebApp
+      if (tg?.initData) {
+        tg.ready()
+        try {
+          await api.telegramWebAppAuth(tg.initData)
+          st = await api.getState()
+          appVersion.value = st.version || ''
+        } catch (err) {
+          tgAuthError.value = err.message
+        }
+      }
+    }
     if (!st.setup) {
       authMode.value = 'setup'
       view.value = 'auth'
@@ -1432,13 +1500,24 @@ onBeforeUnmount(() => {
       </v-alert>
     </div>
 
-    <Auth v-else-if="view === 'auth'" :mode="authMode" @authed="enter" />
+    <template v-else-if="view === 'auth'">
+      <v-alert
+        v-if="tgAuthError"
+        type="error"
+        variant="tonal"
+        density="compact"
+        class="tg-auth-alert"
+      >
+        {{ t('Telegram 登录失败：{error}', { error: tgAuthError }) }}
+      </v-alert>
+      <Auth :mode="authMode" @authed="enter" />
+    </template>
 
     <template v-else>
       <v-app-bar height="64" flat>
-        <div class="appbar-search" :class="{ 'search-after-drawer': wideLayout && drawerOpen }">
+        <div class="appbar-search">
           <div class="search-wrap">
-            <button type="button" class="search-menu-btn" :aria-label="t('展开菜单')" @pointerdown="menuRipple" @click="toggleDrawer">
+            <button v-if="!lgAndUp" type="button" class="search-menu-btn" :aria-label="t('展开菜单')" @pointerdown="menuRipple" @click="toggleDrawer">
               <v-icon icon="mdi-menu" size="22" />
             </button>
             <v-text-field
@@ -1468,12 +1547,26 @@ onBeforeUnmount(() => {
 
       <v-navigation-drawer
         v-model="drawerOpen"
-        :permanent="wideLayout"
-        :temporary="!wideLayout"
+        :permanent="lgAndUp"
+        :temporary="!lgAndUp"
+        :rail="lgAndUp"
+        rail-width="56"
         width="280"
       >
         <div class="d-flex flex-column pa-3 drawer-inner">
           <v-btn
+            v-if="lgAndUp"
+            color="primary"
+            icon="mdi-pencil"
+            rounded="xl"
+            size="small"
+            class="mb-4 align-self-center"
+            style="flex: none"
+            :aria-label="t('写信')"
+            @click="openCompose({})"
+          />
+          <v-btn
+            v-else
             color="primary"
             block
             rounded="xl"
@@ -1489,7 +1582,7 @@ onBeforeUnmount(() => {
             <v-skeleton-loader type="list-item@3" />
           </template>
           <template v-else-if="foldersStatus === 'error'">
-            <p class="text-body-2 text-error px-1">
+            <p v-if="!lgAndUp" class="text-body-2 text-error px-1">
               {{ t('文件夹加载失败：{error}', { error: foldersError }) }}
               <v-btn variant="text" size="small" @click="loadFolders">{{ t('重试') }}</v-btn>
             </p>
@@ -1499,13 +1592,24 @@ onBeforeUnmount(() => {
               <v-list-item
                 v-for="s in visibleScopes"
                 :key="s.key"
-                :prepend-icon="s.icon"
                 :title="s.label"
                 :active="scope === s.key"
                 rounded="pill"
                 @click="selectScope(s.key)"
               >
-                <template #append>
+                <template #prepend>
+                  <v-badge
+                    v-if="lgAndUp"
+                    :model-value="scopeStats[s.key].unread > 0"
+                    :content="scopeStats[s.key].unread"
+                    color="primary"
+                    location="top end"
+                  >
+                    <v-icon :icon="s.icon" />
+                  </v-badge>
+                  <v-icon v-else :icon="s.icon" />
+                </template>
+                <template v-if="!lgAndUp" #append>
                   <v-badge
                     v-if="scopeStats[s.key].unread > 0"
                     :content="scopeStats[s.key].unread"
@@ -1515,7 +1619,7 @@ onBeforeUnmount(() => {
                 </template>
               </v-list-item>
             </v-list>
-            <p v-if="visibleScopes.length === 0" class="text-body-2 text-medium-emphasis px-1">
+            <p v-if="visibleScopes.length === 0 && !lgAndUp" class="text-body-2 text-medium-emphasis px-1">
               {{ t('暂无文件夹（同步后出现）') }}
             </p>
           </template>
@@ -1541,16 +1645,20 @@ onBeforeUnmount(() => {
           <section class="list-section">
             <div class="d-flex align-center ga-1 px-2 py-2 border-b">
               <h1 class="text-body-1 font-weight-bold text-truncate px-1">
-                {{ searching ? t('搜索结果') : scopeLabel }}
+                {{ listSnap.kind === 'search' ? t('搜索结果') : snapScopeLabel }}
               </h1>
-              <span v-if="searching && listStatus === 'ready'" class="text-caption text-medium-emphasis">
+              <span v-if="listBusy" class="text-caption text-medium-emphasis d-flex align-center ga-1 text-no-wrap">
+                <v-progress-circular indeterminate size="14" width="2" />
+                <template v-if="searchQuery.trim()">{{ t('搜索中') }}</template>
+              </span>
+              <span v-else-if="listSnap.kind === 'search' && listStatus === 'ready'" class="text-caption text-medium-emphasis">
                 {{ t('{n} 封', { n: messages.length }) }}
               </span>
               <span
-                v-else-if="!searching && foldersStatus === 'ready' && scopeStats[scope]"
+                v-else-if="listSnap.kind === 'folder' && foldersStatus === 'ready' && scopeStats[listSnap.scope]"
                 class="text-caption text-medium-emphasis text-no-wrap"
               >
-                {{ t('{n} 封', { n: scopeStats[scope].total }) }}<template v-if="scopeStats[scope].unread">{{ t('（{n} 未读）', { n: scopeStats[scope].unread }) }}</template>
+                {{ t('{n} 封', { n: scopeStats[listSnap.scope].total }) }}<template v-if="scopeStats[listSnap.scope].unread">{{ t('（{n} 未读）', { n: scopeStats[listSnap.scope].unread }) }}</template>
               </span>
             </div>
             <div v-if="actionError" class="px-3 py-1 text-caption text-error border-b">{{ actionError }}</div>
@@ -1605,7 +1713,7 @@ onBeforeUnmount(() => {
               </template>
               <template v-else-if="messages.length === 0">
                 <p class="pa-6 text-body-2 text-medium-emphasis">
-                  {{ searching ? t('没有找到匹配的邮件。') : t('这里还没有邮件。添加账号后会自动同步进来。') }}
+                  {{ listSnap.kind === 'search' ? t('没有找到匹配的邮件。') : t('这里还没有邮件。添加账号后会自动同步进来。') }}
                 </p>
               </template>
               <template v-else>
@@ -1660,11 +1768,11 @@ onBeforeUnmount(() => {
                       <div class="text-body-2 text-truncate" :class="{ 'font-weight-bold': !(m.flags & 1) }">
                         {{ m.subject || t('(无主题)') }}
                       </div>
-                      <div class="text-caption text-medium-emphasis text-truncate">
-                        {{ m.account_label }}<template v-if="searching">{{ t('，') }}{{ m.folder_name }}</template>
-                      </div>
                       <div v-if="m.snippet" class="text-caption text-medium-emphasis text-truncate">
                         {{ m.snippet }}
+                      </div>
+                      <div class="text-caption text-medium-emphasis text-truncate">
+                        {{ m.account_label }}<template v-if="searching">{{ t('，') }}{{ m.folder_name }}</template>
                       </div>
                     </div>
                   </div>
@@ -2032,6 +2140,15 @@ body {
   align-items: center;
   justify-content: center;
 }
+.tg-auth-alert {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  width: calc(100% - 32px);
+  max-width: 440px;
+}
 .drawer-inner {
   min-height: 100%;
 }
@@ -2043,6 +2160,23 @@ body {
   height: calc(100dvh - 64px);
   width: 100%;
   overflow: hidden;
+}
+@media (min-width: 1280px) {
+  .v-application__wrap {
+    height: 100dvh;
+    max-height: 100dvh;
+    overflow: hidden;
+  }
+  .v-main {
+    min-height: 0;
+    overflow: hidden;
+  }
+  .reader-section {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
 }
 .search-wrap {
   position: relative;
@@ -2105,10 +2239,14 @@ body {
     width: 380px;
   }
 }
-@media (min-width: 1440px) {
-  .appbar-search.search-after-drawer {
-    margin-inline-start: 280px;
+@media (min-width: 1280px) {
+  .search-field .v-field__input {
+    padding-inline-start: 16px;
   }
+}
+.v-navigation-drawer--rail .drawer-inner {
+  padding: 8px;
+  align-items: center;
 }
 .list-section {
   display: flex;
@@ -2165,6 +2303,9 @@ body {
   inset: 0;
   z-index: 2000;
   background: rgb(var(--v-theme-surface));
+}
+.v-navigation-drawer--temporary {
+  z-index: 2000 !important;
 }
 @media (min-width: 1440px) {
   .reader-scroll > * {
