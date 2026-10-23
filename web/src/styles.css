@@ -1,0 +1,18 @@
+:root {
+  --wm-font: Roboto, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --wm-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+html,
+body,
+.v-application {
+  font-family: var(--wm-font);
+}
+
+.v-application {
+  --v-border-color: var(--v-theme-outline-variant);
+}
+
+.avatar-letter {
+  color: rgba(20, 22, 25, 0.82);
+}

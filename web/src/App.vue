@@ -6,6 +6,7 @@ import Auth from './components/Auth.vue'
 import Accounts from './components/Accounts.vue'
 import Compose from './components/Compose.vue'
 import * as api from './api.js'
+import { avatarColorFor, avatarLetterFor } from './avatar.js'
 
 const SCOPES = computed(() => [
   { key: 'inbox', label: t('收件箱'), icon: 'mdi-inbox' },
@@ -42,7 +43,9 @@ let listGen = 0
 const tombstones = new Map()
 
 function snapCtxKey(snap) {
-  return snap.kind === 'search' ? 'search|' + snap.query : 'folder|' + snap.scope
+  return snap.kind === 'search'
+    ? 'search|' + snap.query
+    : 'folder|' + snap.scope + '|' + (snap.folderId ?? 0)
 }
 
 function dropTombstoned(batch, snap) {
@@ -77,6 +80,29 @@ function clearSelection() {
 }
 const frameEl = ref(null)
 const drawerOpen = ref(false)
+const navHidden = ref(localStorage.getItem('wm_nav_hidden') === '1')
+const wideDesktop = computed(() => display.width.value >= 1440)
+const rangeId = ref(parseInt(localStorage.getItem('wm_range') ?? '0', 10) || 0)
+const rangeAccount = computed(() => accounts.value.find((a) => a.id === rangeId.value) ?? null)
+const activeFolder = computed(() => {
+  if (!rangeId.value) return null
+  return (
+    folders.value.find((f) => f.account_id === rangeId.value && f.special_use === scope.value) ??
+    null
+  )
+})
+
+watch(lgAndUp, (up) => {
+  drawerOpen.value = up ? !navHidden.value : false
+}, { immediate: true })
+
+function setRange(id) {
+  if (rangeId.value === id) return
+  rangeId.value = id
+  localStorage.setItem('wm_range', String(id))
+  clearSelection()
+  loadMessages()
+}
 const loadingMore = ref(false)
 const listHasMore = ref(false)
 const themeMode = ref('system')
@@ -95,6 +121,114 @@ const convoDetails = ref({})
 const cursorIdx = ref(0)
 const cursorActive = ref(false)
 const helpOpen = ref(false)
+const listWidth = ref(parseInt(localStorage.getItem('wm_list_width') ?? '0', 10) || 0)
+const listWidthVal = computed(() => {
+  if (listWidth.value) return Math.min(520, Math.max(320, listWidth.value))
+  return display.width.value >= 1280 && display.width.value < 1440 ? 340 : 400
+})
+let listDrag = null
+function onListDragStart(e) {
+  listDrag = { x: e.clientX, w: listWidthVal.value }
+  window.addEventListener('pointermove', onListDragMove)
+  window.addEventListener('pointerup', onListDragEnd, { once: true })
+}
+function onListDragMove(e) {
+  if (!listDrag) return
+  listWidth.value = Math.min(520, Math.max(320, listDrag.w + (e.clientX - listDrag.x)))
+}
+function onListDragEnd() {
+  window.removeEventListener('pointermove', onListDragMove)
+  if (listWidth.value) localStorage.setItem('wm_list_width', String(Math.round(listWidth.value)))
+  listDrag = null
+}
+const listDensity = ref(localStorage.getItem('wm_list_density') === 'compact' ? 'compact' : 'standard')
+function setDensity(v) {
+  listDensity.value = v
+  localStorage.setItem('wm_list_density', v)
+}
+const selectedIds = ref(new Set())
+const selectionActive = computed(() => selectedIds.value.size > 0)
+function toggleRowSelection(m) {
+  const s = new Set(selectedIds.value)
+  if (s.has(m.id)) s.delete(m.id)
+  else s.add(m.id)
+  selectedIds.value = s
+}
+function clearSelectionIds() {
+  if (selectedIds.value.size) selectedIds.value = new Set()
+}
+const allVisibleSelected = computed(
+  () =>
+    displayMessages.value.length > 0 &&
+    displayMessages.value.every((m) => selectedIds.value.has(m.id)),
+)
+function toggleSelectAll() {
+  if (allVisibleSelected.value) clearSelectionIds()
+  else selectedIds.value = new Set(displayMessages.value.map((m) => m.id))
+}
+async function bulkAct(kind) {
+  if (opBusy.value || !selectionActive.value) return
+  opBusy.value = true
+  const ids = [...selectedIds.value]
+  try {
+    for (const id of ids) {
+      if (kind === 'archive') await api.moveMessage(id, 'archive')
+      else if (kind === 'delete') await api.deleteMessage(id)
+      else if (kind === 'seen') await api.setFlags(id, { seen: true })
+      else if (kind === 'unseen') await api.setFlags(id, { seen: false })
+      if (kind === 'archive' || kind === 'delete') tombstones.set(id, snapCtxKey(listSnap.value))
+    }
+    clearSelectionIds()
+    if (selected.value && ids.includes(selected.value.id)) clearSelection()
+    if (kind === 'archive' || kind === 'delete') reloadLoaded()
+    else loadMessages(true)
+    loadFolders()
+  } finally {
+    opBusy.value = false
+  }
+}
+const searchFilter = ref({ attach: false, unread: false, accountId: 0 })
+const displayMessages = computed(() => {
+  if (!lgAndUp.value || listSnap.value.kind !== 'search') return messages.value
+  const f = searchFilter.value
+  if (!f.attach && !f.unread && !f.accountId) return messages.value
+  return messages.value.filter(
+    (m) =>
+      (!f.attach || m.has_attach) &&
+      (!f.unread || !(m.flags & 1)) &&
+      (!f.accountId || m.account_id === f.accountId),
+  )
+})
+function resetSearchFilter() {
+  searchFilter.value = { attach: false, unread: false, accountId: 0 }
+}
+const newMailPending = ref(0)
+function jumpToNewMail() {
+  newMailPending.value = 0
+  listEl.value?.scrollTo({ top: 0 })
+  reloadLoaded()
+}
+const listErrorBar = ref('')
+const listHeadTitle = computed(() => {
+  if (listSnap.value.kind === 'search') {
+    return t('搜索结果') + ' (' + t('{n} 封', { n: messages.value.length }) + ')'
+  }
+  const label = snapScopeLabel.value
+  const st = scopeStats.value[listSnap.value.scope]
+  if (!st || foldersStatus.value !== 'ready') return label
+  return (
+    label +
+    ' (' +
+    t('{n} 封', { n: st.total }) +
+    (st.unread ? t('，{n} 未读', { n: st.unread }) : '') +
+    ')'
+  )
+})
+function accountShort(m) {
+  const s = m.account_label || ''
+  const at = s.indexOf('@')
+  return at >= 0 ? s.slice(at + 1) : s
+}
 const listEl = ref(null)
 const searchEl = ref(null)
 let pendingReply = false
@@ -169,6 +303,7 @@ const snapScopeLabel = computed(
 const scopeStats = computed(() => {
   const map = {}
   for (const f of folders.value) {
+    if (rangeId.value && f.account_id !== rangeId.value) continue
     if (!f.special_use) continue
     const cur = map[f.special_use] ?? { total: 0, unread: 0, present: false }
     cur.total += f.total
@@ -177,6 +312,23 @@ const scopeStats = computed(() => {
     map[f.special_use] = cur
   }
   return map
+})
+const accountInboxUnread = computed(() => {
+  const map = {}
+  for (const f of folders.value) {
+    if (f.special_use === 'inbox') map[f.account_id] = (map[f.account_id] ?? 0) + f.unread
+  }
+  return map
+})
+const syncIndicator = computed(() => {
+  let anySync = false
+  for (const a of accounts.value) {
+    const st = statuses.value[a.id]
+    if (!st) continue
+    if (st.state === 'error' || st.state === 'repair') return 'error'
+    if (st.state === 'syncing' || st.state === 'connecting') anySync = true
+  }
+  return anySync ? 'syncing' : 'idle'
 })
 const visibleScopes = computed(() => SCOPES.value.filter((s) => scopeStats.value[s.key]?.present))
 
@@ -209,22 +361,12 @@ function initTheme() {
   applyTheme()
 }
 
-const AVATAR_COLORS = [
-  '#c62828', '#ad1457', '#6a1b9a', '#4527a0', '#283593', '#1565c0',
-  '#0277bd', '#00838f', '#00695c', '#2e7d32', '#558b2f', '#9e9d24',
-  '#f9a825', '#ef6c00', '#d84315', '#4e342e', '#616161', '#546e7a',
-]
-
 function avatarColor(email) {
-  const s = email || ''
-  let h = 0
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0
-  return AVATAR_COLORS[h % AVATAR_COLORS.length]
+  return avatarColorFor(email)
 }
 
 function avatarLetter(m) {
-  const s = (m.from_name || m.from_email || '?').trim()
-  return s ? s.charAt(0).toUpperCase() : '?'
+  return avatarLetterFor(m.from_name, m.from_email)
 }
 
 function fmtListTime(ts) {
@@ -271,11 +413,22 @@ function fmtAddrList(list) {
 
 
 async function loadMessages(soft = false) {
+  if (!searching.value && rangeId.value && foldersStatus.value !== 'ready') {
+    await loadFolders()
+  }
   const target = searching.value
     ? { kind: 'search', query: searchQuery.value.trim() }
-    : { kind: 'folder', scope: scope.value }
+    : {
+        kind: 'folder',
+        scope: scope.value,
+        folderId: rangeId.value ? (activeFolder.value?.id ?? -1) : 0,
+      }
   const gen = ++listGen
   listBusy.value = true
+  if (!soft) {
+    clearSelectionIds()
+    newMailPending.value = 0
+  }
   const keepReady = soft && listStatus.value === 'ready'
   if (!keepReady) listStatus.value = 'loading'
   listError.value = ''
@@ -288,6 +441,8 @@ async function loadMessages(soft = false) {
     let batch
     if (target.kind === 'search') {
       batch = await api.searchMessages(target.query)
+    } else if (target.folderId) {
+      batch = await api.getFolderMessages(target.folderId, 0, PAGE_SIZE, threaded.value)
     } else {
       batch = await api.getMessages(target.scope, 0, PAGE_SIZE, threaded.value)
     }
@@ -302,9 +457,15 @@ async function loadMessages(soft = false) {
     }
     listSnap.value = target
     listStatus.value = 'ready'
+    listErrorBar.value = ''
   } catch (err) {
     if (gen !== listGen) return
     if (keepReady) {
+      listStatus.value = 'ready'
+      return
+    }
+    if (lgAndUp.value && messages.value.length > 0) {
+      listErrorBar.value = err.message
       listStatus.value = 'ready'
       return
     }
@@ -322,7 +483,9 @@ async function loadMore() {
   loadingMore.value = true
   const gen = listGen
   try {
-    const batch = await api.getMessages(scope.value, listOffset, PAGE_SIZE, threaded.value)
+    const batch = listSnap.value.folderId
+      ? await api.getFolderMessages(listSnap.value.folderId, listOffset, PAGE_SIZE, threaded.value)
+      : await api.getMessages(scope.value, listOffset, PAGE_SIZE, threaded.value)
     if (gen !== listGen) return
     const seen = new Set(messages.value.map((m) => m.id))
     messages.value = [
@@ -342,9 +505,12 @@ async function reloadLoaded() {
   const gen = ++listGen
   try {
     const n = Math.max(PAGE_SIZE, messages.value.length)
-    const batch = await api.getMessages(scope.value, 0, n, threaded.value)
+    const folderId = rangeId.value ? (activeFolder.value?.id ?? -1) : 0
+    const batch = folderId
+      ? await api.getFolderMessages(folderId, 0, n, threaded.value)
+      : await api.getMessages(scope.value, 0, n, threaded.value)
     if (gen !== listGen) return
-    const snap = { kind: 'folder', scope: scope.value }
+    const snap = { kind: 'folder', scope: scope.value, folderId }
     messages.value = dropTombstoned(batch, snap)
     clearTombstonesFor(snap)
     listOffset = batch.length
@@ -357,6 +523,7 @@ async function reloadLoaded() {
 function onListScroll() {
   const el = listEl.value
   if (!el) return
+  if (el.scrollTop <= 80) newMailPending.value = 0
   if (el.scrollTop + el.clientHeight > el.scrollHeight - 500) loadMore()
 }
 
@@ -607,14 +774,30 @@ function clearSearch() {
   clearTimeout(searchTimer)
   searchQuery.value = ''
   searching.value = false
+  resetSearchFilter()
   loadMessages(true)
 }
 
 function openCompose(init) {
   composeInit.value = init
-  drawerOpen.value = false
+  if (!lgAndUp.value) drawerOpen.value = false
+  composeZ.value = nextLayer()
   composeOpen.value = true
 }
+
+const layerSeq = ref(0)
+const composeZ = ref(2500)
+const settingsZ = ref(2500)
+function nextLayer() {
+  layerSeq.value += 1
+  return 2490 + layerSeq.value * 10
+}
+watch(settingsOpen, (v) => {
+  if (v) settingsZ.value = nextLayer()
+})
+watch([composeOpen, settingsOpen], ([c, s]) => {
+  if (!c && !s) layerSeq.value = 0
+})
 
 async function loadFolders() {
   try {
@@ -669,7 +852,9 @@ function scheduleStatusRefresh() {
 }
 
 function rowMatchesScope(item) {
-  return searching.value ? false : item.folder_special === scope.value
+  if (searching.value) return false
+  if (rangeId.value) return item.folder_id === (activeFolder.value?.id ?? -1)
+  return item.folder_special === scope.value
 }
 
 function insertFlat(item) {
@@ -764,9 +949,18 @@ function applyFolderEvent(folder) {
 function onServerEvent(ev) {
   if (view.value !== 'app') return
   if (ev.type === 'messages') {
+    const beforeCount = messages.value.length
     for (const item of ev.items ?? []) {
       if (threaded.value && !searching.value) insertThreaded(item)
       else insertFlat(item)
+    }
+    if (
+      listSnap.value.kind === 'folder' &&
+      messages.value.length > beforeCount &&
+      listEl.value &&
+      listEl.value.scrollTop > 80
+    ) {
+      newMailPending.value += messages.value.length - beforeCount
     }
     scheduleStatusRefresh()
   } else if (ev.type === 'flags') {
@@ -828,7 +1022,7 @@ function disconnectEvents() {
 function selectScope(key) {
   scope.value = key
   clearSelection()
-  drawerOpen.value = false
+  if (!lgAndUp.value) drawerOpen.value = false
   searchQuery.value = ''
   searching.value = false
   loadMessages()
@@ -837,14 +1031,53 @@ function selectScope(key) {
 const frameCss = computed(() => {
   const dark = theme.global.current.value.dark
   const fg = dark ? '#e6e6e6' : '#000'
-  const link = dark ? '#8ab4f8' : '#0000ee'
+  const link = dark ? '#a8c7fa' : '#0b57d0'
   const scheme = dark ? 'dark' : 'light'
+  const font = lgAndUp.value
+    ? 'font:15px/1.8 Arial,Helvetica,"PingFang SC","Microsoft YaHei",sans-serif;'
+    : 'font:14px/1.5 Arial,Helvetica,"PingFang SC","Microsoft YaHei",sans-serif;'
+  const quote = lgAndUp.value
+    ? 'blockquote{border-left:2px solid ' +
+      (dark ? '#8e9196' : '#74787c') +
+      ';color:' +
+      (dark ? '#c4c7ca' : '#43474c') +
+      ';margin-left:0;padding-left:12px}'
+    : ''
   return (
     '<style>:root{color-scheme:' + scheme + '}html,body{margin:0;padding:0;background:transparent;color:' + fg + ';' +
-    'font:14px/1.5 Arial,Helvetica,"PingFang SC","Microsoft YaHei",sans-serif;' +
-    'overflow-wrap:anywhere}img{max-width:100%;height:auto}table{max-width:100%}a{color:' + link + '}</style>'
+    font +
+    'overflow-wrap:anywhere}img{max-width:100%;height:auto}table{max-width:100%}a{color:' + link + ';text-decoration:none}a:hover{text-decoration:underline}' +
+    quote +
+    '</style>'
   )
 })
+
+const selIdx = computed(() => displayMessages.value.findIndex((m) => m.id === selected.value?.id))
+
+function openNeighbor(dir) {
+  if (selIdx.value < 0) return
+  const n = displayMessages.value[selIdx.value + dir]
+  if (n) openMessage(n)
+}
+
+function printSelected() {
+  const w = frameEl.value?.contentWindow
+  if (w) {
+    w.focus()
+    w.print()
+  }
+}
+
+function downloadAll(d) {
+  for (const a of d.attachments) {
+    const el = document.createElement('a')
+    el.href = api.attachmentURL(d.id, a.id)
+    el.download = a.filename
+    document.body.appendChild(el)
+    el.click()
+    el.remove()
+  }
+}
 
 function frameLoaded() {
   try {
@@ -1253,7 +1486,7 @@ async function deleteFor(m) {
 }
 
 async function markAllRead() {
-  if (searching.value || opBusy.value) return
+  if (searching.value || opBusy.value || rangeId.value) return
   opBusy.value = true
   try {
     await api.markAllRead(scope.value)
@@ -1279,7 +1512,7 @@ async function markAllRead() {
 
 function activeMessage() {
   if (selected.value) return selected.value
-  return messages.value[cursorIdx.value] ?? null
+  return displayMessages.value[cursorIdx.value] ?? null
 }
 
 function replyToMessage(m) {
@@ -1292,9 +1525,9 @@ function replyToMessage(m) {
 }
 
 function moveCursor(d) {
-  if (messages.value.length === 0) return
+  if (displayMessages.value.length === 0) return
   cursorActive.value = true
-  cursorIdx.value = Math.max(0, Math.min(messages.value.length - 1, cursorIdx.value + d))
+  cursorIdx.value = Math.max(0, Math.min(displayMessages.value.length - 1, cursorIdx.value + d))
   requestAnimationFrame(() => {
     listEl.value
       ?.querySelector('[data-rowidx="' + cursorIdx.value + '"]')
@@ -1321,7 +1554,7 @@ function onGlobalKey(e) {
       moveCursor(-1)
       break
     case 'Enter': {
-      const row = messages.value[cursorIdx.value]
+      const row = displayMessages.value[cursorIdx.value]
       if (row) rowClick(row, cursorIdx.value)
       break
     }
@@ -1369,7 +1602,13 @@ function menuRipple(e) {
 }
 
 function toggleDrawer() {
-  if (!lgAndUp.value && composeOpen.value) return
+  if (lgAndUp.value) {
+    navHidden.value = !navHidden.value
+    localStorage.setItem('wm_nav_hidden', navHidden.value ? '1' : '0')
+    drawerOpen.value = !navHidden.value
+    return
+  }
+  if (composeOpen.value) return
   drawerOpen.value = !drawerOpen.value
 }
 
@@ -1398,7 +1637,7 @@ function onReaderTouchEnd(e) {
 
 function openAccounts() {
   openSettings()
-  drawerOpen.value = false
+  if (!lgAndUp.value) drawerOpen.value = false
 }
 
 async function enter() {
@@ -1482,9 +1721,17 @@ function onUndoSecondsChange(v) {
   localStorage.setItem('wm_undo_seconds', String(v))
 }
 
+const online = ref(navigator.onLine)
+function onOnlineChange() {
+  online.value = navigator.onLine
+  if (online.value && view.value === 'app') refreshData()
+}
+
 onMounted(() => {
   window.addEventListener('hashchange', onHashChange)
   window.addEventListener('keydown', onGlobalKey)
+  window.addEventListener('online', onOnlineChange)
+  window.addEventListener('offline', onOnlineChange)
   initTheme()
   boot()
 })
@@ -1492,6 +1739,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('hashchange', onHashChange)
   window.removeEventListener('keydown', onGlobalKey)
+  window.removeEventListener('online', onOnlineChange)
+  window.removeEventListener('offline', onOnlineChange)
   systemDarkMQ?.removeEventListener('change', applyTheme)
   disconnectEvents()
 })
@@ -1527,8 +1776,70 @@ onBeforeUnmount(() => {
     </template>
 
     <template v-else>
-      <v-app-bar height="64" flat>
-        <div class="appbar-search">
+      <v-app-bar height="64" flat class="app-topbar">
+        <div v-if="lgAndUp" class="topbar-desktop">
+          <button type="button" class="topbar-menu-btn" :aria-label="t('展开菜单')" @click="toggleDrawer">
+            <v-icon icon="mdi-menu" size="24" />
+          </button>
+          <span v-if="wideDesktop" class="topbar-title">Namakani</span>
+          <div class="topbar-search">
+            <v-text-field
+              ref="searchEl"
+              v-model="searchQuery"
+              :placeholder="t('搜索')"
+              variant="solo-filled"
+              rounded="pill"
+              hide-details
+              class="search-field-d"
+              @input="onSearchInput"
+            >
+              <template #prepend-inner>
+                <v-icon icon="mdi-magnify" size="22" class="text-medium-emphasis" />
+              </template>
+              <template v-if="searching" #append-inner>
+                <v-btn
+                  icon="mdi-close"
+                  variant="text"
+                  size="x-small"
+                  :aria-label="t('清除搜索')"
+                  @click="clearSearch"
+                />
+              </template>
+            </v-text-field>
+          </div>
+          <v-spacer />
+          <span v-if="syncIndicator === 'syncing'" class="topbar-sync" :title="t('同步中')">
+            <v-icon icon="mdi-refresh" size="22" class="sync-spin" />
+          </span>
+          <v-btn
+            v-else-if="syncIndicator === 'error'"
+            icon="mdi-alert-circle"
+            variant="text"
+            color="error"
+            size="small"
+            :aria-label="t('同步失败')"
+            @click="openSettings"
+          />
+          <v-btn icon="mdi-cog" variant="text" size="small" :aria-label="t('设置')" @click="openSettings" />
+          <v-menu>
+            <template #activator="{ props: mp }">
+              <button
+                type="button"
+                v-bind="mp"
+                class="topbar-avatar"
+                :style="{ background: avatarColor(accounts[0]?.email || 'namakani') }"
+                :aria-label="t('账号')"
+              >
+                <span class="avatar-letter font-weight-bold">{{ (accounts[0]?.email || 'W').charAt(0).toUpperCase() }}</span>
+              </button>
+            </template>
+            <v-list density="compact">
+              <v-list-item prepend-icon="mdi-cog" :title="t('设置')" @click="openSettings" />
+              <v-list-item prepend-icon="mdi-logout" :title="t('退出登录')" @click="doLogout" />
+            </v-list>
+          </v-menu>
+        </div>
+        <div v-else class="appbar-search">
           <div class="search-wrap">
             <button type="button" class="search-menu-btn" :aria-label="t('展开菜单')" @pointerdown="menuRipple" @click="toggleDrawer">
               <v-icon icon="mdi-menu" size="22" />
@@ -1560,22 +1871,46 @@ onBeforeUnmount(() => {
 
       <v-navigation-drawer
         v-model="drawerOpen"
-        temporary
-        width="280"
+        :permanent="lgAndUp"
+        :temporary="!lgAndUp"
+        :width="lgAndUp ? 288 : 280"
+        :elevation="0"
+        color="surface-container-low"
+        class="nav-drawer"
         :touchless="!lgAndUp && composeOpen"
       >
-        <div class="d-flex flex-column pa-3 drawer-inner">
+        <div class="d-flex flex-column pa-4 drawer-inner">
           <v-btn
-            color="primary"
-            block
-            rounded="xl"
+            v-if="lgAndUp"
+            color="primary-container"
+            rounded="pill"
             prepend-icon="mdi-pencil"
-            class="mb-4"
-            style="height: 40px; flex: none"
+            class="nav-compose mb-2"
             @click="openCompose({})"
           >
             {{ t('写信') }}
           </v-btn>
+
+          <div v-if="accounts.length > 1" class="nav-range">
+            <span class="nav-range-label text-truncate">
+              {{ rangeId ? (rangeAccount?.label || rangeAccount?.email) : t('全部账号') }}
+            </span>
+            <v-menu>
+              <template #activator="{ props: mp }">
+                <v-btn v-bind="mp" icon="mdi-chevron-down" size="x-small" variant="text" :aria-label="t('切换范围')" />
+              </template>
+              <v-list density="compact">
+                <v-list-item :title="t('全部账号')" :active="rangeId === 0" @click="setRange(0)" />
+                <v-list-item
+                  v-for="a in accounts"
+                  :key="a.id"
+                  :title="a.label || a.email"
+                  :active="rangeId === a.id"
+                  @click="setRange(a.id)"
+                />
+              </v-list>
+            </v-menu>
+          </div>
 
           <template v-if="foldersStatus === 'loading'">
             <v-skeleton-loader type="list-item@10" />
@@ -1598,18 +1933,36 @@ onBeforeUnmount(() => {
                 @click="selectScope(s.key)"
               >
                 <template #append>
-                  <v-badge
-                    v-if="scopeStats[s.key].unread > 0"
-                    :content="scopeStats[s.key].unread"
-                    color="primary"
-                    inline
-                  />
+                  <span v-if="scopeStats[s.key].unread > 0" class="nav-count">
+                    {{ scopeStats[s.key].unread }}
+                  </span>
                 </template>
               </v-list-item>
             </v-list>
             <p v-if="visibleScopes.length === 0" class="text-body-2 text-medium-emphasis px-1">
               {{ t('暂无文件夹（同步后出现）') }}
             </p>
+          </template>
+
+          <template v-if="accounts.length > 1">
+            <div class="nav-group-label">{{ t('账号') }}</div>
+            <v-list density="compact" nav class="pa-0">
+              <v-list-item
+                v-for="a in accounts"
+                :key="a.id"
+                :active="rangeId === a.id"
+                rounded="pill"
+                @click="setRange(rangeId === a.id ? 0 : a.id)"
+              >
+                <template #prepend>
+                  <span class="nav-dot" :style="{ background: avatarColor(a.email || a.label || '') }" />
+                </template>
+                <v-list-item-title class="text-body-2">{{ a.label || a.email }}</v-list-item-title>
+                <template #append>
+                  <span v-if="accountInboxUnread[a.id]" class="nav-count">{{ accountInboxUnread[a.id] }}</span>
+                </template>
+              </v-list-item>
+            </v-list>
           </template>
 
           <div class="mt-auto">
@@ -1629,9 +1982,151 @@ onBeforeUnmount(() => {
       </v-navigation-drawer>
 
       <v-main>
-        <div class="mail-layout">
-          <section class="list-section">
-            <div class="d-flex align-center ga-1 px-2 py-2 border-b">
+        <div v-if="!online" class="offline-bar">
+          <span>{{ t('网络连接已断开') }}</span>
+          <v-btn variant="text" size="small" @click="refreshData">{{ t('重试') }}</v-btn>
+        </div>
+        <div class="mail-layout" :class="{ 'with-offline': !online }">
+          <section
+            class="list-section"
+            :class="{ 'density-compact': listDensity === 'compact' }"
+            :style="lgAndUp ? { flexBasis: listWidthVal + 'px' } : undefined"
+          >
+            <template v-if="lgAndUp">
+              <div class="list-head">
+                <h1 class="list-head-title text-truncate">
+                  {{ listHeadTitle }}
+                  <span v-if="listStatus === 'loading'" class="head-skel" />
+                </h1>
+                <v-btn
+                  v-if="listSnap.kind === 'search'"
+                  icon="mdi-close"
+                  size="small"
+                  variant="text"
+                  :aria-label="t('清除搜索')"
+                  @click="clearSearch"
+                />
+                <v-menu>
+                  <template #activator="{ props: mp }">
+                    <v-btn v-bind="mp" icon="mdi-dots-vertical" size="small" variant="text" :aria-label="t('更多')" />
+                  </template>
+                  <v-list density="compact">
+                    <v-list-item :title="t('标准密度')" :append-icon="listDensity === 'standard' ? 'mdi-check' : undefined" @click="setDensity('standard')" />
+                    <v-list-item :title="t('紧凑密度')" :append-icon="listDensity === 'compact' ? 'mdi-check' : undefined" @click="setDensity('compact')" />
+                    <v-divider v-if="!searching && !rangeId" />
+                    <v-list-item v-if="!searching && !rangeId" :title="t('全部标为已读')" @click="markAllRead" />
+                  </v-list>
+                </v-menu>
+              </div>
+              <div v-if="listSnap.kind === 'search'" class="search-chips">
+                <v-chip
+                  size="small"
+                  :variant="!searchFilter.attach && !searchFilter.unread && !searchFilter.accountId ? 'flat' : 'outlined'"
+                  :color="!searchFilter.attach && !searchFilter.unread && !searchFilter.accountId ? 'primary-container' : undefined"
+                  @click="resetSearchFilter"
+                >
+                  {{ t('全部') }}
+                </v-chip>
+                <v-chip
+                  size="small"
+                  :variant="searchFilter.attach ? 'flat' : 'outlined'"
+                  :color="searchFilter.attach ? 'primary-container' : undefined"
+                  prepend-icon="mdi-paperclip"
+                  @click="searchFilter = { ...searchFilter, attach: !searchFilter.attach }"
+                >
+                  {{ t('有附件') }}
+                </v-chip>
+                <v-chip
+                  size="small"
+                  :variant="searchFilter.unread ? 'flat' : 'outlined'"
+                  :color="searchFilter.unread ? 'primary-container' : undefined"
+                  @click="searchFilter = { ...searchFilter, unread: !searchFilter.unread }"
+                >
+                  {{ t('未读') }}
+                </v-chip>
+                <v-menu>
+                  <template #activator="{ props: mp }">
+                    <v-chip
+                      v-bind="mp"
+                      size="small"
+                      :variant="searchFilter.accountId ? 'flat' : 'outlined'"
+                      :color="searchFilter.accountId ? 'primary-container' : undefined"
+                      append-icon="mdi-chevron-down"
+                    >
+                      {{ searchFilter.accountId ? (accounts.find((a) => a.id === searchFilter.accountId)?.label || t('按账号')) : t('按账号') }}
+                    </v-chip>
+                  </template>
+                  <v-list density="compact">
+                    <v-list-item :title="t('全部账号')" :active="!searchFilter.accountId" @click="searchFilter = { ...searchFilter, accountId: 0 }" />
+                    <v-list-item
+                      v-for="a in accounts"
+                      :key="a.id"
+                      :title="a.label || a.email"
+                      :active="searchFilter.accountId === a.id"
+                      @click="searchFilter = { ...searchFilter, accountId: a.id }"
+                    />
+                  </v-list>
+                </v-menu>
+              </div>
+              <div class="list-toolbar">
+                <v-checkbox-btn
+                  :model-value="allVisibleSelected"
+                  :indeterminate="selectionActive && !allVisibleSelected"
+                  density="compact"
+                  :aria-label="t('全选')"
+                  @click.prevent="toggleSelectAll"
+                />
+                <template v-if="selectionActive">
+                  <span class="text-body-2 ml-1">{{ t('已选 {n} 封', { n: selectedIds.size }) }}</span>
+                  <v-btn icon variant="text" size="small" :disabled="opBusy || scope === 'archive' || scope === 'trash'" @click="bulkAct('archive')">
+                    <v-icon icon="mdi-archive" />
+                    <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
+                  </v-btn>
+                  <v-btn icon variant="text" size="small" :disabled="opBusy" @click="bulkAct('delete')">
+                    <v-icon icon="mdi-delete" />
+                    <v-tooltip activator="parent" location="bottom">{{ t('删除') }}</v-tooltip>
+                  </v-btn>
+                  <v-btn icon variant="text" size="small" :disabled="opBusy" @click="bulkAct('seen')">
+                    <v-icon icon="mdi-email-open" />
+                    <v-tooltip activator="parent" location="bottom">{{ t('标为已读') }}</v-tooltip>
+                  </v-btn>
+                  <v-btn icon variant="text" size="small" :disabled="opBusy" @click="bulkAct('unseen')">
+                    <v-icon icon="mdi-email" />
+                    <v-tooltip activator="parent" location="bottom">{{ t('标为未读') }}</v-tooltip>
+                  </v-btn>
+                  <v-btn icon="mdi-close" variant="text" size="small" :aria-label="t('取消选择')" @click="clearSelectionIds" />
+                </template>
+                <template v-else>
+                  <v-btn icon variant="text" size="small" disabled>
+                    <v-icon icon="mdi-archive" />
+                    <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
+                  </v-btn>
+                  <v-btn icon variant="text" size="small" disabled>
+                    <v-icon icon="mdi-delete" />
+                    <v-tooltip activator="parent" location="bottom">{{ t('删除') }}</v-tooltip>
+                  </v-btn>
+                  <v-btn icon variant="text" size="small" disabled>
+                    <v-icon icon="mdi-email-open" />
+                    <v-tooltip activator="parent" location="bottom">{{ t('标为已读') }}</v-tooltip>
+                  </v-btn>
+                  <v-btn icon variant="text" size="small" :disabled="listBusy" @click="refreshData">
+                    <v-icon icon="mdi-refresh" />
+                    <v-tooltip activator="parent" location="bottom">{{ t('刷新') }}</v-tooltip>
+                  </v-btn>
+                </template>
+                <span v-if="listSnap.kind === 'folder' && messages.length" class="range-text">
+                  1 {{ t('至') }} {{ displayMessages.length }}
+                </span>
+              </div>
+              <div class="list-progress">
+                <v-progress-linear v-if="listBusy" indeterminate color="primary" height="3" />
+              </div>
+              <div v-if="listErrorBar" class="list-error-bar">
+                <span class="text-truncate">{{ t('加载失败：{error}', { error: listErrorBar }) }}</span>
+                <v-btn variant="text" size="small" @click="loadMessages()">{{ t('重试') }}</v-btn>
+              </div>
+            </template>
+            <div v-else class="d-flex align-center ga-1 px-2 py-2 border-b">
               <h1 class="text-body-1 font-weight-bold text-truncate px-1">
                 {{ listSnap.kind === 'search' ? t('搜索结果') : snapScopeLabel }}
               </h1>
@@ -1651,6 +2146,14 @@ onBeforeUnmount(() => {
             <div v-if="actionError" class="px-3 py-1 text-caption text-error border-b">{{ actionError }}</div>
 
             <div class="list-body">
+            <button
+              v-if="newMailPending > 0"
+              type="button"
+              class="newmail-pill"
+              @click="jumpToNewMail"
+            >
+              {{ t('{n} 封新邮件', { n: newMailPending }) }}
+            </button>
             <div
               class="ptr-ind"
               :style="{
@@ -1686,10 +2189,20 @@ onBeforeUnmount(() => {
             <div ref="listEl" class="list-scroll" @scroll="onListScroll">
               <div>
               <template v-if="listStatus === 'loading'">
-                <v-skeleton-loader type="list-item-three-line@24" />
+                <v-skeleton-loader v-if="lgAndUp" type="list-item-avatar-three-line@12" class="list-skel" />
+                <v-skeleton-loader v-else type="list-item-three-line@24" />
               </template>
               <template v-else-if="listStatus === 'error'">
-                <div class="pa-4">
+                <template v-if="lgAndUp">
+                  <div class="list-error-bar">
+                    <span class="text-truncate">{{ t('加载失败：{error}', { error: listError }) }}</span>
+                    <v-btn variant="text" size="small" @click="loadMessages()">{{ t('重试') }}</v-btn>
+                  </div>
+                  <div class="list-error-center">
+                    <v-btn variant="outlined" @click="loadMessages()">{{ t('重试') }}</v-btn>
+                  </div>
+                </template>
+                <div v-else class="pa-4">
                   <v-alert type="error" variant="tonal" density="compact">
                     {{ t('邮件列表加载失败：{error}', { error: listError }) }}
                     <div class="mt-2">
@@ -1698,28 +2211,87 @@ onBeforeUnmount(() => {
                   </v-alert>
                 </div>
               </template>
-              <template v-else-if="messages.length === 0">
-                <p class="pa-6 text-body-2 text-medium-emphasis">
+              <template v-else-if="displayMessages.length === 0">
+                <div v-if="lgAndUp" class="list-empty">
+                  <v-icon icon="mdi-email-outline" size="48" />
+                  <p>{{ listSnap.kind === 'search' ? t('没有匹配的邮件') : t('{scope}是空的', { scope: snapScopeLabel }) }}</p>
+                </div>
+                <p v-else class="pa-6 text-body-2 text-medium-emphasis">
                   {{ listSnap.kind === 'search' ? t('没有找到匹配的邮件。') : t('这里还没有邮件。添加账号后会自动同步进来。') }}
                 </p>
               </template>
               <template v-else>
-                <template v-for="(m, idx) in messages" :key="m.id">
+                <template v-for="(m, idx) in displayMessages" :key="m.id">
                   <div class="mail-row-wrap" :style="rowWrapStyle(m)">
                     <div
                       v-if="scope !== 'archive' && scope !== 'trash'"
                       class="swipe-bg swipe-bg-left"
                       :style="{ opacity: swipeId === m.id && swipeDx > 0 ? 1 : 0 }"
                     >
-                      <v-icon icon="mdi-archive" color="white" size="20" />
+                      <v-icon icon="mdi-archive" size="20" />
                     </div>
                     <div
                       class="swipe-bg swipe-bg-right"
                       :style="{ opacity: swipeId === m.id && swipeDx < 0 ? 1 : 0 }"
                     >
-                      <v-icon icon="mdi-delete" color="white" size="20" />
+                      <v-icon icon="mdi-delete" size="20" />
                     </div>
                   <div
+                    v-if="lgAndUp"
+                    class="mail-row-d"
+                    :class="{
+                      'row-unread': !(m.flags & 1),
+                      'row-selected': selected?.id === m.id,
+                      'row-cursor': cursorActive && idx === cursorIdx,
+                    }"
+                    :data-rowidx="idx"
+                    :style="rowSwipeStyle(m)"
+                    @click="rowClick(m, idx)"
+                  >
+                    <span
+                      class="row-check"
+                      :class="{ 'row-check-on': selectionActive || selectedIds.has(m.id) }"
+                      @click.stop="toggleRowSelection(m)"
+                    >
+                      <v-checkbox-btn :model-value="selectedIds.has(m.id)" density="compact" tabindex="-1" />
+                    </span>
+                    <v-avatar :color="avatarColor(m.from_email)" :size="listDensity === 'compact' ? 24 : 32" class="mail-avatar-d">
+                      <span class="avatar-letter row-avatar-letter">{{ avatarLetter(m) }}</span>
+                    </v-avatar>
+                    <div class="row-main">
+                      <div class="row-l1">
+                        <span class="row-sender" :class="{ w700: !(m.flags & 1) }">
+                          {{ m.from_name || m.from_email || t('(未知发件人)') }}
+                        </span>
+                        <v-chip v-if="listDensity === 'compact'" class="row-chip" size="x-small" variant="flat" color="primary-container">
+                          {{ accountShort(m) }}
+                        </v-chip>
+                        <span
+                          v-if="threaded && !searching && (m.thread_count ?? 1) > 1"
+                          class="row-thread"
+                        >
+                          {{ t('共 {n} 封', { n: m.thread_count }) }}<template v-if="m.thread_unread">{{ t('，{n} 未读', { n: m.thread_unread }) }}</template>
+                        </span>
+                        <span class="row-time">{{ fmtListTime(m.date_ts) }}</span>
+                      </div>
+                      <div class="row-l2" :class="{ w600: !(m.flags & 1) }">
+                        <span class="row-subject">{{ m.subject || t('(无主题)') }}</span>
+                        <span v-if="listDensity === 'compact' && m.snippet" class="row-l2-snippet">{{ m.snippet }}</span>
+                        <v-icon v-if="listDensity === 'compact' && m.has_attach" icon="mdi-paperclip" size="14" class="text-medium-emphasis flex-none" />
+                      </div>
+                      <div v-if="listDensity === 'standard'" class="row-l3">
+                        <span class="row-snippet">{{ m.snippet }}</span>
+                        <v-chip class="row-chip" size="x-small" variant="flat" color="primary-container">
+                          {{ accountShort(m) }}
+                        </v-chip>
+                        <v-chip v-if="m.has_attach" class="row-chip" size="x-small" variant="outlined" prepend-icon="mdi-paperclip">
+                          {{ t('附件') }}
+                        </v-chip>
+                      </div>
+                    </div>
+                  </div>
+                  <div
+                    v-else
                     v-ripple
                     class="mail-row"
                     :data-rowidx="idx"
@@ -1732,7 +2304,7 @@ onBeforeUnmount(() => {
                     @touchcancel="rowTouchEnd($event, m)"
                   >
                     <v-avatar :color="avatarColor(m.from_email)" size="38" class="mail-avatar">
-                      <span class="text-white text-body-2 font-weight-medium">{{ avatarLetter(m) }}</span>
+                      <span class="avatar-letter text-body-2 font-weight-medium">{{ avatarLetter(m) }}</span>
                     </v-avatar>
                     <div class="flex-1-1" style="min-width: 0">
                       <div class="d-flex align-center ga-2">
@@ -1766,7 +2338,7 @@ onBeforeUnmount(() => {
                   </div>
                 </template>
                 <v-btn
-                  v-if="listHasMore && !searching"
+                  v-if="listHasMore && !searching && !lgAndUp"
                   block
                   variant="text"
                   :loading="loadingMore"
@@ -1778,11 +2350,21 @@ onBeforeUnmount(() => {
               </div>
             </div>
             </div>
+            <div v-if="lgAndUp && listStatus === 'ready' && listHasMore && !searching" class="list-footer">
+              <v-btn variant="text" block size="small" :loading="loadingMore" @click="loadMore">
+                {{ t('加载更多') }}
+              </v-btn>
+            </div>
+            <div v-if="lgAndUp" class="list-drag" @pointerdown="onListDragStart" />
           </section>
 
           <section class="reader-section" :class="{ 'd-none': !lgAndUp && !selected && !convo, 'reader-overlay': !lgAndUp && (!!selected || !!convo) }">
             <div v-if="!selected && !convo" class="h-100 d-flex align-center justify-center">
-              <p class="text-body-2 text-medium-emphasis">{{ t('未选择邮件') }}</p>
+              <div v-if="lgAndUp" class="reader-empty">
+                <v-icon icon="mdi-email-open-outline" size="48" />
+                <p>{{ t('选择一封邮件阅读') }}</p>
+              </div>
+              <p v-else class="text-body-2 text-medium-emphasis">{{ t('未选择邮件') }}</p>
             </div>
             <div
               v-else-if="convo"
@@ -1818,7 +2400,7 @@ onBeforeUnmount(() => {
                   <div v-for="msg in convo.msgs" :key="msg.id" class="convo-card">
                     <div v-ripple class="convo-card-head" @click="toggleCard(msg)">
                       <v-avatar :color="avatarColor(msg.from_email)" size="32" class="flex-none">
-                        <span class="text-white text-caption font-weight-medium">{{ avatarLetter(msg) }}</span>
+                        <span class="avatar-letter text-caption font-weight-medium">{{ avatarLetter(msg) }}</span>
                       </v-avatar>
                       <div class="flex-1-1" style="min-width: 0">
                         <div class="d-flex align-center ga-2">
@@ -1911,7 +2493,8 @@ onBeforeUnmount(() => {
                         <div
                           v-else-if="convoDetails[msg.id].text"
                           class="py-2 text-body-2"
-                          style="white-space: pre-wrap; line-height: 1.6"
+                          :class="{ 'reader-text': lgAndUp }"
+                          :style="lgAndUp ? 'white-space: pre-wrap' : 'white-space: pre-wrap; line-height: 1.6'"
                         >
                           {{ convoDetails[msg.id].text }}
                         </div>
@@ -1939,7 +2522,74 @@ onBeforeUnmount(() => {
                   @click="clearSelection()"
                 />
               </div>
+              <div v-if="lgAndUp" class="reader-toolbar">
+                <v-btn
+                  v-if="scope !== 'archive' && scope !== 'trash'"
+                  icon
+                  variant="text"
+                  size="small"
+                  :disabled="opBusy"
+                  @click="archiveFor(selected)"
+                >
+                  <v-icon icon="mdi-archive" />
+                  <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
+                </v-btn>
+                <v-btn icon variant="text" size="small" :disabled="opBusy" @click="deleteFor(selected)">
+                  <v-icon icon="mdi-delete" />
+                  <v-tooltip activator="parent" location="bottom">
+                    {{ scope === 'trash' || scope === 'junk' ? t('彻底删除') : t('删除') }}
+                  </v-tooltip>
+                </v-btn>
+                <v-btn icon variant="text" size="small" :disabled="opBusy" @click="toggleSeen">
+                  <v-icon :icon="selected.flags & 1 ? 'mdi-email' : 'mdi-email-open'" />
+                  <v-tooltip activator="parent" location="bottom">
+                    {{ selected.flags & 1 ? t('标为未读') : t('标为已读') }}
+                  </v-tooltip>
+                </v-btn>
+                <v-btn icon="mdi-chevron-up" variant="text" size="small" :disabled="selIdx <= 0" :aria-label="t('上一封')" @click="openNeighbor(-1)" />
+                <v-btn
+                  icon="mdi-chevron-down"
+                  variant="text"
+                  size="small"
+                  :disabled="selIdx < 0 || selIdx >= displayMessages.length - 1"
+                  :aria-label="t('下一封')"
+                  @click="openNeighbor(1)"
+                />
+                <v-spacer />
+                <v-btn icon="mdi-printer" variant="text" size="small" :disabled="!detail?.html" :aria-label="t('打印')" @click="printSelected" />
+              </div>
               <div class="reader-scroll px-3 pb-3 px-sm-4 pb-sm-4">
+              <template v-if="lgAndUp">
+                <div class="reader-head-block">
+                  <h2 class="reader-subject">{{ selected.subject || t('(无主题)') }}</h2>
+                  <div class="reader-from-row">
+                    <v-avatar :color="avatarColor(selected.from_email)" size="40" class="flex-none">
+                      <span class="avatar-letter" style="font-size: 16px">{{ avatarLetter(selected) }}</span>
+                    </v-avatar>
+                    <span class="reader-from-name text-truncate">
+                      {{ detail?.from?.name || selected.from_name || selected.from_email }}
+                    </span>
+                    <span class="reader-from-addr text-truncate">{{ detail?.from?.email || selected.from_email }}</span>
+                    <span class="reader-time">{{ fmtFull(selected.date_ts) }}</span>
+                  </div>
+                  <div class="reader-to-row">
+                    <span v-if="detail?.to?.length" style="overflow-wrap: anywhere">
+                      {{ t('收件人') }} {{ fmtAddrList(detail.to) }}
+                    </span>
+                    <v-chip size="x-small" variant="flat" color="primary-container">{{ selected.account_label }}</v-chip>
+                    <v-chip size="x-small" variant="outlined">{{ selected.folder_name }}</v-chip>
+                  </div>
+                  <div class="reader-actions">
+                    <v-btn variant="tonal" size="small" prepend-icon="mdi-reply" :disabled="opBusy || !detail" @click="replySelected">
+                      {{ t('回复') }}
+                    </v-btn>
+                    <v-btn variant="tonal" size="small" prepend-icon="mdi-share" :disabled="opBusy || !detail" @click="forwardSelected">
+                      {{ t('转发') }}
+                    </v-btn>
+                  </div>
+                </div>
+              </template>
+              <template v-else>
               <h2 class="text-h6 font-weight-bold mb-2" style="overflow-wrap: anywhere">
                 {{ selected.subject || t('(无主题)') }}
               </h2>
@@ -2002,9 +2652,10 @@ onBeforeUnmount(() => {
                   </v-tooltip>
                 </v-btn>
               </div>
+              </template>
 
               <template v-if="detailState === 'loading'">
-                <v-skeleton-loader type="paragraph@10" class="py-4" />
+                <v-skeleton-loader type="paragraph@10" class="py-4 reader-body-block" />
               </template>
               <template v-else-if="detailState === 'error'">
                 <v-alert type="error" variant="tonal" density="compact" class="my-4">
@@ -2015,34 +2666,56 @@ onBeforeUnmount(() => {
                 </v-alert>
               </template>
               <template v-else-if="detail">
-                <div v-if="detail.attachments.length > 0" class="d-flex flex-wrap ga-2 py-3">
-                  <v-btn
-                    v-for="a in detail.attachments"
-                    :key="a.id"
-                    variant="outlined"
-                    size="small"
-                    prepend-icon="mdi-paperclip"
-                    :href="api.attachmentURL(detail.id, a.id)"
+                <div class="reader-body-block">
+                  <div v-if="detail.attachments.length > 0 && lgAndUp" class="attach-row">
+                    <v-chip
+                      v-for="a in detail.attachments"
+                      :key="a.id"
+                      variant="outlined"
+                      prepend-icon="mdi-paperclip"
+                      :href="api.attachmentURL(detail.id, a.id)"
+                    >
+                      <span class="text-truncate" style="max-width: 40vw">{{ a.filename }}</span>
+                      <span class="text-medium-emphasis ml-1">{{ fmtSize(a.size) }}</span>
+                    </v-chip>
+                    <v-btn v-if="detail.attachments.length > 1" variant="text" size="small" @click="downloadAll(detail)">
+                      {{ t('全部下载') }}
+                    </v-btn>
+                  </div>
+                  <div v-else-if="detail.attachments.length > 0" class="d-flex flex-wrap ga-2 py-3">
+                    <v-btn
+                      v-for="a in detail.attachments"
+                      :key="a.id"
+                      variant="outlined"
+                      size="small"
+                      prepend-icon="mdi-paperclip"
+                      :href="api.attachmentURL(detail.id, a.id)"
+                    >
+                      <span class="text-truncate" style="max-width: 55vw">{{ a.filename }}</span>
+                      <span class="text-medium-emphasis ml-1">{{ fmtSize(a.size) }}</span>
+                    </v-btn>
+                  </div>
+                  <div v-if="detail.html" style="overflow: hidden">
+                    <iframe
+                      ref="frameEl"
+                      :title="t('邮件正文')"
+                      class="mt-2 d-block w-100 border-0"
+                      style="height: 480px; background: transparent"
+                      sandbox="allow-same-origin"
+                      :srcdoc="frameCss + detail.html"
+                      @load="frameLoaded"
+                    />
+                  </div>
+                  <div
+                    v-else-if="detail.text"
+                    class="py-3 text-body-2"
+                    :class="{ 'reader-text': lgAndUp }"
+                    :style="lgAndUp ? 'white-space: pre-wrap' : 'white-space: pre-wrap; line-height: 1.6'"
                   >
-                    <span class="text-truncate" style="max-width: 55vw">{{ a.filename }}</span>
-                    <span class="text-medium-emphasis ml-1">{{ fmtSize(a.size) }}</span>
-                  </v-btn>
+                    {{ detail.text }}
+                  </div>
+                  <p v-else class="py-6 text-body-2 text-medium-emphasis">{{ t('这封邮件没有可显示的正文。') }}</p>
                 </div>
-                <div v-if="detail.html" style="overflow: hidden">
-                  <iframe
-                    ref="frameEl"
-                    :title="t('邮件正文')"
-                    class="mt-2 d-block w-100 border-0"
-                    style="height: 480px; background: transparent"
-                    sandbox="allow-same-origin"
-                    :srcdoc="frameCss + detail.html"
-                    @load="frameLoaded"
-                  />
-                </div>
-                <div v-else-if="detail.text" class="py-3 text-body-2" style="white-space: pre-wrap; line-height: 1.6">
-                  {{ detail.text }}
-                </div>
-                <p v-else class="py-6 text-body-2 text-medium-emphasis">{{ t('这封邮件没有可显示的正文。') }}</p>
               </template>
               </div>
             </div>
@@ -2062,8 +2735,8 @@ onBeforeUnmount(() => {
         @click="openCompose({})"
       />
 
-      <v-dialog v-model="settingsOpen" z-index="2700" :fullscreen="!lgAndUp" max-width="920" scrollable transition="false" @update:model-value="(v) => { if (!v) closeSettings() }">
-        <v-card>
+      <v-dialog v-model="settingsOpen" :z-index="settingsZ" :fullscreen="!lgAndUp" :max-width="lgAndUp ? 1080 : 920" scrollable transition="false" @update:model-value="(v) => { if (!v) closeSettings() }">
+        <v-card style="border-radius: 28px">
           <v-card-title class="d-flex align-center">
             {{ t('设置') }}
             <v-spacer />
@@ -2109,7 +2782,7 @@ onBeforeUnmount(() => {
         </v-card>
       </v-dialog>
 
-      <Compose v-model="composeOpen" :accounts="accounts" :initial="composeInit" :undo-seconds="undoSeconds" :max-attachment-mb="maxAttachmentMB" @done="onComposeDone" />
+      <Compose v-model="composeOpen" :z-index="composeZ" :accounts="accounts" :initial="composeInit" :undo-seconds="undoSeconds" :max-attachment-mb="maxAttachmentMB" @done="onComposeDone" />
     </template>
   </v-app>
 </template>
@@ -2221,10 +2894,136 @@ body {
   width: 100%;
   padding: 0 12px;
 }
-@media (min-width: 1280px) {
-  .appbar-search {
-    width: 380px;
+.app-topbar {
+  background: rgb(var(--v-theme-surface));
+  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+}
+.topbar-desktop {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 0 16px 0 8px;
+}
+.topbar-menu-btn {
+  width: 48px;
+  height: 48px;
+  flex: none;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(var(--v-theme-on-surface), 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.topbar-menu-btn:hover {
+  background: rgba(var(--v-theme-on-surface), 0.06);
+}
+.topbar-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0 12px 0 4px;
+  color: rgb(var(--v-theme-on-surface));
+}
+.topbar-search {
+  flex: 0 1 720px;
+  min-width: 200px;
+}
+.topbar-search .v-field {
+  height: 56px;
+  border-radius: 28px;
+  background: rgb(var(--v-theme-surface-container-high));
+  box-shadow: none;
+}
+.topbar-search .v-field__input {
+  min-height: 56px;
+  padding-top: 0;
+  padding-bottom: 0;
+  font-size: 16px;
+}
+.topbar-sync {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(var(--v-theme-on-surface), 0.65);
+}
+.sync-spin {
+  animation: wm-spin 1.8s linear infinite;
+}
+@keyframes wm-spin {
+  to {
+    transform: rotate(360deg);
   }
+}
+.topbar-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: none;
+  margin-left: 8px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 15px;
+}
+@media (min-width: 1280px) {
+  .nav-drawer {
+    border-right: 1px solid rgb(var(--v-theme-outline-variant));
+  }
+  .nav-drawer .v-list-item {
+    min-height: 44px;
+  }
+  .nav-drawer .v-list-item--active {
+    background: rgb(var(--v-theme-primary-container));
+    color: rgb(var(--v-theme-on-primary-container));
+  }
+  .nav-drawer .v-list-item__prepend .v-icon {
+    font-size: 20px;
+  }
+}
+.nav-compose {
+  height: 56px !important;
+  width: 160px;
+  flex: none;
+  align-self: flex-start;
+  font-size: 15px;
+  margin-top: 4px;
+}
+.nav-range {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px 6px 12px;
+}
+.nav-range-label {
+  font-size: 13px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  flex: 1;
+  min-width: 0;
+}
+.nav-group-label {
+  font-size: 12px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  padding: 14px 12px 4px;
+}
+.nav-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: rgb(var(--v-theme-on-surface));
+}
+.nav-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+  display: block;
 }
 .list-section {
   display: flex;
@@ -2259,9 +3058,305 @@ body {
 }
 @media (min-width: 1280px) {
   .list-section {
-    flex: 0 0 380px;
-    border-right: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+    flex: 0 0 auto;
+    border-right: 1px solid rgb(var(--v-theme-outline-variant));
+    background: rgb(var(--v-theme-surface-container));
   }
+}
+.mail-layout.with-offline {
+  height: calc(100dvh - 100px);
+}
+.offline-bar {
+  height: 36px;
+  background: rgb(var(--v-theme-error-container));
+  color: rgb(var(--v-theme-on-error-container));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.list-head {
+  height: 48px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px 0 16px;
+  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+}
+.list-head-title {
+  font-size: 15px;
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.head-skel {
+  display: inline-block;
+  width: 90px;
+  height: 12px;
+  border-radius: 6px;
+  margin-left: 10px;
+  background: rgba(var(--v-theme-on-surface), 0.18);
+  animation: wm-pulse 1.2s ease-in-out infinite;
+}
+@keyframes wm-pulse {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.search-chips {
+  height: 40px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+}
+.list-toolbar {
+  height: 48px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+}
+.range-text {
+  margin-left: auto;
+  font-size: 12px;
+  color: rgb(var(--v-theme-on-surface-variant));
+}
+.list-progress {
+  height: 3px;
+  flex: none;
+}
+.list-error-bar {
+  flex: none;
+  background: rgb(var(--v-theme-error-container));
+  color: rgb(var(--v-theme-on-error-container));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+}
+.list-error-center {
+  display: flex;
+  justify-content: center;
+  padding: 32px 0;
+}
+.list-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 72px 16px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  font-size: 14px;
+}
+.list-skel {
+  background: transparent;
+}
+.newmail-pill {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  background: rgb(var(--v-theme-primary-container));
+  color: rgb(var(--v-theme-on-primary-container));
+  border: none;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+}
+.list-footer {
+  height: 36px;
+  flex: none;
+  border-top: 1px solid rgb(var(--v-theme-outline-variant));
+  display: flex;
+  align-items: center;
+}
+.list-drag {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 7;
+  touch-action: none;
+}
+.list-drag:hover {
+  background: rgb(var(--v-theme-primary));
+  opacity: 0.5;
+}
+.mail-row-d {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  height: 84px;
+  padding: 10px 12px;
+  cursor: pointer;
+  background: rgb(var(--v-theme-surface-container-low));
+}
+.mail-row-d.row-unread {
+  background: rgb(var(--v-theme-surface));
+}
+.mail-row-d.row-selected {
+  background: rgb(var(--v-theme-secondary-container));
+  box-shadow: inset 3px 0 0 rgb(var(--v-theme-primary));
+}
+.mail-row-d.row-cursor {
+  outline: 2px solid rgb(var(--v-theme-primary));
+  outline-offset: -2px;
+}
+@media (hover: hover) {
+  .mail-row-d:hover {
+    background: color-mix(
+      in srgb,
+      rgb(var(--v-theme-surface-container-low)) 95%,
+      rgb(var(--v-theme-on-surface))
+    );
+  }
+  .mail-row-d.row-unread:hover {
+    background: color-mix(
+      in srgb,
+      rgb(var(--v-theme-surface)) 95%,
+      rgb(var(--v-theme-on-surface))
+    );
+  }
+  .mail-row-d.row-selected:hover {
+    background: color-mix(
+      in srgb,
+      rgb(var(--v-theme-secondary-container)) 95%,
+      rgb(var(--v-theme-on-surface))
+    );
+  }
+}
+.row-check {
+  width: 28px;
+  flex: none;
+  display: flex;
+  justify-content: center;
+  padding-top: 1px;
+  opacity: 0;
+}
+.mail-row-d:hover .row-check,
+.row-check.row-check-on {
+  opacity: 1;
+}
+.mail-avatar-d {
+  flex: none;
+  margin-top: 1px;
+}
+.row-avatar-letter {
+  font-size: 13px;
+  font-weight: 500;
+}
+.row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+}
+.row-l1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.row-sender {
+  font-size: 15px;
+  line-height: 20px;
+  font-weight: 500;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-sender.w700 {
+  font-weight: 700;
+}
+.row-time {
+  font-size: 12px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  flex: none;
+}
+.row-thread {
+  font-size: 12px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  flex: none;
+  white-space: nowrap;
+}
+.row-l2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 19px;
+  font-weight: 400;
+}
+.row-l2.w600 {
+  font-weight: 600;
+}
+.row-subject {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-l2-snippet {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgb(var(--v-theme-on-surface-variant));
+  font-weight: 400;
+}
+.row-l3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.row-snippet {
+  font-size: 13px;
+  line-height: 18px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-chip {
+  flex: none;
+  height: 20px;
+  font-size: 11px;
+}
+.density-compact .mail-row-d {
+  height: 64px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+}
+.density-compact .row-avatar-letter {
+  font-size: 11px;
 }
 .list-scroll {
   flex: 1;
@@ -2290,11 +3385,90 @@ body {
 .v-navigation-drawer__scrim {
   z-index: 1999 !important;
 }
-@media (min-width: 1440px) {
-  .reader-scroll > * {
-    max-width: 900px;
+@media (min-width: 1280px) {
+  .reader-head-block {
+    max-width: 980px;
     margin-inline: auto;
   }
+  .reader-body-block {
+    max-width: 820px;
+    margin-inline: auto;
+    width: 100%;
+  }
+  .convo-card {
+    border: none !important;
+    border-bottom: 1px solid rgb(var(--v-theme-outline-variant)) !important;
+    border-radius: 0 !important;
+  }
+}
+.reader-toolbar {
+  height: 48px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+  background: rgb(var(--v-theme-surface));
+}
+.reader-subject {
+  font-size: 22px;
+  line-height: 30px;
+  font-weight: 400;
+  margin: 16px 0 8px;
+  overflow-wrap: anywhere;
+}
+.reader-from-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.reader-from-name {
+  font-size: 15px;
+  font-weight: 600;
+}
+.reader-from-addr {
+  font-size: 13px;
+  color: rgb(var(--v-theme-on-surface-variant));
+}
+.reader-time {
+  margin-left: auto;
+  font-size: 13px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  flex: none;
+}
+.reader-to-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  margin-top: 8px;
+}
+.reader-actions {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 4px;
+}
+.reader-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  font-size: 14px;
+}
+.reader-text {
+  font-size: 15px;
+  line-height: 27px;
+}
+.attach-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
 }
 .reader-main {
   display: flex;
@@ -2331,11 +3505,13 @@ body {
   opacity: 0;
 }
 .swipe-bg-left {
-  background: #2e7d32;
+  background: rgb(var(--v-theme-secondary-container));
+  color: rgb(var(--v-theme-on-secondary-container));
   justify-content: flex-start;
 }
 .swipe-bg-right {
-  background: rgb(var(--v-theme-error));
+  background: rgb(var(--v-theme-error-container));
+  color: rgb(var(--v-theme-on-error-container));
   justify-content: flex-end;
 }
 .mail-row {

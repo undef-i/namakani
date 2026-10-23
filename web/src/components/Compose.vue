@@ -20,6 +20,7 @@ const props = defineProps({
   initial: { type: Object, default: () => ({}) },
   undoSeconds: { type: Number, default: 5 },
   maxAttachmentMB: { type: Number, default: 20 },
+  zIndex: { type: Number, default: 2500 },
 })
 const emit = defineEmits(['update:modelValue', 'done'])
 
@@ -104,6 +105,7 @@ const savedAt = ref('')
 const fileInput = ref(null)
 const imageInput = ref(null)
 const maximized = ref(false)
+const minimized = ref(false)
 const dragOver = ref(false)
 const linkMenu = ref(false)
 const linkUrl = ref('')
@@ -310,6 +312,7 @@ watch(open, (isOpen) => {
   sending.value = false
   savedAt.value = ''
   maximized.value = false
+  minimized.value = false
   schedCustom.value = false
   let content = ''
   if (init.html) content = init.html
@@ -683,10 +686,11 @@ function onKeydown(e) {
   <div
     v-show="open"
     class="compose-root"
-    :style="!lgAndUp ? vvStyle : undefined"
+    :style="lgAndUp ? { zIndex: props.zIndex } : vvStyle"
     :class="{
       'compose-root-mobile': !lgAndUp,
       'compose-max': maximized && lgAndUp,
+      'compose-min': minimized && lgAndUp,
     }"
     @keydown="onKeydown"
     @dragover.prevent="dragOver = true"
@@ -703,6 +707,16 @@ function onKeydown(e) {
           icon
           size="small"
           variant="text"
+          :aria-label="t('最小化')"
+          @click.stop="minimized = !minimized"
+        >
+          <v-icon :icon="minimized ? 'mdi-chevron-up' : 'mdi-minus'" />
+        </v-btn>
+        <v-btn
+          v-if="lgAndUp"
+          icon
+          size="small"
+          variant="text"
           :aria-label="maximized ? t('还原') : t('全屏')"
           @click.stop="maximized = !maximized"
         >
@@ -711,11 +725,11 @@ function onKeydown(e) {
         <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" :disabled="busy" @click.stop="closeCompose" />
       </div>
 
-      <v-card-text v-if="done">
+      <v-card-text v-if="done && !minimized">
         <p class="text-body-2" style="overflow-wrap: anywhere">{{ warning }}</p>
       </v-card-text>
 
-      <div v-show="!done" class="compose-main">
+      <div v-show="!done && !minimized" class="compose-main">
         <div class="compose-body">
           <div class="cform">
             <div class="crow">
@@ -809,6 +823,21 @@ function onKeydown(e) {
                 class="cfield"
               />
             </div>
+          </div>
+
+          <div v-if="attachments.length > 0" class="compose-attach-chips">
+            <v-chip
+              v-for="(a, i) in attachments"
+              :key="a.filename + ':' + i"
+              closable
+              variant="outlined"
+              size="small"
+              :disabled="busy"
+              @click:close="removeAttachment(i)"
+            >
+              <span class="text-truncate" style="max-width: 40vw">{{ a.filename }}</span>
+              <span class="text-medium-emphasis ml-1">{{ fmtSize(a.size) }}</span>
+            </v-chip>
           </div>
 
           <div class="compose-editor">
@@ -952,24 +981,6 @@ function onKeydown(e) {
           </div>
 
           <div class="compose-pad">
-            <div class="d-flex align-center ga-2 mt-2 mb-2">
-              <v-btn variant="outlined" size="small" :disabled="busy" @click="fileInput?.click()">
-                {{ t('添加附件') }}
-              </v-btn>
-              <input ref="fileInput" type="file" multiple class="d-none" @change="onFilesChosen" />
-              <span class="text-caption text-medium-emphasis">{{ t('也可拖拽文件到窗口，或粘贴图片') }}</span>
-            </div>
-            <v-list v-if="attachments.length > 0" density="compact" class="mb-2">
-              <v-list-item v-for="(a, i) in attachments" :key="a.filename + ':' + i">
-                <v-list-item-title class="text-body-2">{{ a.filename }}</v-list-item-title>
-                <v-list-item-subtitle>{{ fmtSize(a.size) }}</v-list-item-subtitle>
-                <template #append>
-                  <v-btn variant="text" size="small" :disabled="busy" @click="removeAttachment(i)">
-                    {{ t('移除') }}
-                  </v-btn>
-                </template>
-              </v-list-item>
-            </v-list>
             <v-alert v-if="attachError" type="error" variant="tonal" density="compact" class="mb-2">
               {{ attachError }}
             </v-alert>
@@ -980,23 +991,16 @@ function onKeydown(e) {
         </div>
 
         <v-card-actions class="compose-actions">
-          <v-btn
-            icon="mdi-trash-can-outline"
-            variant="text"
-            color="error"
-            :aria-label="t('删除草稿')"
-            :disabled="busy || sending || undoShow"
-            @click="discardCompose"
-          >
-            <v-icon icon="mdi-trash-can-outline" />
-            <v-tooltip activator="parent" location="top">{{ t('删除草稿') }}</v-tooltip>
+          <v-btn variant="text" prepend-icon="mdi-paperclip" :disabled="busy" @click="fileInput?.click()">
+            {{ t('添加附件') }}
           </v-btn>
+          <input ref="fileInput" type="file" multiple class="d-none" @change="onFilesChosen" />
           <span v-if="savedAt" class="text-caption text-medium-emphasis ml-1">
             {{ t('草稿已保存 {time}', { time: savedAt }) }}
           </span>
           <v-spacer />
           <v-btn-group color="primary" variant="elevated" density="comfortable" class="ml-2">
-            <v-btn :disabled="busy" :loading="sending" @click="doSend">
+            <v-btn prepend-icon="mdi-send" :disabled="busy" :loading="sending" @click="doSend">
               {{ sending ? t('发送中') : t('发送') }}
             </v-btn>
             <v-menu v-model="schedMenu" :close-on-content-click="false" location="top end" z-index="2600">
@@ -1026,10 +1030,21 @@ function onKeydown(e) {
               </v-card>
             </v-menu>
           </v-btn-group>
+          <v-btn
+            icon="mdi-trash-can-outline"
+            variant="text"
+            color="error"
+            :aria-label="t('删除草稿')"
+            :disabled="busy || sending || undoShow"
+            @click="discardCompose"
+          >
+            <v-icon icon="mdi-trash-can-outline" />
+            <v-tooltip activator="parent" location="top">{{ t('删除草稿') }}</v-tooltip>
+          </v-btn>
         </v-card-actions>
       </div>
 
-      <v-card-actions v-if="done">
+      <v-card-actions v-if="done && !minimized">
         <v-spacer />
         <v-btn color="primary" @click="closeAfterDone">{{ t('关闭') }}</v-btn>
       </v-card-actions>
@@ -1054,8 +1069,8 @@ function onKeydown(e) {
 .compose-root {
   position: fixed;
   right: 24px;
-  bottom: 0;
-  width: 560px;
+  bottom: 24px;
+  width: 600px;
   max-width: calc(100vw - 48px);
   z-index: 2500;
 }
@@ -1069,13 +1084,33 @@ function onKeydown(e) {
   width: auto;
   max-width: none;
 }
+.compose-min {
+  inset: auto;
+  right: 24px;
+  bottom: 24px;
+  width: 320px;
+}
+.compose-min .compose-card {
+  height: 48px;
+}
 .compose-card {
   position: relative;
   display: flex;
   flex-direction: column;
-  height: min(660px, calc(100dvh - 88px));
-  border-radius: 16px 16px 0 0;
-  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.35);
+  height: min(640px, calc(100dvh - 96px));
+  border-radius: 16px;
+  box-shadow:
+    0 4px 8px rgba(0, 0, 0, 0.14),
+    0 12px 28px rgba(0, 0, 0, 0.18);
+}
+.compose-attach-chips {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 32dvh;
+  overflow-y: auto;
+  padding: 8px 16px 0;
 }
 .compose-root-mobile .compose-card {
   height: 100%;
@@ -1111,8 +1146,6 @@ function onKeydown(e) {
 }
 .compose-pad {
   flex: none;
-  max-height: 32dvh;
-  overflow-y: auto;
   padding-left: 16px;
   padding-right: 16px;
 }
@@ -1178,6 +1211,10 @@ function onKeydown(e) {
   border: none;
 }
 .compose-root-mobile .compose-pad {
+  padding-left: 12px;
+  padding-right: 12px;
+}
+.compose-root-mobile .compose-attach-chips {
   padding-left: 12px;
   padding-right: 12px;
 }

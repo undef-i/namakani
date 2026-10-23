@@ -55,6 +55,16 @@ export const getMessages = (special, offset = 0, limit = 60, threaded = false) =
       offset +
       (threaded ? '&threaded=1' : ''),
   )
+export const getFolderMessages = (folderId, offset = 0, limit = 60, threaded = false) =>
+  req(
+    '/api/messages?folder_id=' +
+      folderId +
+      '&limit=' +
+      limit +
+      '&offset=' +
+      offset +
+      (threaded ? '&threaded=1' : ''),
+  )
 export const getThreadMessages = (special, accountId, threadKey) =>
   req(
     '/api/messages?special=' +

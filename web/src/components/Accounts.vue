@@ -1,7 +1,45 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
+import { useDisplay } from 'vuetify'
 import { intlLocale, lang, setLang, t } from '../i18n'
+import { avatarColorFor, avatarLetterFor } from '../avatar.js'
 import * as api from '../api.js'
+
+const display = useDisplay()
+const lgAndUp = computed(() => display.lgAndUp.value)
+const activeSection = ref('accounts')
+
+function showSection(s) {
+  return !lgAndUp.value || activeSection.value === s
+}
+
+const SECTIONS = computed(() => [
+  { key: 'accounts', label: t('账号'), icon: 'mdi-account-multiple' },
+  { key: 'appearance', label: t('外观'), icon: 'mdi-palette' },
+  { key: 'compose', label: t('写信与发送'), icon: 'mdi-email-edit' },
+  { key: 'telegram', label: 'Telegram', icon: 'mdi-send-circle' },
+  { key: 'advanced', label: t('高级'), icon: 'mdi-cog' },
+])
+
+function kindText(a) {
+  if (a.kind === 'proton') return 'Proton Mail'
+  if (a.kind === 'tuta') return 'Tuta Mail'
+  return (
+    'IMAP ' + a.imap_host + ':' + a.imap_port + ' (' + a.imap_tls + ')' + t('，') +
+    'SMTP ' + a.smtp_host + ':' + a.smtp_port + ' (' + a.smtp_tls + ')'
+  )
+}
+
+function statusChip(a) {
+  const st = props.statuses[a.id]
+  if (!st) return null
+  if (st.state === 'idle') return { text: t('已同步 {time}', { time: fmtListTime(st.last_sync_at) }), cls: 'st-ok', busy: false }
+  if (st.state === 'syncing' || st.state === 'connecting')
+    return { text: t('同步中'), cls: 'st-busy', busy: true }
+  if (st.state === 'repair') return { text: t('需要手动修复'), cls: 'st-err', busy: false }
+  if (st.state === 'error') return { text: t('同步失败'), cls: 'st-err', busy: false }
+  return { text: t('未同步'), cls: 'st-busy', busy: false }
+}
 
 const props = defineProps({
   accounts: { type: Array, default: () => [] },
@@ -73,7 +111,7 @@ function cacheText(a) {
   const st = props.statuses[a.id]
   if (!st || !(st.cache_bodies_total > 0)) return ''
   return (
-    t('正文缓存 {a}/{b}，附件 {c}/{d}', {
+    t('正文缓存 ({a}/{b}) 附件 ({c}/{d})', {
       a: st.cache_bodies_cached,
       b: st.cache_bodies_total,
       c: st.cache_attachments_cached,
@@ -552,7 +590,22 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="mx-auto w-100 pa-4" style="max-width: 880px">
+  <div class="settings-root">
+    <nav v-if="lgAndUp" class="settings-nav">
+      <button
+        v-for="s in SECTIONS"
+        :key="s.key"
+        type="button"
+        class="settings-nav-item"
+        :class="{ 'nav-on': activeSection === s.key }"
+        @click="activeSection = s.key"
+      >
+        <v-icon :icon="s.icon" size="20" />
+        <span>{{ s.label }}</span>
+      </button>
+    </nav>
+    <div class="settings-content">
+    <section v-if="showSection('accounts')">
     <div class="d-flex align-center justify-space-between mb-3">
       <h2 class="text-h6">{{ t('邮箱账号') }}</h2>
       <v-btn color="primary" prepend-icon="mdi-plus" @click="openCreate">{{ t('添加账号') }}</v-btn>
@@ -584,6 +637,54 @@ onMounted(() => {
     <p v-else-if="accounts.length === 0" class="text-body-2 text-medium-emphasis">
       {{ t('还没有账号。添加第一个邮箱后，它的邮件会自动同步进聚合收件箱。') }}
     </p>
+    <div v-else-if="lgAndUp" class="acct-list">
+      <div v-for="a in accounts" :key="a.id" class="acct-row">
+        <v-avatar :color="avatarColorFor(a.email)" size="40" class="flex-none">
+          <span class="avatar-letter" style="font-size: 16px">{{ avatarLetterFor(a.label, a.email) }}</span>
+        </v-avatar>
+        <div class="acct-main">
+          <div class="acct-name">
+            {{ a.label }}<span class="acct-addr">{{ a.email }}</span>
+          </div>
+          <div class="acct-kind">{{ kindText(a) }}</div>
+          <div
+            v-if="statuses[a.id]"
+            class="acct-status"
+            :class="{ err: statuses[a.id].state === 'error' || statuses[a.id].state === 'repair' }"
+          >
+            {{ statusText(a) }}<template v-if="cacheText(a)"> {{ cacheText(a) }}</template>
+          </div>
+          <div v-if="statuses[a.id] && statuses[a.id].state === 'repair'" class="mt-2">
+            <div v-if="statuses[a.id].last_error" class="text-body-2 text-error" style="overflow-wrap: anywhere">
+              {{ statuses[a.id].last_error }}
+            </div>
+            <v-btn
+              size="small"
+              variant="outlined"
+              color="primary"
+              class="mt-2"
+              :loading="reconnecting === a.id"
+              @click="reconnect(a)"
+            >
+              {{ t('重新连接') }}
+            </v-btn>
+          </div>
+        </div>
+        <span v-if="statusChip(a)" class="acct-chip" :class="statusChip(a).cls">
+          {{ statusChip(a).text }}
+          <v-progress-linear v-if="statusChip(a).busy" indeterminate height="2" class="acct-chip-bar" />
+        </span>
+        <v-menu>
+          <template #activator="{ props: mp }">
+            <v-btn v-bind="mp" icon="mdi-dots-vertical" variant="text" size="small" :aria-label="t('更多')" />
+          </template>
+          <v-list density="compact">
+            <v-list-item :title="t('编辑')" @click="openEdit(a)" />
+            <v-list-item :title="t('删除')" @click="askDelete(a)" />
+          </v-list>
+        </v-menu>
+      </div>
+    </div>
     <div v-else class="d-flex flex-column ga-3">
       <v-card v-for="a in accounts" :key="a.id" variant="outlined" rounded="lg">
         <v-card-text>
@@ -607,7 +708,7 @@ onMounted(() => {
             :class="statuses[a.id].state === 'error' || statuses[a.id].state === 'repair' ? 'text-error font-weight-medium' : 'text-medium-emphasis'"
             style="overflow-wrap: anywhere"
           >
-            {{ statusText(a) }}<template v-if="cacheText(a)">{{ t('，') }}{{ cacheText(a) }}</template>
+            {{ statusText(a) }}<template v-if="cacheText(a)"> {{ cacheText(a) }}</template>
           </div>
           <div v-if="statuses[a.id] && statuses[a.id].state === 'repair'" class="mt-2">
             <div v-if="statuses[a.id].last_error" class="text-body-2 text-error" style="overflow-wrap: anywhere">
@@ -628,8 +729,9 @@ onMounted(() => {
       </v-card>
     </div>
 
-    <v-divider class="my-6" />
+    </section>
 
+    <section v-if="showSection('appearance')" class="settings-sec">
     <h2 class="text-h6 mb-3">{{ t('外观') }}</h2>
     <div style="max-width: 640px">
       <div class="text-body-2 mb-2">{{ t('深色模式') }}</div>
@@ -655,16 +757,6 @@ onMounted(() => {
         @update:model-value="emit('update:threaded', $event)"
       />
       <v-select
-        :model-value="undoSeconds"
-        :items="undoItems"
-        :label="t('撤销发送等待')"
-        variant="outlined"
-        density="comfortable"
-        hide-details
-        style="max-width: 260px"
-        @update:model-value="emit('update:undoSeconds', $event)"
-      />
-      <v-select
         :model-value="lang"
         :items="[
           { title: '中文', value: 'zh' },
@@ -680,8 +772,9 @@ onMounted(() => {
       />
     </div>
 
-    <v-divider class="my-6" />
+    </section>
 
+    <section v-if="showSection('advanced')" class="settings-sec">
     <h2 class="text-h6 mb-3">{{ t('同步与缓存') }}</h2>
     <v-skeleton-loader v-if="appSetState === 'loading'" type="article" />
     <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" class="mb-3">
@@ -733,8 +826,22 @@ onMounted(() => {
       <v-btn color="primary" :loading="appSetBusy" @click="saveAppSet">{{ t('保存') }}</v-btn>
     </div>
 
-    <v-divider class="my-6" />
+    </section>
 
+    <section v-if="showSection('compose')" class="settings-sec">
+    <h2 class="text-h6 mb-3">{{ t('写信与发送') }}</h2>
+    <div style="max-width: 640px" class="mb-6">
+      <v-select
+        :model-value="undoSeconds"
+        :items="undoItems"
+        :label="t('撤销发送等待')"
+        variant="outlined"
+        density="comfortable"
+        hide-details
+        style="max-width: 260px"
+        @update:model-value="emit('update:undoSeconds', $event)"
+      />
+    </div>
     <h2 class="text-h6 mb-3">{{ t('定时发送') }}</h2>
     <template v-if="schStatus === 'loading'">
       <v-skeleton-loader type="list-item-two-line@2" max-width="640" />
@@ -763,8 +870,9 @@ onMounted(() => {
       </v-list>
     </template>
 
-    <v-divider class="my-6" />
+    </section>
 
+    <section v-if="showSection('telegram')" class="settings-sec">
     <h2 class="text-h6 mb-3">{{ t('Telegram 推送') }}</h2>
     <template v-if="tgStatus === 'loading'">
       <v-skeleton-loader type="article" max-width="640" />
@@ -806,9 +914,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <v-divider class="my-6" />
-
-    <h2 class="text-h6 mb-3">{{ t('浏览器推送') }}</h2>
+    <h2 class="text-h6 mb-3 mt-8">{{ t('浏览器推送') }}</h2>
     <template v-if="wpStatus === 'loading'">
       <v-skeleton-loader type="article" max-width="640" />
     </template>
@@ -841,16 +947,18 @@ onMounted(() => {
       </div>
     </div>
 
-    <v-divider class="my-6" />
-    <div class="text-center text-caption text-medium-emphasis pb-10">
+    </section>
+
+    <div class="text-center text-caption text-medium-emphasis pb-10 mt-8">
       <div>Namakani</div>
       <div v-if="version" class="mt-1">{{ t('版本 {version}', { version }) }}</div>
       <div class="mt-1">© 2026 namakani</div>
     </div>
+    </div>
   </div>
 
   <v-dialog v-model="dialogOpen" max-width="560">
-    <v-card>
+    <v-card style="border-radius: 28px">
       <v-card-title>{{ editing ? t('编辑账号') : t('添加账号') }}</v-card-title>
       <v-card-text>
         <v-form @submit.prevent="save">
@@ -963,7 +1071,7 @@ onMounted(() => {
           </template>
           <div class="d-flex align-center ga-2 mb-2">
             <v-btn
-              variant="outlined"
+              variant="tonal"
               :prepend-icon="testOk ? 'mdi-check' : 'mdi-connection'"
               :color="testOk ? 'success' : undefined"
               :loading="testBusy"
@@ -1002,3 +1110,123 @@ onMounted(() => {
     {{ snack.text }}
   </v-snackbar>
 </template>
+
+<style>
+.settings-root {
+  display: flex;
+  align-items: flex-start;
+  width: 100%;
+}
+.settings-nav {
+  width: 240px;
+  flex: none;
+  position: sticky;
+  top: 0;
+  padding: 16px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 44px;
+  padding: 0 16px;
+  border: none;
+  background: transparent;
+  border-radius: 999px;
+  font-size: 14px;
+  color: rgb(var(--v-theme-on-surface));
+  cursor: pointer;
+  text-align: left;
+}
+.settings-nav-item.nav-on {
+  background: rgb(var(--v-theme-primary-container));
+  color: rgb(var(--v-theme-on-primary-container));
+  font-weight: 600;
+}
+.settings-content {
+  flex: 1;
+  min-width: 0;
+  max-width: 880px;
+  margin-inline: auto;
+  padding: 16px;
+}
+.settings-sec {
+  margin-top: 24px;
+}
+.settings-content > section:first-child {
+  margin-top: 0;
+}
+.acct-list {
+  display: flex;
+  flex-direction: column;
+}
+.acct-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 8px;
+  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+}
+.acct-main {
+  flex: 1;
+  min-width: 0;
+}
+.acct-name {
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.acct-addr {
+  font-size: 13px;
+  font-weight: 400;
+  color: rgb(var(--v-theme-on-surface-variant));
+  margin-left: 8px;
+}
+.acct-kind {
+  font-size: 13px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  overflow-wrap: anywhere;
+}
+.acct-status {
+  font-size: 13px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.acct-status.err {
+  color: rgb(var(--v-theme-error));
+  font-weight: 500;
+}
+.acct-chip {
+  position: relative;
+  flex: none;
+  border-radius: 999px;
+  padding: 4px 10px 6px;
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+}
+.acct-chip.st-ok {
+  background: rgb(var(--v-theme-secondary-container));
+  color: rgb(var(--v-theme-on-secondary-container));
+}
+.acct-chip.st-busy {
+  background: rgb(var(--v-theme-surface-container-high));
+  color: rgb(var(--v-theme-on-surface));
+}
+.acct-chip.st-err {
+  background: rgb(var(--v-theme-error-container));
+  color: rgb(var(--v-theme-on-error-container));
+}
+.acct-chip-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+}
+</style>
