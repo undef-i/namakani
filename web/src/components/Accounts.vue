@@ -1245,7 +1245,8 @@ onMounted(() => {
   width: 240px;
   flex: none;
   padding: 16px 8px;
-  overflow-y: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
 }
 .settings-content {
   flex: 1;
@@ -1253,7 +1254,8 @@ onMounted(() => {
   max-width: 880px;
   margin-inline: auto;
   padding: 16px;
-  overflow-y: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
   min-height: 0;
 }
 .settings-sec {

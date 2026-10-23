@@ -3196,7 +3196,8 @@ body {
 }
 .list-scroll {
   flex: 1;
-  overflow-y: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
   overscroll-behavior-y: none;
 }
 .drawer-inner .v-list--nav {
@@ -3213,6 +3214,10 @@ body {
   inset: 0;
   z-index: 2000;
   background: rgb(var(--v-theme-surface));
+}
+.v-navigation-drawer__content {
+  overflow-y: scroll !important;
+  scrollbar-gutter: stable;
 }
 .v-navigation-drawer--temporary {
   top: 0 !important;
@@ -3321,7 +3326,8 @@ body {
 .reader-scroll {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
   overflow-x: hidden;
 }
 @media (hover: none) {

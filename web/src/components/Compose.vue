@@ -117,7 +117,6 @@ const schedInfoShow = ref(false)
 const undoShow = ref(false)
 const undoLeft = ref(0)
 const showCc = ref(false)
-const showBcc = ref(false)
 const contacts = ref([])
 const contactsError = ref(false)
 let saveTimer = null
@@ -298,8 +297,7 @@ watch(open, (isOpen) => {
   toChips.value = splitAddrStr(init.to ?? '')
   ccChips.value = splitAddrStr(init.cc ?? '')
   bccChips.value = splitAddrStr(init.bcc ?? '')
-  showCc.value = ccChips.value.length > 0
-  showBcc.value = bccChips.value.length > 0
+  showCc.value = ccChips.value.length > 0 || bccChips.value.length > 0
   toSearch.value = ''
   ccSearch.value = ''
   bccSearch.value = ''
@@ -765,21 +763,14 @@ function onKeydown(e) {
                 class="cfield"
               />
               <v-btn
+                icon="mdi-chevron-down"
                 size="x-small"
                 variant="text"
-                :color="showCc ? 'primary' : undefined"
+                :aria-label="t('抄送和密送')"
+                class="chev-btn"
+                :class="{ 'chev-open': showCc }"
                 @click="showCc = !showCc"
-              >
-                {{ t('抄送') }}
-              </v-btn>
-              <v-btn
-                size="x-small"
-                variant="text"
-                :color="showBcc ? 'primary' : undefined"
-                @click="showBcc = !showBcc"
-              >
-                {{ t('密送') }}
-              </v-btn>
+              />
             </div>
             <p v-if="toInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: toInvalid.join(t('，')) }) }}</p>
             <p v-if="contactsError" class="cerr">
@@ -806,7 +797,7 @@ function onKeydown(e) {
               />
             </div>
             <p v-if="showCc && ccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: ccInvalid.join(t('，')) }) }}</p>
-            <div v-if="showBcc" class="crow">
+            <div v-if="showCc" class="crow">
               <span class="clabel">{{ t('密送') }}</span>
               <v-combobox
                 @keydown.capture.enter="onBccEnter"
@@ -825,7 +816,7 @@ function onKeydown(e) {
                 class="cfield"
               />
             </div>
-            <p v-if="showBcc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
+            <p v-if="showCc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
             <div class="crow">
               <v-text-field
                 v-model="subject"
@@ -1012,6 +1003,17 @@ function onKeydown(e) {
             {{ t('草稿已保存 {time}', { time: savedAt }) }}
           </span>
           <v-spacer />
+          <v-btn
+            icon="mdi-trash-can-outline"
+            variant="text"
+            color="error"
+            :aria-label="t('删除草稿')"
+            :disabled="busy || sending || undoShow"
+            @click="discardCompose"
+          >
+            <v-icon icon="mdi-trash-can-outline" />
+            <v-tooltip activator="parent" location="top">{{ t('删除草稿') }}</v-tooltip>
+          </v-btn>
           <v-btn-group color="primary" variant="elevated" density="comfortable" class="ml-2">
             <v-btn prepend-icon="mdi-send" :disabled="busy" :loading="sending" @click="doSend">
               {{ sending ? t('发送中') : t('发送') }}
@@ -1043,17 +1045,6 @@ function onKeydown(e) {
               </v-card>
             </v-menu>
           </v-btn-group>
-          <v-btn
-            icon="mdi-trash-can-outline"
-            variant="text"
-            color="error"
-            :aria-label="t('删除草稿')"
-            :disabled="busy || sending || undoShow"
-            @click="discardCompose"
-          >
-            <v-icon icon="mdi-trash-can-outline" />
-            <v-tooltip activator="parent" location="top">{{ t('删除草稿') }}</v-tooltip>
-          </v-btn>
         </v-card-actions>
       </div>
 
@@ -1121,7 +1112,8 @@ function onKeydown(e) {
   flex-wrap: wrap;
   gap: 6px;
   max-height: 32dvh;
-  overflow-y: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
   padding: 8px 16px 0;
 }
 .compose-root-mobile .compose-card {
@@ -1178,6 +1170,13 @@ function onKeydown(e) {
   font-size: 13px;
   color: rgba(var(--v-theme-on-surface), 0.6);
 }
+.chev-btn {
+  flex: none;
+  transition: transform 0.2s ease;
+}
+.chev-btn.chev-open {
+  transform: rotate(180deg);
+}
 .cfield {
   flex: 1;
   min-width: 0;
@@ -1232,7 +1231,8 @@ function onKeydown(e) {
   flex: none;
 }
 .compose-root-mobile .compose-body {
-  overflow-y: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
 }
 .compose-root-mobile .compose-editarea {
   flex: none;
@@ -1259,7 +1259,8 @@ function onKeydown(e) {
 .compose-editarea .ProseMirror {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
   padding: 12px 16px;
   outline: none;
   font-size: 14px;
