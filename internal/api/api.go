@@ -1422,9 +1422,11 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		for i := range page {
 			if page[i].repID == 0 {
 				var id int64
-				if err := s.st.DB.QueryRow(`SELECT id FROM messages
-					WHERE account_id = ? AND thread_key = ?
-					ORDER BY date_ts DESC, id DESC LIMIT 1`, page[i].acct, page[i].tk).Scan(&id); err != nil {
+				repArgs := append(append([]any{}, args...), page[i].acct, page[i].tk)
+				if err := s.st.DB.QueryRow(`SELECT m.id
+					FROM messages m JOIN folders f ON f.id = m.folder_id
+					WHERE `+where+` AND m.account_id = ? AND m.thread_key = ?
+					ORDER BY m.date_ts DESC, m.id DESC LIMIT 1`, repArgs...).Scan(&id); err != nil {
 					writeErr(w, http.StatusInternalServerError, "list threads failed")
 					return
 				}
