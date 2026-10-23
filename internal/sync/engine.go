@@ -472,14 +472,39 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 	}
 }
 
+const (
+	watchRetryBase = 5 * time.Second
+	watchRetryCap  = 2 * time.Minute
+)
+
 func (m *Manager) watchFolder(ctx context.Context, acct mail.Account, r folderRef, kick chan<- struct{}) {
+	failures := 0
 	for {
+		started := time.Now()
 		err := m.watchSession(ctx, acct, r, kick)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
 			log.Printf("sync account %d folder %s watch: %v", acct.ID, r.name, err)
+		}
+		if time.Since(started) >= watchRetryCap {
+			failures = 0
+		}
+		delay := watchRetryBase
+		for i := 0; i < failures && delay < watchRetryCap; i++ {
+			delay *= 2
+		}
+		if delay > watchRetryCap {
+			delay = watchRetryCap
+		}
+		failures++
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 }
