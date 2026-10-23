@@ -1862,7 +1862,7 @@ onBeforeUnmount(() => {
           </div>
 
           <template v-if="foldersStatus === 'loading'">
-            <v-skeleton-loader type="list-item@10" />
+            <v-skeleton-loader type="list-item@10" class="skel-fill" />
           </template>
           <template v-else-if="foldersStatus === 'error'">
             <p class="text-body-2 text-error px-1">
@@ -1871,7 +1871,7 @@ onBeforeUnmount(() => {
             </p>
           </template>
           <template v-else>
-            <v-list density="compact" nav class="pa-0">
+            <v-list density="compact" nav>
               <v-list-item
                 v-for="s in visibleScopes"
                 :key="s.key"
@@ -1894,7 +1894,7 @@ onBeforeUnmount(() => {
 
           <div class="mt-auto">
             <v-divider class="mb-2" />
-            <v-list density="compact" nav class="pa-0">
+            <v-list density="compact" nav>
               <v-list-item
                 prepend-icon="mdi-cog"
                 :title="t('设置')"
@@ -2113,10 +2113,10 @@ onBeforeUnmount(() => {
             </div>
 
             <div ref="listEl" class="list-scroll" @scroll="onListScroll">
-              <div>
+              <div class="h-100">
               <template v-if="listStatus === 'loading'">
-                <v-skeleton-loader v-if="lgAndUp" type="list-item-avatar-three-line@12" class="list-skel" />
-                <v-skeleton-loader v-else type="list-item-three-line@24" />
+                <v-skeleton-loader v-if="lgAndUp" type="list-item-avatar-three-line@16" class="list-skel skel-fixed" />
+                <v-skeleton-loader v-else type="list-item-three-line@24" class="skel-fixed" />
               </template>
               <template v-else-if="listStatus === 'error'">
                 <template v-if="lgAndUp">
@@ -2309,7 +2309,7 @@ onBeforeUnmount(() => {
                 </h2>
                 <p class="text-caption text-medium-emphasis mb-3">{{ t('共 {n} 封', { n: convo.msgs.length }) }}</p>
                 <template v-if="convo.status === 'loading'">
-                  <v-skeleton-loader type="list-item-three-line@12" />
+                  <v-skeleton-loader type="list-item-three-line@12" class="skel-fixed" />
                 </template>
                 <v-alert v-else-if="convo.status === 'error'" type="error" variant="tonal" density="compact">
                   {{ t('会话加载失败') }}
@@ -2421,7 +2421,7 @@ onBeforeUnmount(() => {
                         </div>
                         <p v-else class="py-4 text-body-2 text-medium-emphasis">{{ t('这封邮件没有可显示的正文。') }}</p>
                       </template>
-                      <v-skeleton-loader v-else type="paragraph@2" />
+                      <v-skeleton-loader v-else type="paragraph@2" class="skel-clip" />
                     </div>
                   </div>
                 </div>
@@ -2576,7 +2576,7 @@ onBeforeUnmount(() => {
               </template>
 
               <template v-if="detailState === 'loading'">
-                <v-skeleton-loader type="paragraph@10" class="py-4 reader-body-block" />
+                <v-skeleton-loader type="paragraph@10" class="py-4 reader-body-block skel-clip" />
               </template>
               <template v-else-if="detailState === 'error'">
                 <v-alert type="error" variant="tonal" density="compact" class="my-4">
@@ -3059,8 +3059,7 @@ body {
   background: rgb(var(--v-theme-surface));
 }
 .mail-row-d.row-selected {
-  background: rgb(var(--v-theme-secondary-container));
-  box-shadow: inset 3px 0 0 rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), var(--v-activated-opacity));
 }
 .mail-row-d.row-cursor {
   outline: 2px solid rgb(var(--v-theme-primary));
@@ -3082,11 +3081,7 @@ body {
     );
   }
   .mail-row-d.row-selected:hover {
-    background: color-mix(
-      in srgb,
-      rgb(var(--v-theme-secondary-container)) 95%,
-      rgb(var(--v-theme-on-surface))
-    );
+    background: rgba(var(--v-theme-primary), calc(var(--v-activated-opacity) + 0.05));
   }
 }
 .row-check {
@@ -3196,12 +3191,10 @@ body {
 }
 .list-scroll {
   flex: 1;
-  overflow-y: scroll;
-  scrollbar-gutter: stable;
+  overflow-y: auto;
+  overflow-y: overlay;
+  overflow-anchor: none;
   overscroll-behavior-y: none;
-}
-.drawer-inner .v-list--nav {
-  padding-inline: 0;
 }
 .reader-section {
   flex: 1 1 auto;
@@ -3216,8 +3209,9 @@ body {
   background: rgb(var(--v-theme-surface));
 }
 .v-navigation-drawer__content {
-  overflow-y: scroll !important;
-  scrollbar-gutter: stable;
+  overflow-y: auto !important;
+  overflow-y: overlay !important;
+  overflow-anchor: none;
 }
 .v-navigation-drawer--temporary {
   top: 0 !important;
@@ -3326,8 +3320,9 @@ body {
 .reader-scroll {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: scroll;
-  scrollbar-gutter: stable;
+  overflow-y: auto;
+  overflow-y: overlay;
+  overflow-anchor: none;
   overflow-x: hidden;
 }
 @media (hover: none) {
@@ -3403,7 +3398,7 @@ body {
   }
 }
 .mail-row-active {
-  background: rgba(var(--v-theme-primary), 0.1);
+  background: rgba(var(--v-theme-primary), var(--v-activated-opacity));
 }
 
 .unread-dot {
@@ -3421,13 +3416,6 @@ body {
 .fab-compose {
   margin: 0 16px 16px 0;
   z-index: 40;
-}
-.border-b {
-  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-}
-.border-y {
-  border-top: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
 }
 .font-mono {
   font-family: ui-monospace, monospace;

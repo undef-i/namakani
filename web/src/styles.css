@@ -35,3 +35,18 @@ body,
 .avatar-letter {
   color: rgba(20, 22, 25, 0.82);
 }
+
+.skel-fixed {
+  overflow: hidden;
+  height: 100%;
+}
+
+.skel-fill {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.skel-clip {
+  overflow: hidden;
+}

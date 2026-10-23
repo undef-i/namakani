@@ -674,7 +674,7 @@ onMounted(() => {
 <template>
   <div class="settings-root">
     <nav v-if="lgAndUp" class="settings-nav">
-      <v-list nav density="comfortable" class="pa-0 bg-transparent">
+      <v-list nav density="comfortable" class="bg-transparent">
         <v-list-item
           v-for="s in SECTIONS"
           :key="s.key"
@@ -694,12 +694,12 @@ onMounted(() => {
 
     <template v-if="accountsStatus === 'loading'">
       <div v-if="lgAndUp" class="acct-list">
-        <v-skeleton-loader :type="'list-item-avatar-three-line@' + (accounts.length || 5)" />
+        <v-skeleton-loader :type="'list-item-avatar-three-line@' + (accounts.length || 5)" class="skel-clip" />
       </div>
       <div v-else class="d-flex flex-column ga-3">
         <v-card v-for="i in (accounts.length || 3)" :key="i" variant="outlined">
           <v-card-text>
-            <v-skeleton-loader type="list-item-three-line" />
+            <v-skeleton-loader type="list-item-three-line" class="skel-clip" />
           </v-card-text>
         </v-card>
       </div>
@@ -851,7 +851,7 @@ onMounted(() => {
 
     <section v-if="showSection('advanced')" class="settings-sec">
     <h2 class="text-h6 mb-3">{{ t('同步与缓存') }}</h2>
-    <v-skeleton-loader v-if="appSetState === 'loading'" type="article" />
+    <v-skeleton-loader v-if="appSetState === 'loading'" type="article" class="skel-clip" />
     <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" class="mb-3">
       {{ t('设置加载失败：{error}', { error: appSetError }) }}
       <v-btn variant="text" size="small" @click="loadAppSet">{{ t('重试') }}</v-btn>
@@ -919,7 +919,7 @@ onMounted(() => {
     </div>
     <h2 class="text-h6 mb-3">{{ t('定时发送') }}</h2>
     <template v-if="schStatus === 'loading'">
-      <v-skeleton-loader type="list-item-two-line@2" max-width="640" />
+      <v-skeleton-loader type="list-item-two-line@2" max-width="640" class="skel-clip" />
     </template>
     <template v-else-if="schStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact" max-width="640">
@@ -951,7 +951,7 @@ onMounted(() => {
     <h2 class="text-h6 mb-3">{{ t('推送') }}</h2>
     <div class="text-subtitle-1 font-weight-medium mb-3">Telegram</div>
     <template v-if="tgStatus === 'loading'">
-      <v-skeleton-loader type="article" max-width="640" />
+      <v-skeleton-loader type="article" max-width="640" class="skel-clip" />
     </template>
     <template v-else-if="tgStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact" max-width="640">
@@ -992,7 +992,7 @@ onMounted(() => {
 
     <div class="text-subtitle-1 font-weight-medium mb-3 mt-8">{{ t('浏览器推送') }}</div>
     <template v-if="wpStatus === 'loading'">
-      <v-skeleton-loader type="article" max-width="640" />
+      <v-skeleton-loader type="article" max-width="640" class="skel-clip" />
     </template>
     <template v-else-if="wpStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact" max-width="640">
@@ -1038,11 +1038,19 @@ onMounted(() => {
       <v-card-title>{{ editing ? t('编辑账号') : t('添加账号') }}</v-card-title>
       <v-card-text>
         <v-form @submit.prevent="save">
-          <v-btn-toggle v-model="form.kind" mandatory :disabled="!!editing" color="primary" density="compact" class="mb-3">
-            <v-btn value="imap">{{ t('IMAP/SMTP') }}</v-btn>
-            <v-btn value="proton">Proton Mail</v-btn>
-            <v-btn value="tuta">Tuta Mail</v-btn>
-          </v-btn-toggle>
+          <v-select
+            v-model="form.kind"
+            :label="t('账号类型')"
+            :items="[
+              { title: t('IMAP/SMTP'), value: 'imap' },
+              { title: 'Proton Mail', value: 'proton' },
+              { title: 'Tuta Mail', value: 'tuta' },
+            ]"
+            :disabled="!!editing"
+            variant="outlined"
+            density="comfortable"
+            class="mb-2"
+          />
           <v-text-field v-model="form.label" :label="t('名称')" variant="outlined" density="comfortable" :placeholder="t('如 工作邮箱')" required class="mb-2" />
           <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="outlined" density="comfortable" required class="mb-2" />
           <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="outlined" density="comfortable" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
@@ -1245,8 +1253,8 @@ onMounted(() => {
   width: 240px;
   flex: none;
   padding: 16px 8px;
-  overflow-y: scroll;
-  scrollbar-gutter: stable;
+  overflow-y: auto;
+  overflow-y: overlay;
 }
 .settings-content {
   flex: 1;
@@ -1254,8 +1262,8 @@ onMounted(() => {
   max-width: 880px;
   margin-inline: auto;
   padding: 16px;
-  overflow-y: scroll;
-  scrollbar-gutter: stable;
+  overflow-y: auto;
+  overflow-y: overlay;
   min-height: 0;
 }
 .settings-sec {
