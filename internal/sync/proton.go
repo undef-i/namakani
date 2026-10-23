@@ -12,7 +12,7 @@ import (
 	"namakani/internal/proton"
 )
 
-func (m *Manager) protonSession(ctx context.Context, acct mail.Account) error {
+func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseInit func()) error {
 	sess, err := proton.Connect(m.st, acct)
 	if err != nil {
 		return err
@@ -70,6 +70,7 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account) error {
 	m.mu.Unlock()
 	m.prewarm(ctx, sess, acct)
 	m.repairThreads(ctx, sess, acct)
+	releaseInit()
 
 	syncNames := func(names map[string]bool) {
 		for _, r := range refs {

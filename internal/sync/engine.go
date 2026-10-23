@@ -57,6 +57,7 @@ type Manager struct {
 	live        map[int64]bool
 	repair      map[int64]repairInfo
 	folderLocks map[int64]*sync.Mutex
+	initTurn    chan struct{}
 
 	OnChange func(Change)
 }
@@ -75,11 +76,22 @@ type worker struct {
 
 func NewManager(st *store.Store) *Manager {
 	return &Manager{
-		st:      st,
-		workers: make(map[int64]*worker),
-		status:  make(map[int64]*Status),
-		live:    make(map[int64]bool),
-		repair:  make(map[int64]repairInfo),
+		st:       st,
+		workers:  make(map[int64]*worker),
+		status:   make(map[int64]*Status),
+		live:     make(map[int64]bool),
+		repair:   make(map[int64]repairInfo),
+		initTurn: make(chan struct{}, 1),
+	}
+}
+
+func (m *Manager) acquireInitTurn(ctx context.Context) (func(), bool) {
+	select {
+	case m.initTurn <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-m.initTurn }) }, true
+	case <-ctx.Done():
+		return nil, false
 	}
 }
 
@@ -287,11 +299,16 @@ func (m *Manager) syncFolderLocked(ctx context.Context, cl mail.Conn, acct mail.
 }
 
 func (m *Manager) session(ctx context.Context, acct mail.Account) error {
+	release, ok := m.acquireInitTurn(ctx)
+	if !ok {
+		return ctx.Err()
+	}
+	defer release()
 	if acct.Kind == "proton" {
-		return m.protonSession(ctx, acct)
+		return m.protonSession(ctx, acct, release)
 	}
 	if acct.Kind == "tuta" {
-		return m.tutaSession(ctx, acct)
+		return m.tutaSession(ctx, acct, release)
 	}
 	wake := make(chan struct{}, 1)
 	notify := func() {
@@ -364,6 +381,7 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 	m.mu.Unlock()
 	m.prewarm(ctx, cl, acct)
 	m.repairThreads(ctx, cl, acct)
+	release()
 
 	syncAll := func() {
 		for _, r := range refs {

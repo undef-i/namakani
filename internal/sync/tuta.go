@@ -9,7 +9,7 @@ import (
 	"namakani/internal/tuta"
 )
 
-func (m *Manager) tutaSession(ctx context.Context, acct mail.Account) error {
+func (m *Manager) tutaSession(ctx context.Context, acct mail.Account, releaseInit func()) error {
 	sess, err := tuta.Connect(m.st, acct)
 	if err != nil {
 		return err
@@ -86,6 +86,7 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account) error {
 	m.mu.Unlock()
 	m.prewarm(ctx, sess, acct)
 	m.repairThreads(ctx, sess, acct)
+	releaseInit()
 
 	syncAll := func() {
 		if newRefs, _, err := listRefs(); err == nil {
