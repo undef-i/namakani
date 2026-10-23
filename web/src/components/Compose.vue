@@ -120,6 +120,9 @@ const showCc = ref(false)
 const contacts = ref([])
 const contactsError = ref(false)
 let saveTimer = null
+let savePromise = null
+let savePending = null
+let saveSession = 0
 let lastSavedJSON = ''
 let lastSigHTML = ''
 let initializing = false
@@ -292,6 +295,7 @@ watch(open, (isOpen) => {
     if (p) realSend(p)
   }
   initializing = true
+  saveSession++
   const init = props.initial
   accountId.value = String(init.account_id ?? props.accounts[0]?.id ?? '')
   toChips.value = splitAddrStr(init.to ?? '')
@@ -450,8 +454,42 @@ function removeLink() {
   linkMenu.value = false
 }
 
-async function autosave() {
-  if (!open.value || done.value || busy.value || sending.value) return
+function requestSave() {
+  const entry = { data: payload(), snap: snapshot(), sess: saveSession }
+  if (savePromise) {
+    savePending = entry
+    return
+  }
+  savePromise = (async () => {
+    let current = entry
+    while (current) {
+      try {
+        const res = await api.saveDraft(current.data)
+        if (savePending && savePending.sess === current.sess) {
+          savePending.data.draft_id = res.id
+        }
+        if (current.sess === saveSession) {
+          draftId.value = res.id
+          lastSavedJSON = current.snap
+          savedAt.value = fmtClock(new Date())
+          if (res.warning) warning.value = res.warning
+        }
+      } catch {
+      }
+      current = savePending
+      savePending = null
+    }
+    savePromise = null
+  })()
+}
+
+async function drainSaves() {
+  savePending = null
+  if (savePromise) await savePromise
+}
+
+function autosave() {
+  if (!open.value || done.value || sending.value) return
   if (!accountId.value) return
   if (
     toChips.value.length === 0 &&
@@ -463,19 +501,8 @@ async function autosave() {
   ) {
     return
   }
-  const snap = snapshot()
-  if (snap === lastSavedJSON) return
-  busy.value = true
-  try {
-    const res = await api.saveDraft(payload())
-    draftId.value = res.id
-    lastSavedJSON = snapshot()
-    savedAt.value = fmtClock(new Date())
-    if (res.warning) warning.value = res.warning
-  } catch {
-  } finally {
-    busy.value = false
-  }
+  if (snapshot() === lastSavedJSON) return
+  requestSave()
 }
 
 watch([accountId, toChips, ccChips, bccChips, subject, html, attachments], () => {
@@ -534,10 +561,11 @@ async function realSend(p) {
   }
 }
 
-function doSend() {
+async function doSend() {
   error.value = ''
   if (!validateRecipients()) return
   clearTimeout(saveTimer)
+  await drainSaves()
   pendingPayload = payload()
   open.value = false
   if (!props.undoSeconds || props.undoSeconds <= 0) {
@@ -581,6 +609,7 @@ async function scheduleAt(date) {
   }
   busy.value = true
   clearTimeout(saveTimer)
+  await drainSaves()
   try {
     await api.scheduleSend({ ...payload(), send_at: Math.floor(date.getTime() / 1000) })
     open.value = false
@@ -618,6 +647,7 @@ function scheduleCustomGo() {
 
 async function discardCompose() {
   clearTimeout(saveTimer)
+  await drainSaves()
   if (draftId.value) {
     busy.value = true
     error.value = ''
@@ -650,25 +680,14 @@ function composeBlank() {
   )
 }
 
-async function closeCompose() {
+function closeCompose() {
   if (done.value) {
     closeAfterDone()
     return
   }
   clearTimeout(saveTimer)
   if (!composeBlank() && accountId.value && snapshot() !== lastSavedJSON) {
-    busy.value = true
-    error.value = ''
-    try {
-      const res = await api.saveDraft(payload())
-      draftId.value = res.id
-      lastSavedJSON = snapshot()
-    } catch (e) {
-      error.value = t('草稿保存失败：{error}', { error: e.message })
-      busy.value = false
-      return
-    }
-    busy.value = false
+    requestSave()
   }
   open.value = false
   emit('done')
@@ -722,7 +741,7 @@ function onKeydown(e) {
         >
           <v-icon :icon="maximized ? 'mdi-arrow-collapse' : 'mdi-arrow-expand'" />
         </v-btn>
-        <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" :disabled="busy" @click.stop="closeCompose" />
+        <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" :disabled="sending" @click.stop="closeCompose" />
       </div>
 
       <v-card-text v-if="done && !minimized">
@@ -1112,8 +1131,8 @@ function onKeydown(e) {
   flex-wrap: wrap;
   gap: 6px;
   max-height: 32dvh;
-  overflow-y: scroll;
-  scrollbar-gutter: stable;
+  overflow-y: auto;
+  overflow-y: overlay;
   padding: 8px 16px 0;
 }
 .compose-root-mobile .compose-card {
@@ -1231,8 +1250,9 @@ function onKeydown(e) {
   flex: none;
 }
 .compose-root-mobile .compose-body {
-  overflow-y: scroll;
-  scrollbar-gutter: stable;
+  overflow-y: auto;
+  overflow-y: overlay;
+  overflow-anchor: none;
 }
 .compose-root-mobile .compose-editarea {
   flex: none;
@@ -1259,8 +1279,8 @@ function onKeydown(e) {
 .compose-editarea .ProseMirror {
   flex: 1;
   min-height: 0;
-  overflow-y: scroll;
-  scrollbar-gutter: stable;
+  overflow-y: auto;
+  overflow-y: overlay;
   padding: 12px 16px;
   outline: none;
   font-size: 14px;
