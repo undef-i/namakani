@@ -49,8 +49,24 @@ function statusText(a) {
   if (st.state === 'idle') return t('已同步 {time}', { time: fmtListTime(st.last_sync_at) })
   if (st.state === 'syncing') return t('同步中')
   if (st.state === 'connecting') return t('连接中')
+  if (st.state === 'repair') return t('需要手动修复')
   if (st.state === 'error') return t('同步失败')
   return t('未同步')
+}
+
+const reconnecting = ref(null)
+
+async function reconnect(a) {
+  reconnecting.value = a.id
+  try {
+    await api.reconnectAccount(a.id)
+    showSnack(t('已发起重新连接'))
+    emit('changed')
+  } catch (err) {
+    showSnack(t('重新连接失败：{error}', { error: err.message }))
+  } finally {
+    reconnecting.value = null
+  }
 }
 
 function cacheText(a) {
@@ -588,10 +604,25 @@ onMounted(() => {
           <div
             v-if="statuses[a.id]"
             class="text-body-2 mt-1"
-            :class="statuses[a.id].state === 'error' ? 'text-error font-weight-medium' : 'text-medium-emphasis'"
+            :class="statuses[a.id].state === 'error' || statuses[a.id].state === 'repair' ? 'text-error font-weight-medium' : 'text-medium-emphasis'"
             style="overflow-wrap: anywhere"
           >
             {{ statusText(a) }}<template v-if="cacheText(a)">{{ t('，') }}{{ cacheText(a) }}</template>
+          </div>
+          <div v-if="statuses[a.id] && statuses[a.id].state === 'repair'" class="mt-2">
+            <div v-if="statuses[a.id].last_error" class="text-body-2 text-error" style="overflow-wrap: anywhere">
+              {{ statuses[a.id].last_error }}
+            </div>
+            <v-btn
+              size="small"
+              variant="outlined"
+              color="primary"
+              class="mt-2"
+              :loading="reconnecting === a.id"
+              @click="reconnect(a)"
+            >
+              {{ t('重新连接') }}
+            </v-btn>
           </div>
         </v-card-text>
       </v-card>

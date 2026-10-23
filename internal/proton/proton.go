@@ -3,6 +3,9 @@ package proton
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -83,6 +86,56 @@ func credFingerprint(acct mail.Account) string {
 	return hex.EncodeToString(sum[:])
 }
 
+type AuthTerminalError struct {
+	Reason string
+	Err    error
+}
+
+func (e *AuthTerminalError) Error() string { return e.Err.Error() }
+func (e *AuthTerminalError) Unwrap() error { return e.Err }
+
+var apiCodePattern = regexp.MustCompile(`\[(\d+)\]`)
+
+func humanVerificationReason(err error) string {
+	return "Proton 要求人工验证，在应用里反复重连也过不去。请先在 Proton 官方网页或应用里完成一次登录验证，回来后点「重新连接」。（" + err.Error() + "）"
+}
+
+func ClassifyError(err error) (bool, string) {
+	if err == nil {
+		return false, ""
+	}
+	var term *AuthTerminalError
+	if errors.As(err, &term) {
+		return true, term.Reason
+	}
+	var apiErr *protonmail.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Code {
+		case 9001:
+			return true, humanVerificationReason(err)
+		case 10013:
+			return true, "Proton 登录令牌已被吊销，自动重连不可能成功。请点「重新连接」重新登录。（" + err.Error() + "）"
+		}
+		return false, ""
+	}
+	if errors.Is(err, auth.ErrUnauthorized) {
+		return true, "保存的登录凭据已被拒绝，自动重连不可能成功。请在设置里更新密码后点「重新连接」。（" + err.Error() + "）"
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "two factor authentication enabled") {
+		return true, "该账号开启了两步验证，自动重连无法完成。请在设置里更新该账号重新授权。（" + msg + "）"
+	}
+	if strings.Contains(msg, "cannot re-authenticate") {
+		if strings.Contains(msg, "[9001]") {
+			return true, humanVerificationReason(err)
+		}
+		if apiCodePattern.MatchString(msg) {
+			return true, "Proton 拒绝了用保存凭据重新登录，自动重连不可能成功。请在设置里更新密码后点「重新连接」。（" + msg + "）"
+		}
+	}
+	return false, ""
+}
+
 func Connect(st *store.Store, acct mail.Account) (*Session, error) {
 	regMu.Lock()
 	defer regMu.Unlock()
@@ -93,6 +146,9 @@ func Connect(st *store.Store, acct mail.Account) (*Session, error) {
 	mgr := auth.NewManager(newClient)
 	c, keys, err := mgr.Auth(acct.Username, acct.Password)
 	if err != nil {
+		if _, reason := ClassifyError(err); reason != "" {
+			return nil, &AuthTerminalError{Reason: reason, Err: err}
+		}
 		return nil, err
 	}
 	s := &Session{st: st, acct: acct, c: c, keys: keys}

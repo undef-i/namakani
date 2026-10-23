@@ -2,14 +2,19 @@ package sync
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
 	"namakani/internal/mail"
+	"namakani/internal/proton"
 	"namakani/internal/store"
+	"namakani/internal/tuta"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -39,12 +44,18 @@ type Change struct {
 	Initial   bool
 }
 
+type repairInfo struct {
+	reason string
+	cred   string
+}
+
 type Manager struct {
 	st          *store.Store
 	mu          sync.Mutex
 	workers     map[int64]*worker
 	status      map[int64]*Status
 	live        map[int64]bool
+	repair      map[int64]repairInfo
 	folderLocks map[int64]*sync.Mutex
 
 	OnChange func(Change)
@@ -59,6 +70,7 @@ func (m *Manager) emit(c Change) {
 type worker struct {
 	acct   mail.Account
 	cancel context.CancelFunc
+	retry  chan struct{}
 }
 
 func NewManager(st *store.Store) *Manager {
@@ -67,20 +79,44 @@ func NewManager(st *store.Store) *Manager {
 		workers: make(map[int64]*worker),
 		status:  make(map[int64]*Status),
 		live:    make(map[int64]bool),
+		repair:  make(map[int64]repairInfo),
 	}
+}
+
+func credentialFingerprint(acct mail.Account) string {
+	sum := sha256.Sum256([]byte(acct.Username + "\x00" + acct.Password))
+	return hex.EncodeToString(sum[:])
 }
 
 func (m *Manager) Start(acct mail.Account) {
 	m.mu.Lock()
-	if _, ok := m.workers[acct.ID]; ok {
+	if w, ok := m.workers[acct.ID]; ok {
+		select {
+		case w.retry <- struct{}{}:
+		default:
+		}
 		m.mu.Unlock()
 		return
 	}
+	if ri, ok := m.repair[acct.ID]; ok && ri.cred == credentialFingerprint(acct) {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.repair, acct.ID)
 	ctx, cancel := context.WithCancel(context.Background())
-	m.workers[acct.ID] = &worker{acct: acct, cancel: cancel}
+	w := &worker{acct: acct, cancel: cancel, retry: make(chan struct{}, 1)}
+	m.workers[acct.ID] = w
 	m.setStatusLocked(acct.ID, &Status{State: "connecting"})
 	m.mu.Unlock()
-	go m.run(ctx, acct)
+	go m.run(ctx, w)
+}
+
+func (m *Manager) Restart(acct mail.Account) {
+	m.mu.Lock()
+	delete(m.repair, acct.ID)
+	m.mu.Unlock()
+	m.Stop(acct.ID)
+	m.Start(acct)
 }
 
 func (m *Manager) Stop(accountID int64) {
@@ -150,15 +186,65 @@ func (m *Manager) setStatus(id int64, s *Status) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) run(ctx context.Context, acct mail.Account) {
+func classifySessionError(acct mail.Account, err error) (bool, string) {
+	switch acct.Kind {
+	case "proton":
+		return proton.ClassifyError(err)
+	case "tuta":
+		var re *tuta.RestError
+		if errors.As(err, &re) && (re.StatusCode == 401 || re.StatusCode == 403) {
+			return true, "登录凭据被拒绝或会话已失效，自动重连不可能成功。请在设置里更新密码后点「重新连接」。（" + err.Error() + "）"
+		}
+	default:
+		var ie *imap.Error
+		if errors.As(err, &ie) && ie.Code == imap.ResponseCodeAuthenticationFailed {
+			return true, "服务器拒绝了登录凭据，自动重连不可能成功。请在设置里更新密码后点「重新连接」。（" + err.Error() + "）"
+		}
+	}
+	return false, ""
+}
+
+func (m *Manager) parkRepair(w *worker, reason string) {
+	m.mu.Lock()
+	if cur, ok := m.workers[w.acct.ID]; ok && cur == w {
+		delete(m.workers, w.acct.ID)
+	}
+	m.repair[w.acct.ID] = repairInfo{reason: reason, cred: credentialFingerprint(w.acct)}
+	m.setStatusLocked(w.acct.ID, &Status{State: "repair", LastError: reason})
+	m.mu.Unlock()
+	w.cancel()
+}
+
+func (m *Manager) run(ctx context.Context, w *worker) {
+	acct := w.acct
 	for {
+		m.mu.Lock()
+		m.live[acct.ID] = false
+		m.mu.Unlock()
 		err := m.session(ctx, acct)
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil {
-			m.setStatus(acct.ID, &Status{State: "error", LastError: err.Error()})
-			log.Printf("sync account %d: %v", acct.ID, err)
+		if err == nil {
+			continue
+		}
+		if term, reason := classifySessionError(acct, err); term {
+			m.parkRepair(w, reason)
+			log.Printf("sync account %d: needs manual repair: %s", acct.ID, reason)
+			return
+		}
+		m.setStatus(acct.ID, &Status{State: "error", LastError: err.Error()})
+		log.Printf("sync account %d: %v", acct.ID, err)
+		m.mu.Lock()
+		lived := m.live[acct.ID]
+		m.mu.Unlock()
+		if lived {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.retry:
 		}
 	}
 }

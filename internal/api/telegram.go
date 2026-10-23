@@ -158,6 +158,7 @@ func (s *Server) tgSupervise() {
 				ctx, c := context.WithCancel(context.Background())
 				cancel = c
 				go s.tgPoll(ctx, token)
+				go s.tgBotUsername(token)
 			}
 		}
 		time.Sleep(5 * time.Second)
@@ -386,6 +387,37 @@ func tgDeepLink(id int64) string {
 	return fmt.Sprintf("%s/#/mail/%d", tgNamakaniBase, id)
 }
 
+func (s *Server) tgBotUsername(token string) string {
+	s.tgBotMu.Lock()
+	name, ok := s.tgBotUser[token]
+	s.tgBotMu.Unlock()
+	if ok {
+		return name
+	}
+	raw, err := tgCall(token, "getMe", map[string]any{})
+	if err != nil {
+		log.Printf("namakani: telegram getMe failed: %v", err)
+		return ""
+	}
+	var me struct {
+		Username string `json:"username"`
+	}
+	if err := json.Unmarshal(raw, &me); err != nil || me.Username == "" {
+		return ""
+	}
+	s.tgBotMu.Lock()
+	s.tgBotUser[token] = me.Username
+	s.tgBotMu.Unlock()
+	return me.Username
+}
+
+func tgTitleLink(username string, id int64) string {
+	if username == "" {
+		return tgDeepLink(id)
+	}
+	return fmt.Sprintf("https://t.me/%s?startapp=%d", username, id)
+}
+
 func rtBold(s string) any {
 	return map[string]any{"type": "bold", "text": s}
 }
@@ -412,9 +444,9 @@ func tgParagraph(text any) map[string]any {
 	return map[string]any{"type": "paragraph", "text": text}
 }
 
-func tgRichBlocks(it tgItem) []any {
+func tgRichBlocks(it tgItem, titleLink string) []any {
 	blocks := []any{
-		tgParagraph([]any{rtURL(rtBold(it.Subject), tgDeepLink(it.ID))}),
+		tgParagraph([]any{rtURL(rtBold(it.Subject), titleLink)}),
 		tgParagraph([]any{it.From, "  ", rtDateTime(it.DateTS)}),
 	}
 	blocks = append(blocks, map[string]any{"type": "footer", "text": tgFooterText(it)})
@@ -429,9 +461,10 @@ func tgFooterText(it tgItem) any {
 }
 
 func (s *Server) tgPushOne(cfg tgConfig, it tgItem) {
+	titleLink := tgTitleLink(s.tgBotUsername(cfg.Token), it.ID)
 	_, err := tgCall(cfg.Token, "sendRichMessage", map[string]any{
 		"chat_id":      cfg.ChatID,
-		"rich_message": map[string]any{"blocks": tgRichBlocks(it)},
+		"rich_message": map[string]any{"blocks": tgRichBlocks(it, titleLink)},
 		"reply_markup": map[string]any{
 			"inline_keyboard": [][]any{
 				{

@@ -111,6 +111,18 @@ function deepIdFromHash() {
   return m ? +m[1] : 0
 }
 
+function tgStartParam() {
+  const tg = window.Telegram?.WebApp
+  if (!tg?.initData) return ''
+  let p = tg.initDataUnsafe?.start_param || ''
+  if (!p) {
+    try {
+      p = new URLSearchParams(tg.initData).get('start_param') || ''
+    } catch {}
+  }
+  return /^\d+$/.test(p) ? p : ''
+}
+
 const initialDeepId = deepIdFromHash()
 
 function placeholderMessage(id) {
@@ -1410,8 +1422,8 @@ async function boot() {
   try {
     let st = await api.getState()
     appVersion.value = st.version || ''
+    const tg = window.Telegram?.WebApp
     if (st.setup && !st.authed) {
-      const tg = window.Telegram?.WebApp
       if (tg?.initData) {
         tg.ready()
         try {
@@ -1422,6 +1434,10 @@ async function boot() {
           tgAuthError.value = err.message
         }
       }
+    }
+    const startParam = tgStartParam()
+    if (startParam && !deepIdFromHash()) {
+      location.hash = '#/mail/' + startParam
     }
     if (!st.setup) {
       authMode.value = 'setup'

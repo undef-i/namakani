@@ -44,10 +44,12 @@ type Server struct {
 	loginLastFail time.Time
 	tgSeenMu      sync.Mutex
 	tgSeen        map[string]tgChat
+	tgBotMu       sync.Mutex
+	tgBotUser     map[string]string
 }
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
-	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat)}
+	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), tgBotUser: make(map[string]string)}
 	go s.tgSupervise()
 	go s.scheduleLoop()
 	if key, err := auth.LoadOrCreateServerKey(filepath.Join(st.DataDir(), "server.key")); err == nil {
@@ -72,6 +74,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.authOnly(s.handleDeleteAccount))
 	mux.HandleFunc("POST /api/accounts/{id}/test", s.authOnly(s.handleTestAccount))
 	mux.HandleFunc("GET /api/accounts/{id}/sync", s.authOnly(s.handleSyncStatus))
+	mux.HandleFunc("POST /api/accounts/{id}/reconnect", s.authOnly(s.handleReconnectAccount))
 	mux.HandleFunc("GET /api/folders", s.authOnly(s.handleListFolders))
 	mux.HandleFunc("GET /api/messages", s.authOnly(s.handleListMessages))
 	mux.HandleFunc("GET /api/messages/{id}", s.authOnly(s.handleGetMessage))
@@ -1063,6 +1066,26 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.mgr.Status(id))
+}
+
+func (s *Server) handleReconnectAccount(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad account id")
+		return
+	}
+	key, ok := s.credentialKey(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "not logged in")
+		return
+	}
+	acct, err := s.loadMailAccount(id, key)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	s.mgr.Restart(acct)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 type folderOut struct {
