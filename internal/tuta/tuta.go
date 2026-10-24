@@ -74,6 +74,11 @@ type Session struct {
 
 	cur        *folderCache
 	tokenCache *tokenCache
+
+	tmu     sync.Mutex
+	tcond   *sync.Cond
+	tholder int
+	tusers  int
 	folders    []tutaFolder
 	instKeys   map[string][]byte
 	details    map[string]instance

@@ -527,13 +527,8 @@ func (s *Session) MoveMessage(uid uint32, dest string) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	_, err = s.rest.callService(http.MethodPost, "tutanota", "movemailservice", modelVersionTutanota, instance{
-		"446":  "0",
-		"447":  []any{destFolder.setListID, destFolder.setID},
-		"448":  []any{[]any{m.listID, m.id}},
-		"1644": []any{},
-		"1714": nil,
-	})
+	service, moveData := moveServiceData(destFolder, [2]string{m.listID, m.id})
+	_, err = s.rest.callService(http.MethodPost, "tutanota", service, modelVersionTutanota, moveData)
 	if err != nil {
 		return 0, err
 	}
@@ -557,11 +552,34 @@ func (s *Session) DeleteMessage(uid uint32) error {
 		return fmt.Errorf("tuta: message %d not found in %s", uid, fc.name)
 	}
 	m := fc.meta[id]
-	if err := s.rest.eraseEntity("tutanota", "mail", modelVersionTutanota, m.listID, m.id); err != nil {
+	data := instance{
+		"420": "0",
+		"421": []any{[]any{m.listID, m.id}},
+		"724": []any{[]any{fc.folder.setListID, fc.folder.setID}},
+	}
+	if _, err := s.rest.callService(http.MethodDelete, "tutanota", "mailservice", modelVersionTutanota, data); err != nil {
 		return err
 	}
 	s.cur = nil
 	return nil
+}
+
+func moveServiceData(destFolder tutaFolder, mailID [2]string) (string, instance) {
+	if destFolder.special != "" {
+		return "simplemovemailservice", instance{
+			"1470": "0",
+			"1471": []any{[]any{mailID[0], mailID[1]}},
+			"1472": destFolder.kind,
+			"1713": nil,
+		}
+	}
+	return "movemailservice", instance{
+		"446":  "0",
+		"447":  []any{[]any{destFolder.setListID, destFolder.setID}},
+		"448":  []any{[]any{mailID[0], mailID[1]}},
+		"1644": []any{},
+		"1714": nil,
+	}
 }
 
 func (s *Session) AssignUID(folder, tutaID string) (uint32, error) {

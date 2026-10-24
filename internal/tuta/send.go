@@ -471,7 +471,7 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 	}
 	params := instance{
 		"1791": "en",
-		"1790": []any{draftList, draftID},
+		"1790": []any{[]any{draftList, draftID}},
 		"1795": "0",
 		"1796": "0",
 		"1794": nil,
