@@ -212,12 +212,18 @@ function jumpToNewMail() {
   reloadLoaded()
 }
 const listErrorBar = ref('')
+const liveScopeLabel = computed(
+  () => SCOPES.value.find((s) => s.key === scope.value)?.label ?? scope.value,
+)
 const listHeadTitle = computed(() => {
-  if (listSnap.value.kind === 'search') {
-    return t('搜索结果') + ' (' + t('{n} 封', { n: messages.value.length }) + ')'
+  if (searching.value) {
+    if (listSnap.value.kind === 'search') {
+      return t('搜索结果') + ' (' + t('{n} 封', { n: messages.value.length }) + ')'
+    }
+    return t('搜索结果')
   }
-  const label = snapScopeLabel.value
-  const st = scopeStats.value[listSnap.value.scope]
+  const label = liveScopeLabel.value
+  const st = scopeStats.value[scope.value]
   if (!st || foldersStatus.value !== 'ready') return label
   return (
     label +
@@ -1247,9 +1253,31 @@ async function openMessage(m) {
   cancelReaderLeave()
   closeConvo()
   if (scope.value === 'drafts' && !searching.value) {
+    const hit = detailCache.get(m.id)
+    if (hit) {
+      openCompose({
+        account_id: m.account_id,
+        to: fmtAddrList(hit.to),
+        cc: fmtAddrList(hit.cc),
+        subject: hit.subject || m.subject || '',
+        text: hit.text || '',
+        html: hit.html || '',
+        draft_id: m.id,
+      })
+      return
+    }
+    openCompose({
+      account_id: m.account_id,
+      subject: m.subject || '',
+      draft_id: m.id,
+      draft_loading: true,
+    })
+    const tk = ++detailToken
     try {
       const d = await api.getMessage(m.id)
-      openCompose({
+      detailCache.set(m.id, d)
+      if (tk !== detailToken) return
+      composeInit.value = {
         account_id: m.account_id,
         to: fmtAddrList(d.to),
         cc: fmtAddrList(d.cc),
@@ -1257,10 +1285,19 @@ async function openMessage(m) {
         text: d.text || '',
         html: d.html || '',
         draft_id: m.id,
-      })
-      return
-    } catch {
+        fill_nonce: tk,
+      }
+    } catch (err) {
+      if (tk !== detailToken) return
+      composeInit.value = {
+        account_id: m.account_id,
+        subject: m.subject || '',
+        draft_id: m.id,
+        fill_nonce: tk,
+        load_error: t('草稿加载失败，请关闭后重试') + ' (' + err.message + ')',
+      }
     }
+    return
   }
   selected.value = m
   detailError.value = ''
@@ -2744,11 +2781,10 @@ onBeforeUnmount(() => {
 
       <v-dialog v-model="settingsOpen" :z-index="settingsZ" :fullscreen="!lgAndUp" :max-width="lgAndUp ? 1080 : 920" scrollable @update:model-value="(v) => { if (!v) closeSettings() }">
         <v-card class="settings-card" :style="lgAndUp ? { height: 'min(760px, calc(100dvh - 48px))' } : undefined">
-          <v-card-title class="d-flex align-center">
+          <v-toolbar density="compact" color="transparent">
             <v-btn :icon="lgAndUp ? 'mdi-close' : 'mdi-arrow-left'" size="small" variant="text" :aria-label="lgAndUp ? t('关闭') : t('返回')" @click="closeSettings()" />
-            {{ t('设置') }}
-            <v-spacer />
-          </v-card-title>
+            <v-toolbar-title>{{ t('设置') }}</v-toolbar-title>
+          </v-toolbar>
           <v-card-text class="pa-0">
             <Accounts
               :accounts="accounts"
@@ -3285,6 +3321,7 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .reader-overlay,
+  .reader-body-block,
   .compose-root,
   .compose-root-mobile {
     animation: none !important;
@@ -3316,6 +3353,17 @@ body {
     border: none !important;
     border-bottom: 1px solid rgb(var(--v-theme-outline-variant)) !important;
     border-radius: 0 !important;
+  }
+}
+.reader-body-block {
+  animation: body-in 0.18s ease-out;
+}
+@keyframes body-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }
 .reader-toolbar {

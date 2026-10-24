@@ -63,6 +63,7 @@ function detachVV() {
   vvStyle.value = {}
 }
 const shown = ref(false)
+const draftLoading = ref(false)
 const leaving = ref(false)
 let leaveTimer = null
 watch(
@@ -352,9 +353,12 @@ watch(open, (isOpen) => {
     pendingPayload = null
     if (p) realSend(p)
   }
+  applyInit(props.initial)
+})
+
+function applyInit(init) {
   initializing = true
   saveSession++
-  const init = props.initial
   accountId.value = String(init.account_id ?? props.accounts[0]?.id ?? '')
   toChips.value = splitAddrStr(init.to ?? '')
   ccChips.value = splitAddrStr(init.cc ?? '')
@@ -366,7 +370,8 @@ watch(open, (isOpen) => {
   subject.value = init.subject ?? ''
   attachments.value = []
   draftId.value = init.draft_id ?? 0
-  error.value = ''
+  error.value = init.load_error || ''
+  draftLoading.value = !!init.draft_loading
   attachError.value = ''
   warning.value = ''
   done.value = false
@@ -403,7 +408,16 @@ watch(open, (isOpen) => {
   lastSavedJSON = snapshot()
   initializing = false
   loadContacts()
-})
+}
+
+watch(
+  () => props.initial,
+  (init) => {
+    if (!open.value || !init?.fill_nonce) return
+    if (Number(init.draft_id ?? 0) !== draftId.value) return
+    applyInit(init)
+  },
+)
 
 watch(accountId, () => {
   if (!open.value || initializing) return
@@ -513,6 +527,7 @@ function removeLink() {
 }
 
 function requestSave() {
+  if (draftLoading.value) return
   const entry = { data: payload(), snap: snapshot(), sess: saveSession }
   if (savePromise) {
     savePending = entry
@@ -777,7 +792,7 @@ function onKeydown(e) {
     @paste="onPaste"
   >
     <v-card class="compose-card">
-      <div class="compose-head">
+      <v-toolbar density="compact" color="transparent" class="compose-headbar">
         <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" :disabled="sending" @click.stop="closeCompose" />
         <span class="text-body-2 font-weight-medium ml-1">{{ title }}</span>
         <v-spacer />
@@ -801,13 +816,13 @@ function onKeydown(e) {
         >
           <v-icon :icon="maximized ? 'mdi-arrow-collapse' : 'mdi-arrow-expand'" />
         </v-btn>
-        <v-btn-group color="primary" variant="elevated" density="comfortable" class="ml-2">
-          <v-btn prepend-icon="mdi-send" :disabled="busy" :loading="sending" @click="doSend">
+        <v-btn-group color="primary" variant="tonal" density="comfortable" class="ml-2">
+          <v-btn prepend-icon="mdi-send" :disabled="busy || draftLoading" :loading="sending" @click="doSend">
             {{ sending ? t('发送中') : t('发送') }}
           </v-btn>
           <v-menu v-model="schedMenu" :close-on-content-click="false" location="bottom end" z-index="2600">
             <template #activator="{ props: mp }">
-              <v-btn v-bind="mp" icon="mdi-chevron-down" :disabled="busy" :aria-label="t('定时发送')" />
+              <v-btn v-bind="mp" icon="mdi-chevron-down" :disabled="busy || draftLoading" :aria-label="t('定时发送')" />
             </template>
             <v-card width="280" class="pa-2">
               <v-list density="compact">
@@ -832,7 +847,8 @@ function onKeydown(e) {
             </v-card>
           </v-menu>
         </v-btn-group>
-      </div>
+      </v-toolbar>
+      <v-progress-linear v-if="draftLoading" indeterminate color="primary" />
 
       <v-card-text v-if="done && !minimized">
         <p class="text-body-2" style="overflow-wrap: anywhere">{{ warning }}</p>
@@ -1262,13 +1278,13 @@ function onKeydown(e) {
   border-radius: 0;
   box-shadow: none;
 }
-.compose-head {
-  display: flex;
-  align-items: center;
+.compose-headbar {
   flex: none;
-  padding: 6px 8px;
   background: rgba(var(--v-theme-on-surface), 0.06);
   border-radius: inherit;
+}
+.compose-headbar .v-toolbar__content {
+  padding: 0 8px;
 }
 .compose-main {
   display: flex;
