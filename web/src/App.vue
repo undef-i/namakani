@@ -1032,7 +1032,7 @@ const frameCss = computed(() => {
   return (
     '<style>:root{color-scheme:' + scheme + '}html,body{margin:0;padding:0;background:transparent;color:' + fg + ';' +
     font +
-    'overflow-wrap:anywhere}img{max-width:100%;height:auto}table{max-width:100%}a{color:' + link + ';text-decoration:none}a:hover{text-decoration:underline}' +
+    'overflow-wrap:anywhere;scrollbar-width:thin}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:rgba(128,128,128,0.4);border-radius:4px}::-webkit-scrollbar-track{background:transparent}img{max-width:100%;height:auto}table{max-width:100%}a{color:' + link + ';text-decoration:none}a:hover{text-decoration:underline}' +
     quote +
     '</style>'
   )
@@ -1824,42 +1824,41 @@ onBeforeUnmount(() => {
         :permanent="lgAndUp"
         :temporary="!lgAndUp"
         :width="lgAndUp ? 288 : 280"
-        :elevation="0"
-        color="surface-container-low"
-        class="nav-drawer"
         :touchless="!lgAndUp && composeOpen"
       >
-        <div class="d-flex flex-column pa-4 drawer-inner">
-          <v-btn
-            v-if="lgAndUp"
-            color="primary-container"
-            prepend-icon="mdi-pencil"
-            class="nav-compose mb-2"
-            @click="openCompose({})"
-          >
-            {{ t('写信') }}
-          </v-btn>
-
-          <div v-if="accounts.length > 1" class="nav-range">
-            <span class="nav-range-label text-truncate">
-              {{ rangeId ? (rangeAccount?.label || rangeAccount?.email) : t('全部账号') }}
-            </span>
-            <v-menu>
-              <template #activator="{ props: mp }">
-                <v-btn v-bind="mp" icon="mdi-chevron-down" size="x-small" variant="text" :aria-label="t('切换范围')" />
-              </template>
-              <v-list density="compact">
-                <v-list-item :title="t('全部账号')" :active="rangeId === 0" @click="setRange(0)" />
-                <v-list-item
-                  v-for="a in accounts"
-                  :key="a.id"
-                  :title="a.label || a.email"
-                  :active="rangeId === a.id"
-                  @click="setRange(a.id)"
-                />
-              </v-list>
-            </v-menu>
+        <div class="d-flex flex-column drawer-inner">
+          <div v-if="lgAndUp" class="pa-3 pb-0">
+            <v-btn
+              block
+              color="primary-container"
+              prepend-icon="mdi-pencil"
+              @click="openCompose({})"
+            >
+              {{ t('写信') }}
+            </v-btn>
           </div>
+
+          <v-list v-if="accounts.length > 1" density="compact" nav>
+            <v-list-item :title="rangeId ? (rangeAccount?.label || rangeAccount?.email) : t('全部账号')">
+              <template #append>
+                <v-menu>
+                  <template #activator="{ props: mp }">
+                    <v-btn v-bind="mp" icon="mdi-chevron-down" size="x-small" variant="text" :aria-label="t('切换范围')" />
+                  </template>
+                  <v-list density="compact">
+                    <v-list-item :title="t('全部账号')" :active="rangeId === 0" @click="setRange(0)" />
+                    <v-list-item
+                      v-for="a in accounts"
+                      :key="a.id"
+                      :title="a.label || a.email"
+                      :active="rangeId === a.id"
+                      @click="setRange(a.id)"
+                    />
+                  </v-list>
+                </v-menu>
+              </template>
+            </v-list-item>
+          </v-list>
 
           <template v-if="foldersStatus === 'loading'">
             <v-skeleton-loader type="list-item@10" class="skel-fill" />
@@ -1881,9 +1880,9 @@ onBeforeUnmount(() => {
                 @click="selectScope(s.key)"
               >
                 <template #append>
-                  <span v-if="scopeStats[s.key].unread > 0" class="nav-count">
+                  <v-chip v-if="scopeStats[s.key].unread > 0" size="small">
                     {{ scopeStats[s.key].unread }}
-                  </span>
+                  </v-chip>
                 </template>
               </v-list-item>
             </v-list>
@@ -2844,36 +2843,6 @@ body {
 .topbar-search {
   flex: 0 1 720px;
   min-width: 200px;
-}
-@media (min-width: 1280px) {
-  .nav-drawer {
-    border-right: 1px solid rgb(var(--v-theme-outline-variant));
-  }
-}
-.nav-compose {
-  height: 56px !important;
-  width: 160px;
-  flex: none;
-  align-self: flex-start;
-  font-size: 15px;
-  margin-top: 4px;
-}
-.nav-range {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px 4px 6px 12px;
-}
-.nav-range-label {
-  font-size: 13px;
-  color: rgb(var(--v-theme-on-surface-variant));
-  flex: 1;
-  min-width: 0;
-}
-.nav-count {
-  font-size: 12px;
-  font-weight: 600;
-  color: rgb(var(--v-theme-on-surface));
 }
 .list-section {
   display: flex;

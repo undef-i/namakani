@@ -32,6 +32,17 @@ body,
   background: transparent;
 }
 
+.v-menu > .v-overlay__content,
+.v-select__content,
+.v-autocomplete__content,
+.v-dialog--scrollable > .v-overlay__content > .v-card > .v-card-text,
+.v-table__wrapper,
+.v-virtual-scroll,
+.v-textarea textarea {
+  overflow-y: auto;
+  overflow-y: overlay;
+}
+
 .avatar-letter {
   color: rgba(20, 22, 25, 0.82);
 }

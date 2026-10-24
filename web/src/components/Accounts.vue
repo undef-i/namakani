@@ -693,15 +693,8 @@ onMounted(() => {
     </div>
 
     <template v-if="accountsStatus === 'loading'">
-      <div v-if="lgAndUp" class="acct-list">
+      <div class="acct-list">
         <v-skeleton-loader :type="'list-item-avatar-three-line@' + (accounts.length || 5)" class="skel-clip" />
-      </div>
-      <div v-else class="d-flex flex-column ga-3">
-        <v-card v-for="i in (accounts.length || 3)" :key="i" variant="outlined">
-          <v-card-text>
-            <v-skeleton-loader type="list-item-three-line" class="skel-clip" />
-          </v-card-text>
-        </v-card>
       </div>
     </template>
     <template v-else-if="accountsStatus === 'error'">
@@ -713,7 +706,7 @@ onMounted(() => {
     <p v-else-if="accounts.length === 0" class="text-body-2 text-medium-emphasis">
       {{ t('还没有账号。添加第一个邮箱后，它的邮件会自动同步进聚合收件箱。') }}
     </p>
-    <div v-else-if="lgAndUp" class="acct-list">
+    <div v-else class="acct-list">
       <div v-for="a in accounts" :key="a.id" class="acct-row">
         <v-avatar :color="avatarColorFor(a.email)" size="40" class="flex-none">
           <span class="avatar-letter" style="font-size: 16px">{{ avatarLetterFor(a.label, a.email) }}</span>
@@ -746,6 +739,7 @@ onMounted(() => {
             </v-btn>
           </div>
         </div>
+        <div class="acct-side">
         <v-chip v-if="statusChip(a)" size="small" variant="flat" :color="statusChip(a).color" class="flex-none">
           {{ statusChip(a).text }}
         </v-chip>
@@ -758,52 +752,9 @@ onMounted(() => {
             <v-list-item :title="t('删除')" @click="askDelete(a)" />
           </v-list>
         </v-menu>
+        </div>
       </div>
     </div>
-    <div v-else class="d-flex flex-column ga-3">
-      <v-card v-for="a in accounts" :key="a.id" variant="outlined">
-        <v-card-text>
-          <div class="d-flex align-start">
-            <div style="min-width: 0">
-              <div class="text-body-1 font-weight-medium text-truncate">{{ a.label }}</div>
-              <div class="text-body-2 text-medium-emphasis text-truncate">{{ a.email }}</div>
-            </div>
-            <v-spacer />
-            <v-btn icon="mdi-pencil" variant="text" size="small" :title="t('编辑')" @click="openEdit(a)" />
-            <v-btn icon="mdi-delete" variant="text" size="small" :title="t('删除')" @click="askDelete(a)" />
-          </div>
-          <div v-if="a.kind === 'proton'" class="text-body-2 text-medium-emphasis mt-2">Proton Mail</div>
-          <div v-else-if="a.kind === 'tuta'" class="text-body-2 text-medium-emphasis mt-2">Tuta Mail</div>
-          <div v-else class="text-body-2 text-medium-emphasis mt-2" style="overflow-wrap: anywhere">
-            IMAP {{ a.imap_host }}:{{ a.imap_port }} ({{ a.imap_tls }}){{ t('，') }}SMTP {{ a.smtp_host }}:{{ a.smtp_port }} ({{ a.smtp_tls }})
-          </div>
-          <div
-            v-if="statuses[a.id]"
-            class="text-body-2 mt-1"
-            :class="statuses[a.id].state === 'error' || statuses[a.id].state === 'repair' ? 'text-error font-weight-medium' : 'text-medium-emphasis'"
-            style="overflow-wrap: anywhere"
-          >
-            {{ statusText(a) }}<template v-if="cacheText(a)"> {{ cacheText(a) }}</template>
-          </div>
-          <div v-if="statuses[a.id] && statuses[a.id].state === 'repair'" class="mt-2">
-            <div v-if="statuses[a.id].last_error" class="text-body-2 text-error" style="overflow-wrap: anywhere">
-              {{ statuses[a.id].last_error }}
-            </div>
-            <v-btn
-              size="small"
-              variant="outlined"
-              color="primary"
-              class="mt-2"
-              :loading="reconnecting === a.id"
-              @click="reconnect(a)"
-            >
-              {{ t('重新连接') }}
-            </v-btn>
-          </div>
-        </v-card-text>
-      </v-card>
-    </div>
-
     </section>
 
     <section v-if="showSection('appearance')" class="settings-sec">
@@ -1252,7 +1203,6 @@ onMounted(() => {
 .settings-nav {
   width: 240px;
   flex: none;
-  padding: 16px 8px;
   overflow-y: auto;
   overflow-y: overlay;
 }
@@ -1286,6 +1236,27 @@ onMounted(() => {
 .acct-main {
   flex: 1;
   min-width: 0;
+}
+.acct-side {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  flex: none;
+}
+@media (max-width: 600px) {
+  .acct-row {
+    flex-wrap: wrap;
+  }
+  .acct-main {
+    flex: 1 1 calc(100% - 52px);
+  }
+  .acct-side {
+    margin-left: 52px;
+  }
+  .acct-addr {
+    display: block;
+    margin-left: 0;
+  }
 }
 .acct-name {
   font-size: 15px;
