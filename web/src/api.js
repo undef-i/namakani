@@ -46,6 +46,7 @@ export const testWebPush = () => post('/api/settings/webpush/test')
 export const subscribePush = (sub) => post('/api/push/subscribe', sub)
 export const unsubscribePush = (endpoint) => post('/api/push/unsubscribe', { endpoint })
 export const getFolders = () => req('/api/folders')
+export const purgeFolder = (id) => post('/api/folders/' + id + '/purge')
 export const getMessages = (special, offset = 0, limit = 60, threaded = false) =>
   req(
     '/api/messages?special=' +
@@ -66,6 +67,14 @@ export const getFolderMessages = (folderId, offset = 0, limit = 60, threaded = f
       offset +
       (threaded ? '&threaded=1' : ''),
   )
+export const getThreadMessagesAll = (accountId, threadKey) =>
+  req(
+    '/api/messages?thread_all=1&account_id=' +
+      accountId +
+      '&thread_key=' +
+      encodeURIComponent(threadKey),
+  )
+export const moveMessageToFolder = (id, folderId) => post('/api/messages/' + id + '/move', { to_folder_id: folderId })
 export const getThreadMessages = (special, accountId, threadKey) =>
   req(
     '/api/messages?special=' +
@@ -85,6 +94,9 @@ export const sendMail = (body) => post('/api/send', body)
 export const scheduleSend = (body) => post('/api/send/schedule', body)
 export const listScheduled = () => req('/api/scheduled')
 export const cancelScheduled = (id) => req('/api/scheduled/' + id, { method: 'DELETE' })
+export const getScheduled = (id) => req('/api/scheduled/' + id)
+export const updateScheduled = (id, body) =>
+  req('/api/scheduled/' + id, { method: 'PUT', body: JSON.stringify(body) })
 export const getContacts = () => req('/api/contacts')
 export const saveDraft = (body) => post('/api/drafts', body)
 export const searchMessages = (q, limit = 60) =>

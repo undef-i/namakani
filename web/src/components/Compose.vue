@@ -1,8 +1,9 @@
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { intlLocale, t } from '../i18n'
 import { useEditor, EditorContent } from '@tiptap/vue-3'
+import { avatarColorFor, avatarLetterFor } from '../avatar.js'
 import StarterKit from '@tiptap/starter-kit'
 import Underline from '@tiptap/extension-underline'
 import TextAlign from '@tiptap/extension-text-align'
@@ -22,7 +23,7 @@ const props = defineProps({
   maxAttachmentMB: { type: Number, default: 20 },
   zIndex: { type: Number, default: 2500 },
 })
-const emit = defineEmits(['update:modelValue', 'done'])
+const emit = defineEmits(['update:modelValue', 'done', 'discarded'])
 
 const display = useDisplay()
 const lgAndUp = computed(() => display.lgAndUp.value)
@@ -92,6 +93,10 @@ watch([open, lgAndUp], ([isOpen, up]) => {
 onBeforeUnmount(detachVV)
 
 const accountId = ref('')
+const boxKeys = reactive({ to: 0, cc: 0, bcc: 0 })
+const toBox = ref(null)
+const ccBox = ref(null)
+const bccBox = ref(null)
 const toChips = ref([])
 const ccChips = ref([])
 const bccChips = ref([])
@@ -123,34 +128,77 @@ const onToEnter = chipEnter(toChips, toSearch)
 const onCcEnter = chipEnter(ccChips, ccSearch)
 const onBccEnter = chipEnter(bccChips, bccSearch)
 
-const noMenu = computed({ get: () => false, set: () => {} })
+const toMenu = ref(false)
+const ccMenu = ref(false)
+const bccMenu = ref(false)
+function menuGate(store) {
+  return computed({
+    get: () => store.value,
+    set: (v) => {
+      store.value = lgAndUp.value ? v : false
+    },
+  })
+}
+const toMenuGate = menuGate(toMenu)
+const ccMenuGate = menuGate(ccMenu)
+const bccMenuGate = menuGate(bccMenu)
 const focusedField = ref('')
 const fieldRefs = {
-  to: { chips: toChips, search: toSearch },
-  cc: { chips: ccChips, search: ccSearch },
-  bcc: { chips: bccChips, search: bccSearch },
+  to: { chips: toChips, search: toSearch, box: toBox },
+  cc: { chips: ccChips, search: ccSearch, box: ccBox },
+  bcc: { chips: bccChips, search: bccSearch, box: bccBox },
 }
 function suggestFor(field) {
+  if (lgAndUp.value) return []
   const { chips, search } = fieldRefs[field]
   const q = (search.value || '').trim().toLowerCase()
   if (!q) return []
   return contactItems.value
     .filter((c) => c.toLowerCase().includes(q) && !chips.value.includes(c))
-    .slice(0, 6)
+    .slice(0, 50)
 }
 function pickSuggest(field, item) {
-  const { chips, search } = fieldRefs[field]
+  const { chips, search, box } = fieldRefs[field]
   if (!chips.value.includes(item)) chips.value = [...chips.value, item]
   search.value = ''
-  requestAnimationFrame(() => {
-    search.value = ''
+  boxKeys[field]++
+  nextTick(() => {
+    box.value?.focus()
   })
 }
+function contactParts(item) {
+  const m = /^(.*)<([^>]+)>$/.exec(item)
+  if (m) return { name: m[1].trim(), email: m[2].trim() }
+  return { name: '', email: item }
+}
+const suggItems = computed(() =>
+  suggestFor(focusedField.value).map((raw) => ({ raw, ...contactParts(raw) })),
+)
+const suggActive = computed(
+  () => !lgAndUp.value && focusedField.value !== '' && suggItems.value.length > 0,
+)
+let rowTouch = null
+function onRowTouchStart(e) {
+  const t = e.touches[0]
+  rowTouch = { x: t.clientX, y: t.clientY }
+}
+function onRowTouchEnd(e, it) {
+  if (!rowTouch) return
+  const t = e.changedTouches[0]
+  const moved = Math.abs(t.clientX - rowTouch.x) > 10 || Math.abs(t.clientY - rowTouch.y) > 10
+  rowTouch = null
+  if (moved) return
+  e.preventDefault()
+  pickSuggest(focusedField.value, it.raw)
+}
+
 const subject = ref('')
 const html = ref('')
 const plainText = ref('')
 const attachments = ref([])
 const draftId = ref(0)
+const schedId = ref(0)
+const schedAt = ref(null)
 const busy = ref(false)
 const sending = ref(false)
 const error = ref('')
@@ -187,12 +235,16 @@ let undoTimer = null
 let pendingPayload = null
 
 const title = computed(() =>
-  props.initial.draft_id ? t('编辑草稿') : props.initial.reply_to_id ? t('回复邮件') : t('写信'),
+  props.initial.reply_to_id ? t('回复邮件') : t('写信'),
 )
 
 const contactItems = computed(() =>
   contacts.value.map((c) => (c.name ? c.name + ' <' + c.email + '>' : c.email)),
 )
+
+watch(draftLoading, (v) => {
+  editor.value?.setEditable(!v)
+})
 
 const editor = useEditor({
   extensions: [
@@ -215,6 +267,16 @@ onBeforeUnmount(() => {
   editor.value?.destroy()
   clearInterval(undoTimer)
 })
+
+let layerPushed = false
+function onPopState() {
+  if (open.value && layerPushed) {
+    layerPushed = false
+    closeCompose()
+  }
+}
+onMounted(() => window.addEventListener('popstate', onPopState))
+onBeforeUnmount(() => window.removeEventListener('popstate', onPopState))
 
 function escHTML(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -336,8 +398,14 @@ async function loadContacts() {
 watch(open, (isOpen) => {
   if (!isOpen) {
     clearTimeout(saveTimer)
+    if (layerPushed) {
+      layerPushed = false
+      history.back()
+    }
     return
   }
+  history.pushState({ wmCompose: 1 }, '', location.href)
+  layerPushed = true
   if (restoring) {
     restoring = false
     return
@@ -365,8 +433,15 @@ function applyInit(init) {
   ccSearch.value = ''
   bccSearch.value = ''
   subject.value = init.subject ?? ''
-  attachments.value = []
+  attachments.value = (init.attachments ?? []).map((a) => ({
+    filename: a.filename,
+    content_type: a.content_type,
+    size: a.size ?? 0,
+    existing: a.file,
+  }))
   draftId.value = init.draft_id ?? 0
+  schedId.value = init.sched_id ?? 0
+  schedAt.value = init.sched_send_at ? new Date(init.sched_send_at * 1000) : null
   error.value = init.load_error || ''
   draftLoading.value = !!init.draft_loading
   attachError.value = ''
@@ -412,6 +487,7 @@ watch(
   (init) => {
     if (!open.value || !init?.fill_nonce) return
     if (Number(init.draft_id ?? 0) !== draftId.value) return
+    if (Number(init.sched_id ?? 0) !== schedId.value) return
     applyInit(init)
   },
 )
@@ -525,6 +601,7 @@ function removeLink() {
 
 function requestSave() {
   if (draftLoading.value) return
+  if (schedId.value) return
   const entry = { data: payload(), snap: snapshot(), sess: saveSession }
   if (savePromise) {
     savePending = entry
@@ -671,6 +748,15 @@ function undoSend() {
 async function scheduleAt(date) {
   schedMenu.value = false
   schedCustom.value = false
+  if (schedId.value) {
+    if (!(date.getTime() > Date.now())) {
+      error.value = t('定时发送时间必须在将来')
+      return
+    }
+    error.value = ''
+    schedAt.value = date
+    return
+  }
   error.value = ''
   if (!validateRecipients()) return
   if (!(date.getTime() > Date.now())) {
@@ -691,6 +777,54 @@ async function scheduleAt(date) {
   } finally {
     busy.value = false
   }
+}
+
+async function persistSchedEdit() {
+  error.value = ''
+  if (!validateRecipients()) return false
+  if (!schedAt.value || !(schedAt.value.getTime() > Date.now())) {
+    error.value = t('定时发送时间必须在将来')
+    return false
+  }
+  busy.value = true
+  try {
+    const p = payload()
+    p.send_at = Math.floor(schedAt.value.getTime() / 1000)
+    p.attachments = attachments.value
+      .filter((a) => !a.existing)
+      .map((a) => ({ filename: a.filename, content_type: a.content_type, data_b64: a.data_b64 }))
+    p.keep_files = attachments.value.filter((a) => a.existing).map((a) => a.existing)
+    await api.updateScheduled(schedId.value, p)
+    lastSavedJSON = snapshot()
+    return true
+  } catch (e) {
+    error.value = e.message
+    return false
+  } finally {
+    busy.value = false
+  }
+}
+
+async function sendSchedNow() {
+  error.value = ''
+  if (!validateRecipients()) return
+  busy.value = true
+  try {
+    await api.cancelScheduled(schedId.value)
+  } catch (e) {
+    error.value = e.message
+    busy.value = false
+    return
+  }
+  busy.value = false
+  schedId.value = ''
+  schedAt.value = null
+  doSend()
+}
+
+function onSendClick() {
+  if (schedId.value) sendSchedNow()
+  else doSend()
 }
 
 function scheduleOption(kind) {
@@ -718,17 +852,38 @@ function scheduleCustomGo() {
 async function discardCompose() {
   clearTimeout(saveTimer)
   await drainSaves()
-  if (draftId.value) {
+  if (schedId.value) {
     busy.value = true
     error.value = ''
     try {
-      await api.deleteMessage(draftId.value)
+      await api.cancelScheduled(schedId.value)
+    } catch (e) {
+      error.value = e.message
+      busy.value = false
+      return
+    }
+    busy.value = false
+    open.value = false
+    emit('discarded', { row_id: -schedId.value, kind: 'cancel' })
+    emit('done')
+    return
+  }
+  if (draftId.value) {
+    busy.value = true
+    error.value = ''
+    let dres = null
+    try {
+      dres = await api.deleteMessage(draftId.value)
     } catch (e) {
       error.value = t('删除草稿失败：{error}', { error: e.message })
       busy.value = false
       return
     }
     busy.value = false
+    open.value = false
+    emit('discarded', { row_id: draftId.value, kind: 'draft' })
+    emit('done')
+    return
   }
   open.value = false
   emit('done')
@@ -750,12 +905,21 @@ function composeBlank() {
   )
 }
 
-function closeCompose() {
+async function closeCompose() {
   if (done.value) {
     closeAfterDone()
     return
   }
   clearTimeout(saveTimer)
+  if (schedId.value) {
+    if (!composeBlank() && snapshot() !== lastSavedJSON) {
+      const ok = await persistSchedEdit()
+      if (!ok) return
+    }
+    open.value = false
+    emit('done')
+    return
+  }
   if (!composeBlank() && accountId.value && snapshot() !== lastSavedJSON) {
     requestSave()
   }
@@ -766,7 +930,7 @@ function closeCompose() {
 function onKeydown(e) {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
     e.preventDefault()
-    if (!done.value && !busy.value) doSend()
+    if (!done.value && !busy.value) onSendClick()
   }
 }
 </script>
@@ -812,37 +976,33 @@ function onKeydown(e) {
         >
           <v-icon :icon="maximized ? 'mdi-arrow-collapse' : 'mdi-arrow-expand'" />
         </v-btn>
-        <v-btn-group color="primary" variant="tonal" class="ml-2">
-          <v-btn prepend-icon="mdi-send" :disabled="busy || draftLoading" :loading="sending" @click="doSend">
-            {{ sending ? t('发送中') : t('发送') }}
-          </v-btn>
-          <v-menu v-model="schedMenu" :close-on-content-click="false" location="bottom end" z-index="2600">
-            <template #activator="{ props: mp }">
-              <v-btn v-bind="mp" icon="mdi-chevron-down" :disabled="busy || draftLoading" :aria-label="t('定时发送')" />
+        <v-btn icon="mdi-send" variant="text" :disabled="busy || draftLoading" :loading="sending" :aria-label="t('发送')" @click="onSendClick" />
+        <v-menu v-model="schedMenu" :close-on-content-click="false" location="bottom end" z-index="2600">
+          <template #activator="{ props: mp }">
+            <v-btn v-bind="mp" icon="mdi-chevron-down" variant="text" :disabled="busy || draftLoading" :aria-label="t('定时发送')" />
+          </template>
+          <v-card class="pa-2">
+            <v-list density="compact">
+              <v-list-item :title="t('1 小时后')" @click="scheduleOption('h1')" />
+              <v-list-item :title="t('今晚 20:00')" @click="scheduleOption('tonight')" />
+              <v-list-item :title="t('明早 08:00')" @click="scheduleOption('tomorrow')" />
+              <v-list-item :title="t('自定义时间')" @click="schedCustom = true" />
+            </v-list>
+            <template v-if="schedCustom">
+              <v-text-field
+                v-model="schedWhen"
+                type="datetime-local"
+                density="compact"
+                variant="filled"
+                hide-details
+                class="ma-2"
+              />
+              <v-btn block color="primary" size="small" class="mb-1" @click="scheduleCustomGo">
+                {{ t('安排发送') }}
+              </v-btn>
             </template>
-            <v-card class="pa-2">
-              <v-list density="compact">
-                <v-list-item :title="t('1 小时后')" @click="scheduleOption('h1')" />
-                <v-list-item :title="t('今晚 20:00')" @click="scheduleOption('tonight')" />
-                <v-list-item :title="t('明早 08:00')" @click="scheduleOption('tomorrow')" />
-                <v-list-item :title="t('自定义时间')" @click="schedCustom = true" />
-              </v-list>
-              <template v-if="schedCustom">
-                <v-text-field
-                  v-model="schedWhen"
-                  type="datetime-local"
-                  density="compact"
-                  variant="filled"
-                  hide-details
-                  class="ma-2"
-                />
-                <v-btn block color="primary" size="small" class="mb-1" @click="scheduleCustomGo">
-                  {{ t('安排发送') }}
-                </v-btn>
-              </template>
-            </v-card>
-          </v-menu>
-        </v-btn-group>
+          </v-card>
+        </v-menu>
       </v-toolbar>
       <v-progress-linear v-if="draftLoading" indeterminate color="primary" />
 
@@ -851,11 +1011,15 @@ function onKeydown(e) {
       </v-card-text>
 
       <div v-show="!done && !minimized" class="compose-main">
+        <div v-if="draftLoading" class="compose-lock" />
         <div class="compose-body">
-          <div class="cform">
+          <div data-overlayscrollbars-viewport class="compose-vp">
+            <div data-overlayscrollbars-content class="compose-content" :class="{ 'compose-content-lock': suggActive }">
+          <div class="cform" :class="{ 'cform-sugg': suggActive }">
             <div class="crow">
               <span class="clabel">{{ t('发件人') }}</span>
               <v-select
+                :disabled="draftLoading"
                 v-model="accountId"
                 variant="plain"
                 density="compact"
@@ -868,13 +1032,18 @@ function onKeydown(e) {
             <div class="crow">
               <span class="clabel">{{ t('收件人') }}</span>
               <v-combobox
+                :disabled="draftLoading"
                 @keydown.capture.enter="onToEnter"
-                v-model:menu="noMenu"
+                ref="toBox" :key="boxKeys.to"
+                v-model:menu="toMenuGate"
                 @focus="focusedField = 'to'"
                 @blur="focusedField = ''"
                 v-model="toChips"
                 v-model:search="toSearch"
                 :items="contactItems"
+                menu-icon=""
+                hide-no-data
+                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 variant="plain"
                 density="compact"
                 hide-details
@@ -884,7 +1053,17 @@ function onKeydown(e) {
                 :delimiters="[',']"
                 :error="toInvalid.length > 0"
                 class="cfield"
-              />
+              >
+                <template #chip="{ props: chipProps, item }">
+                  <v-chip
+                    v-bind="chipProps"
+                    :color="chipValid(item.value) ? undefined : 'error'"
+                    :class="{ 'chip-bad': !chipValid(item.value) }"
+                  >
+                    {{ item.value }}
+                  </v-chip>
+                </template>
+              </v-combobox>
               <v-btn
                 icon="mdi-chevron-down"
                 size="x-small"
@@ -894,32 +1073,41 @@ function onKeydown(e) {
                 :class="{ 'chev-open': showCc }"
                 @click="showCc = !showCc"
               />
-              <div v-if="suggestFor('to').length" class="csuggest">
-                <button
-                  v-for="it in suggestFor('to')"
-                  :key="it"
-                  type="button"
-                  class="csuggest-item"
-                  @mousedown.prevent="pickSuggest('to', it)"
-                  @touchstart.prevent="pickSuggest('to', it)"
-                >{{ it }}</button>
-              </div>
             </div>
-            <p v-if="toInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: toInvalid.join(t('，')) }) }}</p>
-            <p v-if="contactsError" class="cerr">
-              {{ t('联系人加载失败，地址联想不可用') }}
-              <v-btn variant="text" size="x-small" @click="loadContacts">{{ t('重试') }}</v-btn>
-            </p>
-            <div v-if="showCc" class="crow">
+            <div v-if="suggActive && focusedField === 'to'" class="csuggest-full">
+              <button
+                v-for="it in suggItems"
+                :key="it.raw"
+                type="button"
+                class="csuggest-full-item"
+                @touchstart="onRowTouchStart"
+                @touchend="onRowTouchEnd($event, it)"
+                @mousedown.prevent="pickSuggest(focusedField, it.raw)"
+              >
+                <v-avatar :color="avatarColorFor(it.email)" size="36" class="flex-none mr-3">
+                  <span class="avatar-letter">{{ avatarLetterFor(it.name, it.email) }}</span>
+                </v-avatar>
+                <span class="csuggest-full-text">
+                  <span class="csuggest-full-name">{{ it.name || it.email }}</span>
+                  <span v-if="it.name" class="csuggest-full-mail">{{ it.email }}</span>
+                </span>
+              </button>
+              </div>
+            <div v-if="showCc" v-show="!(suggActive && focusedField === 'to')" class="crow">
               <span class="clabel">{{ t('抄送') }}</span>
               <v-combobox
+                :disabled="draftLoading"
                 @keydown.capture.enter="onCcEnter"
-                v-model:menu="noMenu"
+                ref="ccBox" :key="boxKeys.cc"
+                v-model:menu="ccMenuGate"
                 @focus="focusedField = 'cc'"
                 @blur="focusedField = ''"
                 v-model="ccChips"
                 v-model:search="ccSearch"
                 :items="contactItems"
+                menu-icon=""
+                hide-no-data
+                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 variant="plain"
                 density="compact"
                 hide-details
@@ -929,29 +1117,52 @@ function onKeydown(e) {
                 :delimiters="[',']"
                 :error="ccInvalid.length > 0"
                 class="cfield"
-              />
-              <div v-if="suggestFor('cc').length" class="csuggest">
-                <button
-                  v-for="it in suggestFor('cc')"
-                  :key="it"
-                  type="button"
-                  class="csuggest-item"
-                  @mousedown.prevent="pickSuggest('cc', it)"
-                  @touchstart.prevent="pickSuggest('cc', it)"
-                >{{ it }}</button>
-              </div>
+              >
+                <template #chip="{ props: chipProps, item }">
+                  <v-chip
+                    v-bind="chipProps"
+                    :color="chipValid(item.value) ? undefined : 'error'"
+                    :class="{ 'chip-bad': !chipValid(item.value) }"
+                  >
+                    {{ item.value }}
+                  </v-chip>
+                </template>
+              </v-combobox>
             </div>
-            <p v-if="showCc && ccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: ccInvalid.join(t('，')) }) }}</p>
-            <div v-if="showCc" class="crow">
+            <div v-if="suggActive && focusedField === 'cc'" class="csuggest-full">
+              <button
+                v-for="it in suggItems"
+                :key="it.raw"
+                type="button"
+                class="csuggest-full-item"
+                @touchstart="onRowTouchStart"
+                @touchend="onRowTouchEnd($event, it)"
+                @mousedown.prevent="pickSuggest(focusedField, it.raw)"
+              >
+                <v-avatar :color="avatarColorFor(it.email)" size="36" class="flex-none mr-3">
+                  <span class="avatar-letter">{{ avatarLetterFor(it.name, it.email) }}</span>
+                </v-avatar>
+                <span class="csuggest-full-text">
+                  <span class="csuggest-full-name">{{ it.name || it.email }}</span>
+                  <span v-if="it.name" class="csuggest-full-mail">{{ it.email }}</span>
+                </span>
+              </button>
+              </div>
+            <div v-if="showCc" v-show="!(suggActive && focusedField !== 'bcc')" class="crow">
               <span class="clabel">{{ t('密送') }}</span>
               <v-combobox
+                :disabled="draftLoading"
                 @keydown.capture.enter="onBccEnter"
-                v-model:menu="noMenu"
+                ref="bccBox" :key="boxKeys.bcc"
+                v-model:menu="bccMenuGate"
                 @focus="focusedField = 'bcc'"
                 @blur="focusedField = ''"
                 v-model="bccChips"
                 v-model:search="bccSearch"
                 :items="contactItems"
+                menu-icon=""
+                hide-no-data
+                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 variant="plain"
                 density="compact"
                 hide-details
@@ -961,21 +1172,40 @@ function onKeydown(e) {
                 :delimiters="[',']"
                 :error="bccInvalid.length > 0"
                 class="cfield"
-              />
-              <div v-if="suggestFor('bcc').length" class="csuggest">
-                <button
-                  v-for="it in suggestFor('bcc')"
-                  :key="it"
-                  type="button"
-                  class="csuggest-item"
-                  @mousedown.prevent="pickSuggest('bcc', it)"
-                  @touchstart.prevent="pickSuggest('bcc', it)"
-                >{{ it }}</button>
-              </div>
+              >
+                <template #chip="{ props: chipProps, item }">
+                  <v-chip
+                    v-bind="chipProps"
+                    :color="chipValid(item.value) ? undefined : 'error'"
+                    :class="{ 'chip-bad': !chipValid(item.value) }"
+                  >
+                    {{ item.value }}
+                  </v-chip>
+                </template>
+              </v-combobox>
             </div>
-            <p v-if="showCc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
-            <div class="crow">
+            <div v-if="suggActive && focusedField === 'bcc'" class="csuggest-full">
+              <button
+                v-for="it in suggItems"
+                :key="it.raw"
+                type="button"
+                class="csuggest-full-item"
+                @touchstart="onRowTouchStart"
+                @touchend="onRowTouchEnd($event, it)"
+                @mousedown.prevent="pickSuggest(focusedField, it.raw)"
+              >
+                <v-avatar :color="avatarColorFor(it.email)" size="36" class="flex-none mr-3">
+                  <span class="avatar-letter">{{ avatarLetterFor(it.name, it.email) }}</span>
+                </v-avatar>
+                <span class="csuggest-full-text">
+                  <span class="csuggest-full-name">{{ it.name || it.email }}</span>
+                  <span v-if="it.name" class="csuggest-full-mail">{{ it.email }}</span>
+                </span>
+              </button>
+              </div>
+            <div v-show="!suggActive" class="crow">
               <v-text-field
+                :disabled="draftLoading"
                 v-model="subject"
                 :placeholder="t('主题')"
                 variant="plain"
@@ -986,7 +1216,7 @@ function onKeydown(e) {
             </div>
           </div>
 
-          <div v-if="attachments.length > 0" class="compose-attach-chips">
+          <div v-if="attachments.length > 0" v-show="!suggActive" class="compose-attach-chips">
             <v-chip
               v-for="(a, i) in attachments"
               :key="a.filename + ':' + i"
@@ -1001,7 +1231,7 @@ function onKeydown(e) {
             </v-chip>
           </div>
 
-          <div class="compose-editor">
+          <div v-show="!suggActive" class="compose-editor">
             <div class="compose-toolbar">
               <v-btn
                 icon="mdi-undo"
@@ -1141,13 +1371,16 @@ function onKeydown(e) {
             <EditorContent :editor="editor" class="compose-editarea" />
           </div>
 
-          <div class="compose-pad">
+          <div v-show="!suggActive" class="compose-pad">
             <v-alert v-if="attachError" type="error" variant="tonal" density="compact" class="mb-2">
               {{ attachError }}
             </v-alert>
             <v-alert v-if="error" type="error" variant="tonal" density="compact">
               {{ error }}
             </v-alert>
+          </div>
+        
+            </div>
           </div>
         </div>
 
@@ -1183,7 +1416,7 @@ function onKeydown(e) {
     </v-card>
   </div>
 
-  <v-snackbar v-model="undoShow" :timeout="-1" location="bottom left">
+  <v-snackbar v-model="undoShow" :timeout="-1" location="bottom">
     {{ t('正在发送，{n} 秒后发出', { n: undoLeft }) }}
     <template #actions>
       <v-btn color="warning" variant="text" @click="undoSend">{{ t('撤销') }}</v-btn>
@@ -1222,7 +1455,7 @@ function onKeydown(e) {
   width: auto;
   max-width: none;
   animation: compose-in-m 0.28s cubic-bezier(0.32, 0.72, 0, 1);
-  transition: transform 0.22s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+  transition: transform 0.22s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.22s cubic-bezier(0.32, 0.72, 0, 1), height 0.25s cubic-bezier(0.32, 0.72, 0, 1), top 0.25s cubic-bezier(0.32, 0.72, 0, 1);
 }
 @keyframes compose-in-m {
   from {
@@ -1281,10 +1514,26 @@ function onKeydown(e) {
   border-radius: inherit;
 }
 .compose-main {
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+.compose-lock {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  background: rgba(var(--v-theme-surface), 0.55);
+}
+.compose-vp {
+  width: 100%;
+  height: 100%;
+}
+.compose-body .compose-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
 }
 .compose-body {
   display: flex;
@@ -1298,6 +1547,15 @@ function onKeydown(e) {
   flex: none;
   padding-left: 16px;
   padding-right: 16px;
+}
+.compose-body .compose-content-lock {
+  height: 100%;
+}
+.cform-sugg {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .cform {
   flex: none;
@@ -1328,34 +1586,6 @@ function onKeydown(e) {
   flex: 1;
   min-width: 0;
 }
-.csuggest {
-  position: absolute;
-  top: calc(100% + 1px);
-  left: 52px;
-  right: 0;
-  z-index: 40;
-  background: rgb(var(--v-theme-surface));
-  border: 1px solid rgb(var(--v-theme-outline-variant));
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
-  max-height: 240px;
-  overflow-y: auto;
-  padding: 4px 0;
-}
-.csuggest-item {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: 10px 12px;
-  font-size: 14px;
-  color: rgb(var(--v-theme-on-surface));
-  overflow-wrap: anywhere;
-}
-@media (hover: hover) {
-  .csuggest-item:hover {
-    background: rgba(var(--v-theme-on-surface), 0.05);
-  }
-}
 .cfield .v-field__input {
   min-height: 30px;
   padding-top: 3px;
@@ -1370,10 +1600,47 @@ function onKeydown(e) {
 .cfield .v-field--variant-plain .v-field__clearable {
   padding-top: 4px;
 }
-.cerr {
-  margin: 4px 0 0;
-  font-size: 12px;
-  color: rgb(var(--v-theme-error));
+.cfield .v-chip {
+  height: auto;
+}
+.cfield .v-chip__content {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.chip-bad {
+  font-weight: 700;
+}
+.csuggest-full {
+  scrollbar-gutter: stable;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.csuggest-full-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  padding: 10px 16px;
+  color: rgb(var(--v-theme-on-surface));
+}
+.csuggest-full-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.csuggest-full-name {
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.csuggest-full-mail {
+  font-size: 12.5px;
+  color: rgb(var(--v-theme-on-surface), 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .compose-actions {
   flex: none;
@@ -1397,6 +1664,9 @@ function onKeydown(e) {
 }
 .compose-root-mobile .cform {
   padding: 0 12px;
+}
+.compose-root-mobile .csuggest-full {
+  margin: 0 -12px;
 }
 .compose-root-mobile .compose-editor {
   margin: 0;
