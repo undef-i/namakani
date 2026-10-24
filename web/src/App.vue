@@ -2649,7 +2649,7 @@ onBeforeUnmount(() => {
         @click="openCompose({})"
       />
 
-      <v-dialog v-model="settingsOpen" :z-index="settingsZ" :fullscreen="!lgAndUp" :max-width="lgAndUp ? 1080 : 920" scrollable transition="false" @update:model-value="(v) => { if (!v) closeSettings() }">
+      <v-dialog v-model="settingsOpen" :z-index="settingsZ" :fullscreen="!lgAndUp" :max-width="lgAndUp ? 1080 : 920" scrollable @update:model-value="(v) => { if (!v) closeSettings() }">
         <v-card class="settings-card" :style="lgAndUp ? { height: 'min(760px, calc(100dvh - 48px))' } : undefined">
           <v-card-title class="d-flex align-center">
             {{ t('设置') }}
