@@ -177,6 +177,7 @@ const en = {
   '关闭（立即发送）': 'Off (send immediately)',
   '{n} 秒': '{n} seconds',
   '已同步 {time}': 'Synced {time}',
+  '上次同步 {time}': 'Last synced {time}',
   同步中: 'Syncing',
   连接中: 'Connecting',
   同步失败: 'Sync failed',
@@ -191,6 +192,7 @@ const en = {
   两步验证码: 'Two-factor code',
   '该账号开启了两步验证，请输入验证码': 'This account has two-factor authentication on, enter the code',
   打开人机验证: 'Open human verification',
+  完成验证并继续: 'Finish verification and continue',
   已完成验证: 'Verification done',
   '验证已过期，已生成新的验证链接': 'That verification expired, a new verification link has been generated',
   '连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）':

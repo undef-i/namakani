@@ -33,6 +33,7 @@ body,
 }
 
 .v-menu > .v-overlay__content,
+.v-dialog > .v-overlay__content,
 .v-select__content,
 .v-autocomplete__content,
 .v-dialog--scrollable > .v-overlay__content > .v-card > .v-card-text,

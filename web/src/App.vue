@@ -2114,7 +2114,7 @@ onBeforeUnmount(() => {
             <div ref="listEl" class="list-scroll" @scroll="onListScroll">
               <div class="h-100">
               <template v-if="listStatus === 'loading'">
-                <v-skeleton-loader v-if="lgAndUp" type="list-item-avatar-three-line@16" class="list-skel skel-fixed" />
+                <v-skeleton-loader v-if="lgAndUp" type="list-item-three-line@16" class="list-skel skel-fixed" />
                 <v-skeleton-loader v-else type="list-item-three-line@24" class="skel-fixed" />
               </template>
               <template v-else-if="listStatus === 'error'">
@@ -2180,9 +2180,6 @@ onBeforeUnmount(() => {
                     >
                       <v-checkbox-btn :model-value="selectedIds.has(m.id)" density="compact" tabindex="-1" />
                     </span>
-                    <v-avatar :color="avatarColor(m.from_email)" :size="listDensity === 'compact' ? 24 : 32" class="mail-avatar-d">
-                      <span class="avatar-letter row-avatar-letter">{{ avatarLetter(m) }}</span>
-                    </v-avatar>
                     <div class="row-main">
                       <div class="row-l1">
                         <span class="row-sender" :class="{ w700: !(m.flags & 1) }">
@@ -2228,9 +2225,6 @@ onBeforeUnmount(() => {
                     @touchend="rowTouchEnd($event, m)"
                     @touchcancel="rowTouchEnd($event, m)"
                   >
-                    <v-avatar :color="avatarColor(m.from_email)" size="38" class="mail-avatar">
-                      <span class="avatar-letter text-body-2 font-weight-medium">{{ avatarLetter(m) }}</span>
-                    </v-avatar>
                     <div class="flex-1-1" style="min-width: 0">
                       <div class="d-flex align-center ga-2">
                         <span v-if="!(m.flags & 1)" class="unread-dot" />
@@ -3060,14 +3054,6 @@ body {
   justify-content: center;
   padding-top: 1px;
 }
-.mail-avatar-d {
-  flex: none;
-  margin-top: 1px;
-}
-.row-avatar-letter {
-  font-size: 13px;
-  font-weight: 500;
-}
 .row-main {
   flex: 1;
   min-width: 0;
@@ -3154,9 +3140,6 @@ body {
   height: 64px;
   padding: 8px 12px;
   border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
-}
-.density-compact .row-avatar-letter {
-  font-size: 11px;
 }
 .list-scroll {
   flex: 1;
@@ -3356,10 +3339,6 @@ body {
 }
 .convo-card-body {
   padding: 2px 12px 12px;
-}
-.mail-avatar {
-  flex: none;
-  margin-top: 2px;
 }
 @media (hover: hover) {
   .mail-row:hover {

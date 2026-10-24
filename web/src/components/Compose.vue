@@ -758,7 +758,7 @@ function onKeydown(e) {
                 variant="plain"
                 density="compact"
                 hide-details
-                :menu-props="{ zIndex: 2600 }"
+                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 :items="accounts.map((a) => ({ title: (a.from_name || a.label) + ' <' + a.email + '>', value: String(a.id) }))"
                 class="cfield"
               />
@@ -778,7 +778,7 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="toInvalid.length > 0"
-                :menu-props="{ zIndex: 2600 }"
+                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 class="cfield"
               />
               <v-btn
@@ -811,7 +811,7 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="ccInvalid.length > 0"
-                :menu-props="{ zIndex: 2600 }"
+                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 class="cfield"
               />
             </div>
@@ -831,7 +831,7 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="bccInvalid.length > 0"
-                :menu-props="{ zIndex: 2600 }"
+                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 class="cfield"
               />
             </div>

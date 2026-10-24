@@ -30,10 +30,16 @@ function kindText(a) {
   )
 }
 
+function kindShort(a) {
+  if (a.kind === 'proton') return 'Proton Mail'
+  if (a.kind === 'tuta') return 'Tuta Mail'
+  return 'IMAP/SMTP'
+}
+
 function statusChip(a) {
   const st = props.statuses[a.id]
   if (!st) return null
-  if (st.state === 'idle') return { text: t('已同步 {time}', { time: fmtListTime(st.last_sync_at) }), color: 'secondary-container' }
+  if (st.state === 'idle') return { text: t('已同步'), color: 'secondary-container' }
   if (st.state === 'syncing' || st.state === 'connecting')
     return { text: t('同步中'), color: 'surface-container-high' }
   if (st.state === 'repair') return { text: t('需要手动修复'), color: 'error-container' }
@@ -81,15 +87,14 @@ function fmtDateTime(ts) {
   }).format(new Date(ts * 1000))
 }
 
-function statusText(a) {
+function detailText(a) {
   const st = props.statuses[a.id]
   if (!st) return ''
-  if (st.state === 'idle') return t('已同步 {time}', { time: fmtListTime(st.last_sync_at) })
-  if (st.state === 'syncing') return t('同步中')
-  if (st.state === 'connecting') return t('连接中')
-  if (st.state === 'repair') return t('需要手动修复')
-  if (st.state === 'error') return t('同步失败')
-  return t('未同步')
+  const parts = []
+  if (st.last_sync_at) parts.push(t('上次同步 {time}', { time: fmtListTime(st.last_sync_at) }))
+  const cache = cacheText(a)
+  if (cache) parts.push(cache)
+  return parts.join(t('，'))
 }
 
 const reconnecting = ref(null)
@@ -99,6 +104,7 @@ const rcTarget = ref(null)
 const rcForm = ref({ password: '', mailbox_password: '', totp: '', captcha_token: '' })
 const rcNeedsTotp = ref(false)
 const rcNeedsCaptcha = ref(false)
+const rcCaptchaOpened = ref(false)
 const rcCaptchaUrl = ref('')
 const rcError = ref('')
 const rcBusy = ref(false)
@@ -109,6 +115,7 @@ async function reconnect(a) {
     rcForm.value = { password: '', mailbox_password: '', totp: '', captcha_token: '' }
     rcNeedsTotp.value = false
     rcNeedsCaptcha.value = false
+    rcCaptchaOpened.value = false
     rcCaptchaUrl.value = ''
     rcError.value = ''
     rcOpen.value = true
@@ -135,6 +142,7 @@ async function rcSubmit() {
     const res = await api.reconnectAccount(rcTarget.value.id, { ...rcForm.value })
     if (res && res.needs_captcha) {
       rcForm.value.captcha_token = res.captcha_token
+      rcCaptchaOpened.value = false
       rcCaptchaUrl.value = res.captcha_url
       rcNeedsCaptcha.value = true
       return
@@ -208,6 +216,7 @@ const form = ref(emptyForm())
 const formError = ref('')
 const needsTotp = ref(false)
 const needsCaptcha = ref(false)
+const captchaOpened = ref(false)
 const captchaUrl = ref('')
 const deleteTarget = ref(null)
 const deleteOpen = ref(false)
@@ -259,6 +268,7 @@ function consumeCaptcha(sentToken) {
   if (sentToken && form.value.captcha_token === sentToken) {
     form.value.captcha_token = ''
     captchaUrl.value = ''
+    captchaOpened.value = false
     needsCaptcha.value = false
     captchaCtx = ''
   }
@@ -310,6 +320,7 @@ async function submit(mode) {
     if (res && res.needs_captcha) {
       if (sentToken) showSnack(t('验证已过期，已生成新的验证链接'))
       form.value.captcha_token = res.captcha_token
+      captchaOpened.value = false
       captchaUrl.value = res.captcha_url
       captchaCtx = captchaFingerprint()
       needsCaptcha.value = true
@@ -350,6 +361,24 @@ function testConnection() {
 
 function resumePending() {
   return submit(pendingMode.value)
+}
+
+function captchaStep() {
+  if (!captchaOpened.value) {
+    window.open(captchaUrl.value, '_blank', 'noopener')
+    captchaOpened.value = true
+    return
+  }
+  resumePending()
+}
+
+function rcCaptchaStep() {
+  if (!rcCaptchaOpened.value) {
+    window.open(rcCaptchaUrl.value, '_blank', 'noopener')
+    rcCaptchaOpened.value = true
+    return
+  }
+  rcSubmit()
 }
 
 function reportTestResult(res) {
@@ -693,8 +722,12 @@ onMounted(() => {
     </div>
 
     <template v-if="accountsStatus === 'loading'">
-      <div class="acct-list">
-        <v-skeleton-loader :type="'list-item-avatar-three-line@' + (accounts.length || 5)" class="skel-clip" />
+      <div class="d-flex flex-column ga-3">
+        <v-card v-for="i in (accounts.length || 3)" :key="i" variant="outlined">
+          <v-card-text>
+            <v-skeleton-loader type="list-item-avatar-three-line" class="skel-clip" />
+          </v-card-text>
+        </v-card>
       </div>
     </template>
     <template v-else-if="accountsStatus === 'error'">
@@ -706,24 +739,40 @@ onMounted(() => {
     <p v-else-if="accounts.length === 0" class="text-body-2 text-medium-emphasis">
       {{ t('还没有账号。添加第一个邮箱后，它的邮件会自动同步进聚合收件箱。') }}
     </p>
-    <div v-else class="acct-list">
-      <div v-for="a in accounts" :key="a.id" class="acct-row">
-        <v-avatar :color="avatarColorFor(a.email)" size="40" class="flex-none">
-          <span class="avatar-letter" style="font-size: 16px">{{ avatarLetterFor(a.label, a.email) }}</span>
-        </v-avatar>
-        <div class="acct-main">
-          <div class="acct-name">
-            {{ a.label }}<span class="acct-addr">{{ a.email }}</span>
+    <div v-else class="d-flex flex-column ga-3">
+      <v-card v-for="a in accounts" :key="a.id" variant="outlined">
+        <v-card-text>
+          <div class="d-flex align-start ga-3">
+            <v-avatar :color="avatarColorFor(a.email)" size="40" class="flex-none">
+              <span class="avatar-letter" style="font-size: 16px">{{ avatarLetterFor(a.label, a.email) }}</span>
+            </v-avatar>
+            <div class="flex-grow-1" style="min-width: 0">
+              <div class="text-body-1 font-weight-bold text-truncate">{{ a.label }}</div>
+              <div class="text-body-2 text-medium-emphasis" style="overflow-wrap: anywhere">{{ a.email }}</div>
+            </div>
+            <v-menu>
+              <template #activator="{ props: mp }">
+                <v-btn v-bind="mp" icon="mdi-dots-vertical" variant="text" size="small" class="flex-none" :aria-label="t('更多')" />
+              </template>
+              <v-list density="compact">
+                <v-list-item :title="t('编辑')" @click="openEdit(a)" />
+                <v-list-item :title="t('删除')" @click="askDelete(a)" />
+              </v-list>
+            </v-menu>
           </div>
-          <div class="acct-kind">{{ kindText(a) }}</div>
-          <div
-            v-if="statuses[a.id]"
-            class="acct-status"
-            :class="{ err: statuses[a.id].state === 'error' || statuses[a.id].state === 'repair' }"
-          >
-            {{ statusText(a) }}<template v-if="cacheText(a)"> {{ cacheText(a) }}</template>
+          <div class="d-flex flex-wrap ga-2 mt-3">
+            <v-chip size="small" variant="tonal">{{ kindShort(a) }}</v-chip>
+            <v-chip v-if="statusChip(a)" size="small" variant="flat" :color="statusChip(a).color">
+              {{ statusChip(a).text }}
+            </v-chip>
           </div>
-          <div v-if="statuses[a.id] && statuses[a.id].state === 'repair'" class="mt-2">
+          <div v-if="a.kind === 'imap'" class="text-body-2 text-medium-emphasis mt-3" style="overflow-wrap: anywhere">
+            {{ kindText(a) }}
+          </div>
+          <div v-if="detailText(a)" class="text-body-2 text-medium-emphasis mt-1" style="overflow-wrap: anywhere">
+            {{ detailText(a) }}
+          </div>
+          <div v-if="statuses[a.id] && statuses[a.id].state === 'repair'" class="mt-3">
             <div v-if="statuses[a.id].last_error" class="text-body-2 text-error" style="overflow-wrap: anywhere">
               {{ statuses[a.id].last_error }}
             </div>
@@ -738,22 +787,8 @@ onMounted(() => {
               {{ t('重新连接') }}
             </v-btn>
           </div>
-        </div>
-        <div class="acct-side">
-        <v-chip v-if="statusChip(a)" size="small" variant="flat" :color="statusChip(a).color" class="flex-none">
-          {{ statusChip(a).text }}
-        </v-chip>
-        <v-menu>
-          <template #activator="{ props: mp }">
-            <v-btn v-bind="mp" icon="mdi-dots-vertical" variant="text" size="small" :aria-label="t('更多')" />
-          </template>
-          <v-list density="compact">
-            <v-list-item :title="t('编辑')" @click="openEdit(a)" />
-            <v-list-item :title="t('删除')" @click="askDelete(a)" />
-          </v-list>
-        </v-menu>
-        </div>
-      </div>
+        </v-card-text>
+      </v-card>
     </div>
     </section>
 
@@ -1043,11 +1078,10 @@ onMounted(() => {
               density="comfortable"
               class="mb-2"
             />
-            <div v-if="needsCaptcha" class="d-flex flex-column flex-sm-row align-stretch align-sm-center ga-2 mb-2">
-              <v-btn :href="captchaUrl" target="_blank" rel="noopener" color="primary" variant="tonal" prepend-icon="mdi-open-in-new">
-                {{ t('打开人机验证') }}
+            <div v-if="needsCaptcha" class="mb-2">
+              <v-btn block color="primary" variant="tonal" prepend-icon="mdi-open-in-new" @click="captchaStep">
+                {{ captchaOpened ? t('完成验证并继续') : t('打开人机验证') }}
               </v-btn>
-              <v-btn variant="outlined" @click="resumePending">{{ t('已完成验证') }}</v-btn>
             </div>
           </template>
           <template v-else-if="form.kind === 'tuta'">
@@ -1157,11 +1191,10 @@ onMounted(() => {
           density="comfortable"
           class="mb-2"
         />
-        <div v-if="rcNeedsCaptcha" class="d-flex flex-column flex-sm-row align-stretch align-sm-center ga-2 mb-2">
-          <v-btn :href="rcCaptchaUrl" target="_blank" rel="noopener" color="primary" variant="tonal" prepend-icon="mdi-open-in-new">
-            {{ t('打开人机验证') }}
+        <div v-if="rcNeedsCaptcha" class="mb-2">
+          <v-btn block color="primary" variant="tonal" prepend-icon="mdi-open-in-new" :loading="rcBusy" @click="rcCaptchaStep">
+            {{ rcCaptchaOpened ? t('完成验证并继续') : t('打开人机验证') }}
           </v-btn>
-          <v-btn variant="outlined" :loading="rcBusy" @click="rcSubmit">{{ t('已完成验证') }}</v-btn>
         </div>
         <v-alert v-if="rcError" type="error" variant="tonal" density="compact">{{ rcError }}</v-alert>
       </v-card-text>
@@ -1222,69 +1255,6 @@ onMounted(() => {
 .settings-content > section:first-child {
   margin-top: 0;
 }
-.acct-list {
-  display: flex;
-  flex-direction: column;
-}
-.acct-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 14px 8px;
-  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
-}
-.acct-main {
-  flex: 1;
-  min-width: 0;
-}
-.acct-side {
-  display: flex;
-  align-items: flex-start;
-  gap: 4px;
-  flex: none;
-}
-@media (max-width: 600px) {
-  .acct-row {
-    flex-wrap: wrap;
-  }
-  .acct-main {
-    flex: 1 1 calc(100% - 52px);
-  }
-  .acct-side {
-    margin-left: 52px;
-  }
-  .acct-addr {
-    display: block;
-    margin-left: 0;
-  }
-}
-.acct-name {
-  font-size: 15px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.acct-addr {
-  font-size: 13px;
-  font-weight: 400;
-  color: rgb(var(--v-theme-on-surface-variant));
-  margin-left: 8px;
-}
-.acct-kind {
-  font-size: 13px;
-  color: rgb(var(--v-theme-on-surface-variant));
-  overflow-wrap: anywhere;
-}
-.acct-status {
-  font-size: 13px;
-  color: rgb(var(--v-theme-on-surface-variant));
-  margin-top: 2px;
-  overflow-wrap: anywhere;
-}
-.acct-status.err {
-  color: rgb(var(--v-theme-error));
-  font-weight: 500;
-}
+
 
 </style>
