@@ -1076,12 +1076,28 @@ function downloadAll(d) {
   }
 }
 
-function frameLoaded() {
+const frameObservers = new WeakMap()
+
+function fitFrame(el) {
   try {
-    const doc = frameEl.value?.contentDocument
-    if (doc) frameEl.value.style.height = doc.documentElement.scrollHeight + 'px'
+    const doc = el?.contentDocument
+    if (!doc || !doc.documentElement) return
+    const h = Math.max(doc.documentElement.scrollHeight || 0, doc.body?.scrollHeight || 0)
+    if (h > 0) el.style.height = h + 'px'
+    const prev = frameObservers.get(el)
+    if (prev && prev.doc === doc) return
+    if (prev) prev.ro.disconnect()
+    if (doc.body) {
+      const ro = new ResizeObserver(() => fitFrame(el))
+      ro.observe(doc.body)
+      frameObservers.set(el, { ro, doc })
+    }
   } catch {
   }
+}
+
+function frameLoaded() {
+  fitFrame(frameEl.value)
 }
 
 function patchLocalFlags(id, flags) {
@@ -1328,12 +1344,7 @@ function toggleCard(msg) {
 }
 
 function cardFrameLoaded(e) {
-  try {
-    const el = e.target
-    const doc = el?.contentDocument
-    if (doc) el.style.height = doc.documentElement.scrollHeight + 'px'
-  } catch {
-  }
+  fitFrame(e.target)
 }
 
 function replyCard(msg) {
@@ -2417,6 +2428,7 @@ onBeforeUnmount(() => {
                             class="d-block w-100 border-0"
                             style="height: 320px; background: transparent"
                             sandbox="allow-same-origin"
+                            scrolling="no"
                             :srcdoc="frameCss + convoDetails[msg.id].html"
                             @load="cardFrameLoaded"
                           />
@@ -2633,6 +2645,7 @@ onBeforeUnmount(() => {
                       class="mt-2 d-block w-100 border-0"
                       style="height: 480px; background: transparent"
                       sandbox="allow-same-origin"
+                      scrolling="no"
                       :srcdoc="frameCss + detail.html"
                       @load="frameLoaded"
                     />
