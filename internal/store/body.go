@@ -39,11 +39,15 @@ func (s *Store) GetBody(messageID int64) (text, html string, ok bool, err error)
 }
 
 func (s *Store) SaveBody(messageID int64, text, html, snippet string) error {
+	oldLen := s.bodyLen(messageID)
+	s.beginBodyMutation()
 	if _, err := s.DB.Exec(`INSERT INTO bodies(message_id, text_body, html_body) VALUES(?, ?, ?)
 		ON CONFLICT(message_id) DO UPDATE SET text_body = excluded.text_body, html_body = excluded.html_body`,
 		messageID, text, html); err != nil {
+		s.endBodyMutation(0)
 		return err
 	}
+	s.endBodyMutation(s.bodyLen(messageID) - oldLen)
 	if _, err := s.DB.Exec("UPDATE messages SET body_state = 1, snippet = ? WHERE id = ?", snippet, messageID); err != nil {
 		return err
 	}
@@ -145,9 +149,13 @@ func (s *Store) DeleteLocalMessage(messageID int64) error {
 		}
 	}
 	_ = s.ftsDelete(messageID)
+	oldLen := s.bodyLen(messageID)
+	s.beginBodyMutation()
 	if _, err := s.DB.Exec("DELETE FROM messages WHERE id = ?", messageID); err != nil {
+		s.endBodyMutation(0)
 		return err
 	}
+	s.endBodyMutation(-oldLen)
 	if _, err := s.DB.Exec("UPDATE folders SET total = MAX(total - 1, 0) WHERE id = ?", folderID); err != nil {
 		return err
 	}
@@ -213,10 +221,19 @@ func (s *Store) MoveLocalMessage(oldID, destFolderID int64, destUID uint32) erro
 		return err
 	}
 	if bodyState == 1 {
-		if _, err := s.DB.Exec(`INSERT OR IGNORE INTO bodies(message_id, text_body, html_body)
-			SELECT ?, text_body, html_body FROM bodies WHERE message_id = ?`, newID, oldID); err != nil {
+		copiedLen := s.bodyLen(oldID)
+		s.beginBodyMutation()
+		res, err := s.DB.Exec(`INSERT OR IGNORE INTO bodies(message_id, text_body, html_body)
+			SELECT ?, text_body, html_body FROM bodies WHERE message_id = ?`, newID, oldID)
+		if err != nil {
+			s.endBodyMutation(0)
 			return err
 		}
+		var delta int64
+		if n, err := res.RowsAffected(); err == nil && n == 1 {
+			delta = copiedLen
+		}
+		s.endBodyMutation(delta)
 		if _, err := s.DB.Exec(`INSERT INTO attachments(message_id, part_path, filename, mime, size, local_path, content_id, inline)
 			SELECT ?, part_path, filename, mime, size, local_path, content_id, inline
 			FROM attachments WHERE message_id = ?

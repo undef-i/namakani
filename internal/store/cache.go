@@ -7,9 +7,57 @@ import (
 )
 
 func (s *Store) cacheBodyBytes() (int64, error) {
+	s.bodyBytesMu.Lock()
+	if s.bodyBytesOK {
+		n := s.bodyBytes
+		s.bodyBytesMu.Unlock()
+		return n, nil
+	}
+	epoch := s.bodyEpoch
+	s.bodyBytesMu.Unlock()
+	stable := epoch%2 == 0
 	var n int64
 	err := s.DB.QueryRow(`SELECT COALESCE(SUM(LENGTH(text_body) + LENGTH(html_body)), 0) FROM bodies`).Scan(&n)
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	s.bodyBytesMu.Lock()
+	if stable && s.bodyEpoch == epoch {
+		s.bodyBytes = n
+		s.bodyBytesOK = true
+	}
+	s.bodyBytesMu.Unlock()
+	return n, nil
+}
+
+func (s *Store) bodyLen(messageID int64) int64 {
+	var n int64
+	if err := s.DB.QueryRow(`SELECT COALESCE(LENGTH(text_body) + LENGTH(html_body), 0) FROM bodies WHERE message_id = ?`, messageID).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
+func (s *Store) beginBodyMutation() {
+	s.bodyBytesMu.Lock()
+	s.bodyEpoch++
+	s.bodyBytesMu.Unlock()
+}
+
+func (s *Store) endBodyMutation(delta int64) {
+	s.bodyBytesMu.Lock()
+	if s.bodyBytesOK {
+		s.bodyBytes += delta
+	}
+	s.bodyEpoch++
+	s.bodyBytesMu.Unlock()
+}
+
+func (s *Store) invalidateBodyBytes() {
+	s.bodyBytesMu.Lock()
+	s.bodyBytesOK = false
+	s.bodyEpoch++
+	s.bodyBytesMu.Unlock()
 }
 
 func (s *Store) cacheAttachmentBytes() (int64, error) {
@@ -163,9 +211,13 @@ func (s *Store) attachmentBytesBefore(dateTS, msgID, attID int64) (int64, error)
 }
 
 func (s *Store) EvictBody(messageID int64) error {
+	oldLen := s.bodyLen(messageID)
+	s.beginBodyMutation()
 	if _, err := s.DB.Exec("DELETE FROM bodies WHERE message_id = ?", messageID); err != nil {
+		s.endBodyMutation(0)
 		return err
 	}
+	s.endBodyMutation(-oldLen)
 	if _, err := s.DB.Exec("UPDATE messages SET body_state = 0 WHERE id = ?", messageID); err != nil {
 		return err
 	}

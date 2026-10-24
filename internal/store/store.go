@@ -16,6 +16,10 @@ type Store struct {
 	attachmentsDir string
 	appMu          sync.RWMutex
 	app            AppSettings
+	bodyBytesMu    sync.Mutex
+	bodyBytes      int64
+	bodyBytesOK    bool
+	bodyEpoch      int64
 }
 
 func (s *Store) DataDir() string { return s.dataDir }

@@ -44,13 +44,17 @@ func (s *Store) UpdateFolderSync(folderID int64, uidValidity, uidNext uint32, mo
 }
 
 func (s *Store) WipeFolder(folderID int64) error {
+	s.beginBodyMutation()
 	if _, err := s.DB.Exec(`DELETE FROM messages_fts WHERE rowid IN
 		(SELECT id FROM messages WHERE folder_id = ?)`, folderID); err != nil {
+		s.endBodyMutation(0)
 		return err
 	}
 	if _, err := s.DB.Exec("DELETE FROM messages WHERE folder_id = ?", folderID); err != nil {
+		s.endBodyMutation(0)
 		return err
 	}
+	s.invalidateBodyBytes()
 	_, err := s.DB.Exec(`UPDATE folders SET uidvalidity = 0, uidnext = 0, highest_modseq = 0,
 		total = 0, unread = 0 WHERE id = ?`, folderID)
 	return err
@@ -146,7 +150,9 @@ func (s *Store) FolderUIDs(folderID int64) (map[uint32]bool, error) {
 
 func (s *Store) DeleteMessage(folderID int64, uid uint32) error {
 	var id int64
+	var oldLen int64
 	if err := s.DB.QueryRow("SELECT id FROM messages WHERE folder_id = ? AND uid = ?", folderID, uid).Scan(&id); err == nil {
+		oldLen = s.bodyLen(id)
 		_ = s.ftsDelete(id)
 		if paths, err := s.DB.Query("SELECT local_path FROM attachments WHERE message_id = ? AND local_path <> ''", id); err == nil {
 			var files []string
@@ -162,7 +168,13 @@ func (s *Store) DeleteMessage(folderID int64, uid uint32) error {
 			}
 		}
 	}
+	s.beginBodyMutation()
 	_, err := s.DB.Exec("DELETE FROM messages WHERE folder_id = ? AND uid = ?", folderID, uid)
+	if err == nil {
+		s.endBodyMutation(-oldLen)
+	} else {
+		s.endBodyMutation(0)
+	}
 	return err
 }
 

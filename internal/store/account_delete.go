@@ -29,15 +29,19 @@ func (s *Store) DeleteAccount(accountID int64) error {
 	}
 	rows.Close()
 
+	s.beginBodyMutation()
 	if _, err := s.DB.Exec(
 		"DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE account_id = ?)",
 		accountID,
 	); err != nil {
+		s.endBodyMutation(0)
 		return err
 	}
 	if _, err := s.DB.Exec("DELETE FROM accounts WHERE id = ?", accountID); err != nil {
+		s.endBodyMutation(0)
 		return err
 	}
+	s.invalidateBodyBytes()
 	for _, f := range files {
 		if f.localPath != "" {
 			_ = os.Remove(f.localPath)
