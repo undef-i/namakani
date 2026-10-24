@@ -3,7 +3,6 @@ import 'overlayscrollbars/overlayscrollbars.css'
 
 const SELECTOR = [
   '.list-scroll',
-  '.reader-scroll',
   '.v-navigation-drawer__content',
   '.settings-nav',
   '.settings-content',

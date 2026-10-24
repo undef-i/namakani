@@ -90,6 +90,28 @@ function chipEnter(chips, search) {
 const onToEnter = chipEnter(toChips, toSearch)
 const onCcEnter = chipEnter(ccChips, ccSearch)
 const onBccEnter = chipEnter(bccChips, bccSearch)
+
+const noMenu = computed({ get: () => false, set: () => {} })
+const focusedField = ref('')
+const fieldRefs = {
+  to: { chips: toChips, search: toSearch },
+  cc: { chips: ccChips, search: ccSearch },
+  bcc: { chips: bccChips, search: bccSearch },
+}
+function suggestFor(field) {
+  if (focusedField.value !== field) return []
+  const { chips, search } = fieldRefs[field]
+  const q = (search.value || '').trim().toLowerCase()
+  if (!q) return []
+  return contactItems.value
+    .filter((c) => c.toLowerCase().includes(q) && !chips.value.includes(c))
+    .slice(0, 6)
+}
+function pickSuggest(field, item) {
+  const { chips, search } = fieldRefs[field]
+  if (!chips.value.includes(item)) chips.value = [...chips.value, item]
+  search.value = ''
+}
 const subject = ref('')
 const html = ref('')
 const plainText = ref('')
@@ -767,6 +789,9 @@ function onKeydown(e) {
               <span class="clabel">{{ t('收件人') }}</span>
               <v-combobox
                 @keydown.capture.enter="onToEnter"
+                v-model:menu="noMenu"
+                @focus="focusedField = 'to'"
+                @blur="focusedField = ''"
                 v-model="toChips"
                 v-model:search="toSearch"
                 :items="contactItems"
@@ -778,7 +803,6 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="toInvalid.length > 0"
-                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 class="cfield"
               />
               <v-btn
@@ -791,6 +815,15 @@ function onKeydown(e) {
                 @click="showCc = !showCc"
               />
             </div>
+            <div v-if="suggestFor('to').length" class="csuggest">
+              <button
+                v-for="it in suggestFor('to')"
+                :key="it"
+                type="button"
+                class="csuggest-item"
+                @mousedown.prevent="pickSuggest('to', it)"
+              >{{ it }}</button>
+            </div>
             <p v-if="toInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: toInvalid.join(t('，')) }) }}</p>
             <p v-if="contactsError" class="cerr">
               {{ t('联系人加载失败，地址联想不可用') }}
@@ -800,6 +833,9 @@ function onKeydown(e) {
               <span class="clabel">{{ t('抄送') }}</span>
               <v-combobox
                 @keydown.capture.enter="onCcEnter"
+                v-model:menu="noMenu"
+                @focus="focusedField = 'cc'"
+                @blur="focusedField = ''"
                 v-model="ccChips"
                 v-model:search="ccSearch"
                 :items="contactItems"
@@ -811,15 +847,26 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="ccInvalid.length > 0"
-                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 class="cfield"
               />
+            </div>
+            <div v-if="suggestFor('cc').length" class="csuggest">
+              <button
+                v-for="it in suggestFor('cc')"
+                :key="it"
+                type="button"
+                class="csuggest-item"
+                @mousedown.prevent="pickSuggest('cc', it)"
+              >{{ it }}</button>
             </div>
             <p v-if="showCc && ccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: ccInvalid.join(t('，')) }) }}</p>
             <div v-if="showCc" class="crow">
               <span class="clabel">{{ t('密送') }}</span>
               <v-combobox
                 @keydown.capture.enter="onBccEnter"
+                v-model:menu="noMenu"
+                @focus="focusedField = 'bcc'"
+                @blur="focusedField = ''"
                 v-model="bccChips"
                 v-model:search="bccSearch"
                 :items="contactItems"
@@ -831,9 +878,17 @@ function onKeydown(e) {
                 closable-chips
                 :delimiters="[',']"
                 :error="bccInvalid.length > 0"
-                :menu-props="{ zIndex: 2600, maxHeight: 240 }"
                 class="cfield"
               />
+            </div>
+            <div v-if="suggestFor('bcc').length" class="csuggest">
+              <button
+                v-for="it in suggestFor('bcc')"
+                :key="it"
+                type="button"
+                class="csuggest-item"
+                @mousedown.prevent="pickSuggest('bcc', it)"
+              >{{ it }}</button>
             </div>
             <p v-if="showCc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
             <div class="crow">
@@ -1198,6 +1253,23 @@ function onKeydown(e) {
 .cfield {
   flex: 1;
   min-width: 0;
+}
+.csuggest {
+  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+.csuggest-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 10px 0 10px 52px;
+  font-size: 14px;
+  color: rgb(var(--v-theme-on-surface));
+  overflow-wrap: anywhere;
+}
+@media (hover: hover) {
+  .csuggest-item:hover {
+    background: rgba(var(--v-theme-on-surface), 0.05);
+  }
 }
 .cfield .v-field__input {
   min-height: 30px;
