@@ -1244,6 +1244,7 @@ watch(selected, (sel) => {
 })
 
 async function openMessage(m) {
+  cancelReaderLeave()
   closeConvo()
   if (scope.value === 'drafts' && !searching.value) {
     try {
@@ -1292,6 +1293,7 @@ async function openMessage(m) {
 }
 
 async function openConversation(m) {
+  cancelReaderLeave()
   clearSelection()
   const threadKey = m.thread_key || 'id:' + m.id
   convo.value = {
@@ -1331,6 +1333,35 @@ function closeConvo() {
   convo.value = null
   convoOpenIds.value = new Set()
   convoDetails.value = {}
+}
+
+const readerLeaving = ref(false)
+let readerLeaveTimer = null
+
+function closeReaderNow() {
+  if (convo.value) closeConvo()
+  else if (selected.value) clearSelection()
+}
+
+function leaveReader() {
+  if (lgAndUp.value || readerLeaving.value) {
+    closeReaderNow()
+    return
+  }
+  readerLeaving.value = true
+  readerLeaveTimer = setTimeout(() => {
+    readerLeaveTimer = null
+    readerLeaving.value = false
+    closeReaderNow()
+  }, 200)
+}
+
+function cancelReaderLeave() {
+  if (readerLeaveTimer) {
+    clearTimeout(readerLeaveTimer)
+    readerLeaveTimer = null
+  }
+  readerLeaving.value = false
 }
 
 async function loadCardBody(id) {
@@ -1684,6 +1715,7 @@ async function boot() {
     let st = await api.getState()
     appVersion.value = st.version || ''
     const tg = window.Telegram?.WebApp
+    if (tg?.initData) tg.disableVerticalSwipes?.()
     if (st.setup && !st.authed) {
       if (tg?.initData) {
         tg.ready()
@@ -1696,9 +1728,10 @@ async function boot() {
         }
       }
     }
-    const mParam = new URLSearchParams(location.search).get('m') || ''
+    const pathMatch = /^\/m\/(\d+)$/.exec(location.pathname)
+    const mParam = pathMatch ? pathMatch[1] : new URLSearchParams(location.search).get('m') || ''
     if (/^\d+$/.test(mParam)) {
-      history.replaceState(null, '', location.pathname + location.hash)
+      history.replaceState(null, '', (pathMatch ? '/' : location.pathname) + location.hash)
       if (!deepIdFromHash()) location.hash = '#/mail/' + mParam
     }
     const startParam = tgStartParam()
@@ -2322,7 +2355,7 @@ onBeforeUnmount(() => {
             <div v-if="lgAndUp" class="list-drag" @pointerdown="onListDragStart" />
           </section>
 
-          <section class="reader-section" :class="{ 'd-none': !lgAndUp && !selected && !convo, 'reader-overlay': !lgAndUp && (!!selected || !!convo) }">
+          <section class="reader-section" :class="{ 'd-none': !lgAndUp && !selected && !convo, 'reader-overlay': !lgAndUp && (!!selected || !!convo), 'reader-leaving': readerLeaving }">
             <div v-if="!selected && !convo" class="h-100 d-flex align-center justify-center">
               <div v-if="lgAndUp" class="reader-empty">
                 <v-icon icon="mdi-email-open-outline" size="48" />
@@ -2343,7 +2376,7 @@ onBeforeUnmount(() => {
                   size="small"
                   variant="text"
                   :aria-label="t('关闭')"
-                  @click="closeConvo"
+                  @click="leaveReader"
                 />
               </div>
               <div class="reader-scroll">
@@ -2488,7 +2521,7 @@ onBeforeUnmount(() => {
                   size="small"
                   variant="text"
                   :aria-label="t('关闭')"
-                  @click="clearSelection()"
+                  @click="leaveReader"
                 />
               </div>
               <div v-if="lgAndUp" class="reader-toolbar">
@@ -3229,7 +3262,10 @@ body {
   inset: 0;
   z-index: 2000;
   background: rgb(var(--v-theme-surface));
-  animation: reader-in 0.24s ease-out;
+  animation: reader-in 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.reader-overlay.reader-leaving {
+  animation: reader-out 0.21s cubic-bezier(0.32, 0.72, 0, 1) forwards;
 }
 @keyframes reader-in {
   from {
@@ -3237,6 +3273,22 @@ body {
   }
   to {
     transform: translateX(0);
+  }
+}
+@keyframes reader-out {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .reader-overlay,
+  .compose-root,
+  .compose-root-mobile {
+    animation: none !important;
+    transition: none !important;
   }
 }
 .v-navigation-drawer__content {

@@ -1191,24 +1191,25 @@ function onKeydown(e) {
   width: 600px;
   max-width: calc(100vw - 48px);
   z-index: 2500;
-  animation: compose-in 0.18s ease-out;
-  transition: opacity 0.18s ease;
+  animation: compose-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+  transition: opacity 0.2s cubic-bezier(0.32, 0.72, 0, 1), transform 0.2s cubic-bezier(0.32, 0.72, 0, 1);
 }
 @keyframes compose-in {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(10px) scale(0.98);
   }
 }
 .compose-root.compose-leaving {
   opacity: 0;
+  transform: translateY(6px);
 }
 .compose-root-mobile {
   inset: 0;
   width: auto;
   max-width: none;
-  animation: compose-in-m 0.24s ease-out;
-  transition: transform 0.2s ease, opacity 0.2s ease;
+  animation: compose-in-m 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+  transition: transform 0.22s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.22s cubic-bezier(0.32, 0.72, 0, 1);
 }
 @keyframes compose-in-m {
   from {
