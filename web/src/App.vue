@@ -1016,22 +1016,21 @@ function selectScope(key) {
 }
 
 const frameCss = computed(() => {
-  const dark = theme.global.current.value.dark
-  const fg = dark ? '#e6e6e6' : '#000'
-  const link = dark ? '#a8c7fa' : '#0b57d0'
-  const scheme = dark ? 'dark' : 'light'
+  const fg = '#000'
+  const link = '#0b57d0'
+  const scheme = 'light'
   const font = lgAndUp.value
     ? 'font:15px/1.8 Arial,Helvetica,"PingFang SC","Microsoft YaHei",sans-serif;'
     : 'font:14px/1.5 Arial,Helvetica,"PingFang SC","Microsoft YaHei",sans-serif;'
   const quote = lgAndUp.value
     ? 'blockquote{border-left:2px solid ' +
-      (dark ? '#8e9196' : '#74787c') +
+      '#74787c' +
       ';color:' +
-      (dark ? '#c4c7ca' : '#43474c') +
+      '#43474c' +
       ';margin-left:0;padding-left:12px}'
     : ''
   return (
-    '<style>:root{color-scheme:' + scheme + '}html,body{margin:0;padding:0;background:transparent;color:' + fg + ';' +
+    '<style>:root{color-scheme:' + scheme + '}html,body{margin:0;padding:0;background:#ffffff;color:' + fg + ';' +
     font +
     'overflow-wrap:anywhere;scrollbar-width:thin}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:rgba(128,128,128,0.4);border-radius:4px}::-webkit-scrollbar-track{background:transparent}img{max-width:100%;height:auto}table{max-width:100%}a{color:' + link + ';text-decoration:none}a:hover{text-decoration:underline}' +
     quote +
