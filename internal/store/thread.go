@@ -8,15 +8,60 @@ func cleanMsgID(s string) string {
 	return strings.Trim(strings.TrimSpace(s), "<>")
 }
 
-func (s *Store) ComputeThreadKey(accountID int64, messageID, inReplyTo string) string {
+var subjectPrefixes = []string{"re", "fw", "fwd", "aw", "wg", "回复", "答复", "转发", "回覆"}
+
+func normalizeSubject(s string) string {
+	s = strings.TrimSpace(s)
+	for {
+		matched := false
+		for _, p := range subjectPrefixes {
+			if len(s) >= len(p) && strings.EqualFold(s[:len(p)], p) {
+				rest := strings.TrimSpace(s[len(p):])
+				if strings.HasPrefix(rest, "[") {
+					if i := strings.Index(rest, "]"); i >= 0 && i > 1 {
+						numeric := true
+						for _, r := range rest[1:i] {
+							if r < '0' || r > '9' {
+								numeric = false
+								break
+							}
+						}
+						if numeric {
+							rest = strings.TrimSpace(rest[i+1:])
+						}
+					}
+				}
+				if strings.HasPrefix(rest, ":") {
+					s = strings.TrimSpace(rest[1:])
+					matched = true
+					break
+				}
+				if strings.HasPrefix(rest, "：") {
+					s = strings.TrimSpace(rest[len("："):])
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			break
+		}
+	}
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
+}
+
+func (s *Store) ComputeThreadKey(accountID int64, messageID, inReplyTo, subject string) string {
 	self := cleanMsgID(messageID)
 	parent := cleanMsgID(inReplyTo)
 	if parent != "" {
-		var parentKey string
-		err := s.DB.QueryRow("SELECT thread_key FROM messages WHERE account_id = ? AND message_id = ? AND thread_key <> '' LIMIT 1",
-			accountID, parent).Scan(&parentKey)
+		var parentKey, parentSubject string
+		err := s.DB.QueryRow("SELECT thread_key, subject FROM messages WHERE account_id = ? AND message_id = ? AND thread_key <> '' LIMIT 1",
+			accountID, parent).Scan(&parentKey, &parentSubject)
 		if err == nil && parentKey != "" {
-			return parentKey
+			if normalizeSubject(parentSubject) == normalizeSubject(subject) {
+				return parentKey
+			}
+			return self
 		}
 		if self != "" && self == parent {
 			return self
@@ -69,10 +114,11 @@ func (s *Store) MarkThreadChecked(ids []int64) error {
 }
 
 func (s *Store) RecomputeThreadKey(accountID, rowID int64, refs []string, inReplyTo string) error {
-	var messageID, curKey string
-	if err := s.DB.QueryRow("SELECT message_id, thread_key FROM messages WHERE id = ?", rowID).Scan(&messageID, &curKey); err != nil {
+	var messageID, curKey, subject string
+	if err := s.DB.QueryRow("SELECT message_id, thread_key, subject FROM messages WHERE id = ?", rowID).Scan(&messageID, &curKey, &subject); err != nil {
 		return err
 	}
+	selfSubj := normalizeSubject(subject)
 	self := cleanMsgID(messageID)
 	if self == "" {
 		return nil
@@ -84,26 +130,40 @@ func (s *Store) RecomputeThreadKey(accountID, rowID int64, refs []string, inRepl
 		}
 	}
 	irt := cleanMsgID(inReplyTo)
-	lookup := func(id string) string {
-		var k string
-		err := s.DB.QueryRow("SELECT thread_key FROM messages WHERE account_id = ? AND message_id = ? AND thread_key <> '' LIMIT 1",
-			accountID, id).Scan(&k)
-		if err != nil || k == id {
-			return ""
+	lookup := func(id string) (string, bool) {
+		var k, subj string
+		err := s.DB.QueryRow("SELECT thread_key, subject FROM messages WHERE account_id = ? AND message_id = ? AND thread_key <> '' LIMIT 1",
+			accountID, id).Scan(&k, &subj)
+		if err != nil {
+			return "", false
 		}
-		return k
+		if normalizeSubject(subj) != selfSubj {
+			return "", true
+		}
+		return k, true
 	}
 	key := ""
+	foundAny := false
 	for i := len(chain) - 1; i >= 0 && key == ""; i-- {
 		if chain[i] != self {
-			key = lookup(chain[i])
+			k, found := lookup(chain[i])
+			if found {
+				foundAny = true
+				key = k
+			}
 		}
 	}
 	if key == "" && irt != "" && irt != self {
-		key = lookup(irt)
+		k, found := lookup(irt)
+		if found {
+			foundAny = true
+			key = k
+		}
 	}
 	if key == "" {
 		switch {
+		case foundAny:
+			key = self
 		case len(chain) > 0:
 			key = chain[0]
 		case irt != "":
@@ -126,9 +186,31 @@ func (s *Store) RecomputeThreadKey(accountID, rowID int64, refs []string, inRepl
 		cands[curKey] = true
 	}
 	for c := range cands {
-		if c != key {
-			if _, err := s.DB.Exec("UPDATE messages SET thread_key = ? WHERE account_id = ? AND thread_key = ?",
-				key, accountID, c); err != nil {
+		if c == key || c == "" {
+			continue
+		}
+		rows, err := s.DB.Query("SELECT id, subject FROM messages WHERE account_id = ? AND thread_key = ?", accountID, c)
+		if err != nil {
+			return err
+		}
+		var ids []int64
+		for rows.Next() {
+			var rid int64
+			var rsubj string
+			if err := rows.Scan(&rid, &rsubj); err != nil {
+				rows.Close()
+				return err
+			}
+			if rid != rowID && normalizeSubject(rsubj) == selfSubj {
+				ids = append(ids, rid)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, rid := range ids {
+			if _, err := s.DB.Exec("UPDATE messages SET thread_key = ? WHERE id = ?", key, rid); err != nil {
 				return err
 			}
 		}
@@ -136,16 +218,49 @@ func (s *Store) RecomputeThreadKey(accountID, rowID int64, refs []string, inRepl
 	return nil
 }
 
-func (s *Store) AdoptThreadKey(accountID int64, fromKey, toKey string, exceptID int64) error {
+func (s *Store) AdoptThreadKey(accountID int64, fromKey, toKey string, exceptID int64, subject string) error {
 	if fromKey == "" || toKey == "" || fromKey == toKey {
 		return nil
 	}
-	_, err := s.DB.Exec("UPDATE messages SET thread_key = ? WHERE account_id = ? AND thread_key = ? AND id <> ?",
-		toKey, accountID, fromKey, exceptID)
-	return err
+	rows, err := s.DB.Query("SELECT id, subject FROM messages WHERE account_id = ? AND thread_key = ? AND id <> ?",
+		accountID, fromKey, exceptID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var ids []int64
+	want := normalizeSubject(subject)
+	for rows.Next() {
+		var rid int64
+		var rsubj string
+		if err := rows.Scan(&rid, &rsubj); err != nil {
+			return err
+		}
+		if normalizeSubject(rsubj) == want {
+			ids = append(ids, rid)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	for _, rid := range ids {
+		if _, err := s.DB.Exec("UPDATE messages SET thread_key = ? WHERE id = ?", toKey, rid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) BackfillThreadKeys() error {
+	if v, ok, err := s.GetSetting("thread_scheme"); err == nil && (!ok || v != "gmail-subject-v1") {
+		if _, err := s.DB.Exec("UPDATE messages SET thread_key = '', thread_checked = 0"); err != nil {
+			return err
+		}
+		if err := s.SetSetting("thread_scheme", "gmail-subject-v1"); err != nil {
+			return err
+		}
+	}
 	if _, err := s.DB.Exec("UPDATE messages SET thread_key = '' WHERE thread_key LIKE 'subj:%'"); err != nil {
 		return err
 	}

@@ -1,6 +1,9 @@
 package store
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 type AttachmentRow struct {
 	ID        int64  `json:"id"`
@@ -80,6 +83,39 @@ func (s *Store) ReplaceAttachments(messageID int64, atts []AttachmentRow) ([]Att
 		}
 	}
 	return s.ListAttachments(messageID)
+}
+
+func (s *Store) MarkPendingRemoval(messageID, fromFolderID int64) {
+	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO pending_removals(message_id, from_folder_id, created_at) VALUES(?, ?, unixepoch())`, messageID, fromFolderID)
+}
+
+func (s *Store) ClearPendingRemoval(messageID int64) {
+	_, _ = s.DB.Exec(`DELETE FROM pending_removals WHERE message_id = ?`, messageID)
+}
+
+func (s *Store) PendingRemovalSet(ids []int64) map[int64]bool {
+	out := map[int64]bool{}
+	if len(ids) == 0 {
+		return out
+	}
+	ph := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		ph[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.DB.Query(`SELECT message_id FROM pending_removals WHERE message_id IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err == nil {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 func (s *Store) ListAttachments(messageID int64) ([]AttachmentRow, error) {
@@ -176,83 +212,30 @@ func (s *Store) FolderBySpecial(accountID int64, special string) (int64, string,
 }
 
 func (s *Store) MoveLocalMessage(oldID, destFolderID int64, destUID uint32) error {
-	var (
-		acctID    int64
-		messageID string
-		subject   string
-		fromJSON  string
-		toJSON    string
-		ccJSON    string
-		threadKey string
-		snippet   string
-		dateTS    int64
-		flags     uint32
-		hasAttach int
-		size      int64
-		bodyState int
-	)
-	err := s.DB.QueryRow(`SELECT account_id, message_id, subject, from_json, to_json, cc_json,
-		thread_key, snippet, date_ts, flags, has_attach, size, body_state
-		FROM messages WHERE id = ?`, oldID).
-		Scan(&acctID, &messageID, &subject, &fromJSON, &toJSON, &ccJSON,
-			&threadKey, &snippet, &dateTS, &flags, &hasAttach, &size, &bodyState)
-	if err != nil {
+	var acctID, srcFolderID int64
+	if err := s.DB.QueryRow("SELECT account_id, folder_id FROM messages WHERE id = ?", oldID).Scan(&acctID, &srcFolderID); err != nil {
 		return err
 	}
-	row := &MessageRow{
-		UID:       destUID,
-		MessageID: messageID,
-		ThreadKey: threadKey,
-		Subject:   subject,
-		FromJSON:  fromJSON,
-		ToJSON:    toJSON,
-		CcJSON:    ccJSON,
-		DateTS:    dateTS,
-		Flags:     flags,
-		HasAttach: hasAttach != 0,
-		Size:      size,
-	}
-	if _, _, err := s.UpsertMessage(acctID, destFolderID, row); err != nil {
-		return err
-	}
-	var newID int64
-	if err := s.DB.QueryRow("SELECT id FROM messages WHERE account_id = ? AND folder_id = ? AND uid = ?",
-		acctID, destFolderID, destUID).Scan(&newID); err != nil {
-		return err
-	}
-	if bodyState == 1 {
-		copiedLen := s.bodyLen(oldID)
-		s.beginBodyMutation()
-		res, err := s.DB.Exec(`INSERT OR IGNORE INTO bodies(message_id, text_body, html_body)
-			SELECT ?, text_body, html_body FROM bodies WHERE message_id = ?`, newID, oldID)
-		if err != nil {
-			s.endBodyMutation(0)
-			return err
-		}
-		var delta int64
-		if n, err := res.RowsAffected(); err == nil && n == 1 {
-			delta = copiedLen
-		}
-		s.endBodyMutation(delta)
-		if _, err := s.DB.Exec(`INSERT INTO attachments(message_id, part_path, filename, mime, size, local_path, content_id, inline)
-			SELECT ?, part_path, filename, mime, size, local_path, content_id, inline
-			FROM attachments WHERE message_id = ?
-			AND NOT EXISTS (SELECT 1 FROM attachments WHERE message_id = ?)`, newID, oldID, newID); err != nil {
-			return err
-		}
-		if _, err := s.DB.Exec("UPDATE messages SET body_state = 1, snippet = ?, thread_key = ? WHERE id = ?",
-			snippet, threadKey, newID); err != nil {
+	var dupID int64
+	if err := s.DB.QueryRow("SELECT id FROM messages WHERE account_id = ? AND folder_id = ? AND uid = ? AND id != ?",
+		acctID, destFolderID, destUID, oldID).Scan(&dupID); err == nil {
+		if err := s.DeleteLocalMessage(dupID); err != nil {
 			return err
 		}
 	}
-	if err := s.ftsCopy(oldID, newID); err != nil {
+	if _, err := s.DB.Exec("UPDATE messages SET folder_id = ?, uid = ? WHERE id = ?", destFolderID, destUID, oldID); err != nil {
 		return err
 	}
-	if err := s.DeleteLocalMessage(oldID); err != nil {
-		return err
-	}
-	if _, err := s.DB.Exec("UPDATE folders SET total = total + 1 WHERE id = ?", destFolderID); err != nil {
-		return err
+	if srcFolderID != destFolderID {
+		if _, err := s.DB.Exec("UPDATE folders SET total = MAX(total - 1, 0) WHERE id = ?", srcFolderID); err != nil {
+			return err
+		}
+		if _, err := s.DB.Exec("UPDATE folders SET total = total + 1 WHERE id = ?", destFolderID); err != nil {
+			return err
+		}
+		if err := s.RefreshUnread(srcFolderID); err != nil {
+			return err
+		}
 	}
 	return s.RefreshUnread(destFolderID)
 }
