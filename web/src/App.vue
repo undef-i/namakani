@@ -367,6 +367,15 @@ function applyTheme() {
   const dark =
     themeMode.value === 'dark' || (themeMode.value === 'system' && !!systemDarkMQ?.matches)
   theme.global.name.value = dark ? 'dark' : 'light'
+  const bg = dark ? '#1F2022' : '#E7EDF4'
+  document.documentElement.style.background = bg
+  const tg = window.Telegram?.WebApp
+  if (tg?.setBackgroundColor) {
+    try {
+      tg.setBackgroundColor(bg)
+    } catch {
+    }
+  }
 }
 
 function setThemeMode(v) {

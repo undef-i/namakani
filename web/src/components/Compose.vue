@@ -32,19 +32,14 @@ const open = computed({
   set: (v) => emit('update:modelValue', v),
 })
 
-const vvStyle = ref({})
+const rootEl = ref(null)
 let vvAttached = false
-let vvRaf = 0
-let vvTop = 0
 function syncVV() {
-  if (vvRaf) return
-  vvRaf = requestAnimationFrame(() => {
-    vvRaf = 0
-    const vv = window.visualViewport
-    if (!vv) return
-    if (Math.abs(vv.offsetTop - vvTop) >= 8) vvTop = vv.offsetTop
-    vvStyle.value = { top: vvTop + 'px', height: vv.height + 'px' }
-  })
+  const el = rootEl.value
+  const vv = window.visualViewport
+  if (!el || !vv) return
+  el.style.top = vv.offsetTop + 'px'
+  el.style.height = vv.height + 'px'
 }
 function attachVV() {
   if (vvAttached || !window.visualViewport) return
@@ -58,12 +53,11 @@ function detachVV() {
   vvAttached = false
   window.visualViewport.removeEventListener('resize', syncVV)
   window.visualViewport.removeEventListener('scroll', syncVV)
-  if (vvRaf) {
-    cancelAnimationFrame(vvRaf)
-    vvRaf = 0
+  const el = rootEl.value
+  if (el) {
+    el.style.top = ''
+    el.style.height = ''
   }
-  vvStyle.value = {}
-  vvTop = 0
 }
 const shown = ref(false)
 const draftLoading = ref(false)
@@ -779,9 +773,10 @@ function onKeydown(e) {
 
 <template>
   <div
+    ref="rootEl"
     v-show="shown"
     class="compose-root"
-    :style="lgAndUp ? { zIndex: props.zIndex } : vvStyle"
+    :style="{ zIndex: props.zIndex }"
     :class="{
       'compose-root-mobile': !lgAndUp,
       'compose-max': maximized && lgAndUp,
