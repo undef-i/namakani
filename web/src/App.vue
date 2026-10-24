@@ -2370,14 +2370,14 @@ onBeforeUnmount(() => {
               @touchend.passive="onReaderTouchEnd"
             >
               <div v-if="!lgAndUp" class="reader-head">
-                <v-spacer />
                 <v-btn
-                  icon="mdi-close"
+                  icon="mdi-arrow-left"
                   size="small"
                   variant="text"
-                  :aria-label="t('关闭')"
+                  :aria-label="t('返回')"
                   @click="leaveReader"
                 />
+                <v-spacer />
               </div>
               <div class="reader-scroll">
                 <div data-overlayscrollbars-viewport class="reader-vp">
@@ -2515,14 +2515,14 @@ onBeforeUnmount(() => {
               @touchend.passive="onReaderTouchEnd"
             >
               <div v-if="!lgAndUp" class="reader-head">
-                <v-spacer />
                 <v-btn
-                  icon="mdi-close"
+                  icon="mdi-arrow-left"
                   size="small"
                   variant="text"
-                  :aria-label="t('关闭')"
+                  :aria-label="t('返回')"
                   @click="leaveReader"
                 />
+                <v-spacer />
               </div>
               <div v-if="lgAndUp" class="reader-toolbar">
                 <v-btn
