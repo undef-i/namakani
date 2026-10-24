@@ -75,6 +75,8 @@ function clearSelection() {
   detailToken++
   selected.value = null
   detail.value = null
+  detailState.value = 'idle'
+  detailError.value = ''
   if (!booted && (location.hash.startsWith('#/mail/') || location.hash.startsWith('#m-'))) {
     history.pushState(null, '', location.pathname + location.search)
   }
@@ -1043,7 +1045,7 @@ const frameCss = computed(() => {
   return (
     '<style>:root{color-scheme:' + scheme + '}html,body{margin:0;padding:0;background:#ffffff;color:' + fg + ';' +
     font +
-    'overflow-wrap:anywhere;scrollbar-width:thin}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:rgba(128,128,128,0.4);border-radius:4px}::-webkit-scrollbar-track{background:transparent}img{max-width:100%;height:auto}table{max-width:100%}a{color:' + link + ';text-decoration:none}a:hover{text-decoration:underline}' +
+    'overflow-wrap:anywhere;scrollbar-width:thin}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:rgba(128,128,128,0.4);border-radius:4px}::-webkit-scrollbar-track{background:transparent}img{max-width:100%;height:auto}a{color:' + link + ';text-decoration:none}a:hover{text-decoration:underline}' +
     quote +
     '</style>'
   )
@@ -1083,7 +1085,22 @@ function fitFrame(el) {
     const doc = el?.contentDocument
     if (!doc || !doc.documentElement) return
     const h = Math.max(doc.documentElement.scrollHeight || 0, doc.body?.scrollHeight || 0)
-    if (h > 0) el.style.height = h + 'px'
+    const wrap = el.parentElement
+    const avail = wrap ? wrap.clientWidth : 0
+    const w = Math.max(doc.documentElement.scrollWidth || 0, doc.body?.scrollWidth || 0)
+    if (h > 0 && avail > 0 && w > avail + 1) {
+      const sc = avail / w
+      el.style.setProperty('width', w + 'px', 'important')
+      el.style.height = h + 'px'
+      el.style.transform = 'scale(' + sc + ')'
+      el.style.transformOrigin = 'top left'
+      if (wrap) wrap.style.height = Math.ceil(h * sc) + 'px'
+    } else if (h > 0) {
+      el.style.removeProperty('width')
+      el.style.transform = ''
+      el.style.height = h + 'px'
+      if (wrap) wrap.style.height = ''
+    }
     const prev = frameObservers.get(el)
     if (prev && prev.doc === doc) return
     if (prev) prev.ro.disconnect()
@@ -1678,6 +1695,11 @@ async function boot() {
           tgAuthError.value = err.message
         }
       }
+    }
+    const mParam = new URLSearchParams(location.search).get('m') || ''
+    if (/^\d+$/.test(mParam)) {
+      history.replaceState(null, '', location.pathname + location.hash)
+      if (!deepIdFromHash()) location.hash = '#/mail/' + mParam
     }
     const startParam = tgStartParam()
     if (startParam && !deepIdFromHash()) {
@@ -2324,7 +2346,9 @@ onBeforeUnmount(() => {
                   @click="closeConvo"
                 />
               </div>
-              <div class="reader-scroll px-3 pb-3 px-sm-4 pb-sm-4">
+              <div class="reader-scroll">
+                <div data-overlayscrollbars-viewport class="reader-vp">
+                  <div data-overlayscrollbars-content class="px-3 pb-3 px-sm-4 pb-sm-4">
                 <h2 class="text-h6 font-weight-bold mb-1" style="overflow-wrap: anywhere">
                   {{ convo.subject || t('(无主题)') }}
                 </h2>
@@ -2447,6 +2471,8 @@ onBeforeUnmount(() => {
                     </div>
                   </div>
                 </div>
+                  </div>
+                </div>
               </div>
             </div>
             <div
@@ -2501,7 +2527,9 @@ onBeforeUnmount(() => {
                 <v-spacer />
                 <v-btn icon="mdi-printer" variant="text" size="small" :disabled="!detail?.html" :aria-label="t('打印')" @click="printSelected" />
               </div>
-              <div class="reader-scroll px-3 pb-3 px-sm-4 pb-sm-4">
+              <div class="reader-scroll">
+                <div data-overlayscrollbars-viewport class="reader-vp">
+                  <div data-overlayscrollbars-content class="px-3 pb-3 px-sm-4 pb-sm-4">
               <template v-if="lgAndUp">
                 <div class="reader-head-block">
                   <h2 class="reader-subject">{{ selected.subject || t('(无主题)') }}</h2>
@@ -2661,6 +2689,8 @@ onBeforeUnmount(() => {
                   <p v-else class="py-6 text-body-2 text-medium-emphasis">{{ t('这封邮件没有可显示的正文。') }}</p>
                 </div>
               </template>
+                  </div>
+                </div>
               </div>
             </div>
           </section>
@@ -2846,10 +2876,11 @@ body {
   display: flex;
   flex-direction: column;
 }
-.settings-card .v-card-text {
+.settings-card > .v-card-text {
   flex: 1;
   min-height: 0;
   display: flex;
+  flex-direction: column;
 }
 .topbar-desktop {
   display: flex;
@@ -3198,6 +3229,15 @@ body {
   inset: 0;
   z-index: 2000;
   background: rgb(var(--v-theme-surface));
+  animation: reader-in 0.24s ease-out;
+}
+@keyframes reader-in {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: translateX(0);
+  }
 }
 .v-navigation-drawer__content {
   overflow-anchor: none;
@@ -3309,9 +3349,11 @@ body {
 .reader-scroll {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
   overflow-anchor: none;
-  overflow-x: hidden;
+}
+.reader-vp {
+  width: 100%;
+  height: 100%;
 }
 @media (hover: none) {
   .v-tooltip {

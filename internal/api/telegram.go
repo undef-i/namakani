@@ -383,7 +383,7 @@ type tgItem struct {
 const tgNamakaniBase = "https://namakani.example.com"
 
 func tgDeepLink(id int64) string {
-	return fmt.Sprintf("%s/#/mail/%d", tgNamakaniBase, id)
+	return fmt.Sprintf("%s/?m=%d", tgNamakaniBase, id)
 }
 
 func rtBold(s string) any {

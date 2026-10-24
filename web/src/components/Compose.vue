@@ -34,10 +34,15 @@ const open = computed({
 
 const vvStyle = ref({})
 let vvAttached = false
+let vvRaf = 0
 function syncVV() {
-  const vv = window.visualViewport
-  if (!vv) return
-  vvStyle.value = { top: vv.offsetTop + 'px', height: vv.height + 'px' }
+  if (vvRaf) return
+  vvRaf = requestAnimationFrame(() => {
+    vvRaf = 0
+    const vv = window.visualViewport
+    if (!vv) return
+    vvStyle.value = { top: vv.offsetTop + 'px', height: vv.height + 'px' }
+  })
 }
 function attachVV() {
   if (vvAttached || !window.visualViewport) return
@@ -51,8 +56,37 @@ function detachVV() {
   vvAttached = false
   window.visualViewport.removeEventListener('resize', syncVV)
   window.visualViewport.removeEventListener('scroll', syncVV)
+  if (vvRaf) {
+    cancelAnimationFrame(vvRaf)
+    vvRaf = 0
+  }
   vvStyle.value = {}
 }
+const shown = ref(false)
+const leaving = ref(false)
+let leaveTimer = null
+watch(
+  open,
+  (v) => {
+    if (v) {
+      if (leaveTimer) {
+        clearTimeout(leaveTimer)
+        leaveTimer = null
+      }
+      leaving.value = false
+      shown.value = true
+    } else if (shown.value) {
+      leaving.value = true
+      leaveTimer = setTimeout(() => {
+        shown.value = false
+        leaving.value = false
+        leaveTimer = null
+      }, 200)
+    }
+  },
+  { immediate: true },
+)
+
 watch([open, lgAndUp], ([isOpen, up]) => {
   if (isOpen && !up) attachVV()
   else detachVV()
@@ -727,13 +761,14 @@ function onKeydown(e) {
 
 <template>
   <div
-    v-show="open"
+    v-show="shown"
     class="compose-root"
     :style="lgAndUp ? { zIndex: props.zIndex } : vvStyle"
     :class="{
       'compose-root-mobile': !lgAndUp,
       'compose-max': maximized && lgAndUp,
       'compose-min': minimized && lgAndUp,
+      'compose-leaving': leaving,
     }"
     @keydown="onKeydown"
     @dragover.prevent="dragOver = true"
@@ -1156,11 +1191,33 @@ function onKeydown(e) {
   width: 600px;
   max-width: calc(100vw - 48px);
   z-index: 2500;
+  animation: compose-in 0.18s ease-out;
+  transition: opacity 0.18s ease;
+}
+@keyframes compose-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+.compose-root.compose-leaving {
+  opacity: 0;
 }
 .compose-root-mobile {
   inset: 0;
   width: auto;
   max-width: none;
+  animation: compose-in-m 0.24s ease-out;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+@keyframes compose-in-m {
+  from {
+    transform: translateY(100%);
+  }
+}
+.compose-root-mobile.compose-leaving {
+  transform: translateY(100%);
+  opacity: 1;
 }
 .compose-max {
   inset: 0;

@@ -54,6 +54,8 @@ type Manager struct {
 	mu          sync.Mutex
 	workers     map[int64]*worker
 	status      map[int64]*Status
+	lastCache   map[int64]store.AccountCacheStats
+	lastBytes   int64
 	live        map[int64]bool
 	repair      map[int64]repairInfo
 	folderLocks map[int64]*sync.Mutex
@@ -79,6 +81,7 @@ func NewManager(st *store.Store) *Manager {
 		st:       st,
 		workers:  make(map[int64]*worker),
 		status:   make(map[int64]*Status),
+		lastCache: make(map[int64]store.AccountCacheStats),
 		live:     make(map[int64]bool),
 		repair:   make(map[int64]repairInfo),
 		initTurn: make(chan struct{}, 1),
@@ -164,14 +167,25 @@ func (m *Manager) Status(accountID int64) Status {
 		out = Status{State: "stopped"}
 	}
 	m.mu.Unlock()
-	if cs, err := m.st.AccountCacheStats(accountID); err == nil {
+	cs, csErr := m.st.AccountCacheStats(accountID)
+	bodyBytes, attBytes, usageErr := m.st.CacheUsage()
+	m.mu.Lock()
+	if csErr == nil {
+		m.lastCache[accountID] = cs
+	} else if last, ok := m.lastCache[accountID]; ok {
+		cs = last
+		csErr = nil
+	}
+	if usageErr == nil {
+		m.lastBytes = bodyBytes + attBytes
+	}
+	out.CacheBytesUsed = m.lastBytes
+	m.mu.Unlock()
+	if csErr == nil {
 		out.CacheBodiesCached = cs.BodiesCached
 		out.CacheBodiesTotal = cs.BodiesTotal
 		out.CacheAttachmentsCached = cs.AttachmentsCached
 		out.CacheAttachmentsTotal = cs.AttachmentsTotal
-	}
-	if bodyBytes, attBytes, err := m.st.CacheUsage(); err == nil {
-		out.CacheBytesUsed = bodyBytes + attBytes
 	}
 	out.CacheBudgetBytes = m.st.CacheBudgetBytes()
 	return out

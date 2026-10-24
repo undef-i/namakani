@@ -20,6 +20,17 @@ const SECTIONS = computed(() => [
   { key: 'advanced', label: t('高级'), icon: 'mdi-cog' },
 ])
 
+const props = defineProps({
+  accounts: { type: Array, default: () => [] },
+  accountsStatus: { type: String, default: 'ready' },
+  statuses: { type: Object, default: () => ({}) },
+  themeMode: { type: String, default: 'system' },
+  threaded: { type: Boolean, default: false },
+  undoSeconds: { type: Number, default: 5 },
+  version: { type: String, default: '' },
+})
+const emit = defineEmits(['changed', 'update:themeMode', 'update:threaded', 'update:undoSeconds', 'appSettings'])
+
 function kindText(a) {
   if (a.kind === 'proton') return 'Proton Mail'
   if (a.kind === 'tuta') return 'Tuta Mail'
@@ -29,6 +40,35 @@ function kindText(a) {
   )
 }
 
+
+const undoItems = computed(() => [
+  { title: t('关闭（立即发送）'), value: 0 },
+  { title: t('{n} 秒', { n: 5 }), value: 5 },
+  { title: t('{n} 秒', { n: 10 }), value: 10 },
+  { title: t('{n} 秒', { n: 20 }), value: 20 },
+  { title: t('{n} 秒', { n: 30 }), value: 30 },
+])
+
+function fmtListTime(ts) {
+  const d = new Date(ts * 1000)
+  const now = new Date()
+  if (d.toDateString() === now.toDateString())
+    return new Intl.DateTimeFormat(intlLocale(), { hour: '2-digit', minute: '2-digit', hour12: false }).format(d)
+  if (d.getFullYear() === now.getFullYear())
+    return new Intl.DateTimeFormat(intlLocale(), { month: 'numeric', day: 'numeric' }).format(d)
+  return new Intl.DateTimeFormat(intlLocale(), { year: 'numeric', month: 'numeric', day: 'numeric' }).format(d)
+}
+
+function fmtDateTime(ts) {
+  return new Intl.DateTimeFormat(intlLocale(), {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(ts * 1000))
+}
 
 function statusText(a) {
   const st = props.statuses[a.id]
@@ -1186,13 +1226,12 @@ onMounted(() => {
   display: flex;
   align-items: stretch;
   width: 100%;
-  height: 100%;
+  flex: 1 1 auto;
   min-height: 0;
 }
 .settings-nav {
   width: 240px;
   flex: none;
-  overflow-y: auto;
 }
 .settings-content {
   flex: 1;
@@ -1200,7 +1239,6 @@ onMounted(() => {
   max-width: 880px;
   margin-inline: auto;
   padding: 16px;
-  overflow-y: auto;
   min-height: 0;
 }
 .settings-sec {

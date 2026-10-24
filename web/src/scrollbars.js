@@ -2,6 +2,9 @@ import { OverlayScrollbars } from 'overlayscrollbars'
 import 'overlayscrollbars/overlayscrollbars.css'
 
 const SELECTOR = [
+  '.reader-scroll',
+  '.settings-nav',
+  '.settings-content',
   '.list-scroll',
   '.v-navigation-drawer__content',
   '.compose-body',
@@ -22,6 +25,13 @@ function initEl(el) {
   const options = { scrollbars: { autoHide: 'leave', autoHideDelay: 600 } }
   if (el.classList.contains('v-table__wrapper')) {
     options.overflow = { x: 'scroll', y: 'scroll' }
+  }
+  if (
+    el.classList.contains('reader-scroll') ||
+    el.classList.contains('settings-nav') ||
+    el.classList.contains('settings-content')
+  ) {
+    options.overflow = { x: 'hidden', y: 'scroll' }
   }
   try {
     const inst = OverlayScrollbars(el, options)
