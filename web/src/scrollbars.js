@@ -4,8 +4,6 @@ import 'overlayscrollbars/overlayscrollbars.css'
 const SELECTOR = [
   '.list-scroll',
   '.v-navigation-drawer__content',
-  '.settings-nav',
-  '.settings-content',
   '.compose-body',
   '.compose-attach-chips',
   '.v-menu > .v-overlay__content',

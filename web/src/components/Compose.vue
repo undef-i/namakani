@@ -99,7 +99,6 @@ const fieldRefs = {
   bcc: { chips: bccChips, search: bccSearch },
 }
 function suggestFor(field) {
-  if (focusedField.value !== field) return []
   const { chips, search } = fieldRefs[field]
   const q = (search.value || '').trim().toLowerCase()
   if (!q) return []
@@ -111,6 +110,9 @@ function pickSuggest(field, item) {
   const { chips, search } = fieldRefs[field]
   if (!chips.value.includes(item)) chips.value = [...chips.value, item]
   search.value = ''
+  requestAnimationFrame(() => {
+    search.value = ''
+  })
 }
 const subject = ref('')
 const html = ref('')
@@ -822,6 +824,7 @@ function onKeydown(e) {
                 type="button"
                 class="csuggest-item"
                 @mousedown.prevent="pickSuggest('to', it)"
+                @touchstart.prevent="pickSuggest('to', it)"
               >{{ it }}</button>
             </div>
             <p v-if="toInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: toInvalid.join(t('，')) }) }}</p>
@@ -857,6 +860,7 @@ function onKeydown(e) {
                 type="button"
                 class="csuggest-item"
                 @mousedown.prevent="pickSuggest('cc', it)"
+                @touchstart.prevent="pickSuggest('cc', it)"
               >{{ it }}</button>
             </div>
             <p v-if="showCc && ccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: ccInvalid.join(t('，')) }) }}</p>
@@ -888,6 +892,7 @@ function onKeydown(e) {
                 type="button"
                 class="csuggest-item"
                 @mousedown.prevent="pickSuggest('bcc', it)"
+                @touchstart.prevent="pickSuggest('bcc', it)"
               >{{ it }}</button>
             </div>
             <p v-if="showCc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
