@@ -816,16 +816,16 @@ function onKeydown(e) {
                 :class="{ 'chev-open': showCc }"
                 @click="showCc = !showCc"
               />
-            </div>
-            <div v-if="suggestFor('to').length" class="csuggest">
-              <button
-                v-for="it in suggestFor('to')"
-                :key="it"
-                type="button"
-                class="csuggest-item"
-                @mousedown.prevent="pickSuggest('to', it)"
-                @touchstart.prevent="pickSuggest('to', it)"
-              >{{ it }}</button>
+              <div v-if="suggestFor('to').length" class="csuggest">
+                <button
+                  v-for="it in suggestFor('to')"
+                  :key="it"
+                  type="button"
+                  class="csuggest-item"
+                  @mousedown.prevent="pickSuggest('to', it)"
+                  @touchstart.prevent="pickSuggest('to', it)"
+                >{{ it }}</button>
+              </div>
             </div>
             <p v-if="toInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: toInvalid.join(t('，')) }) }}</p>
             <p v-if="contactsError" class="cerr">
@@ -852,16 +852,16 @@ function onKeydown(e) {
                 :error="ccInvalid.length > 0"
                 class="cfield"
               />
-            </div>
-            <div v-if="suggestFor('cc').length" class="csuggest">
-              <button
-                v-for="it in suggestFor('cc')"
-                :key="it"
-                type="button"
-                class="csuggest-item"
-                @mousedown.prevent="pickSuggest('cc', it)"
-                @touchstart.prevent="pickSuggest('cc', it)"
-              >{{ it }}</button>
+              <div v-if="suggestFor('cc').length" class="csuggest">
+                <button
+                  v-for="it in suggestFor('cc')"
+                  :key="it"
+                  type="button"
+                  class="csuggest-item"
+                  @mousedown.prevent="pickSuggest('cc', it)"
+                  @touchstart.prevent="pickSuggest('cc', it)"
+                >{{ it }}</button>
+              </div>
             </div>
             <p v-if="showCc && ccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: ccInvalid.join(t('，')) }) }}</p>
             <div v-if="showCc" class="crow">
@@ -884,16 +884,16 @@ function onKeydown(e) {
                 :error="bccInvalid.length > 0"
                 class="cfield"
               />
-            </div>
-            <div v-if="suggestFor('bcc').length" class="csuggest">
-              <button
-                v-for="it in suggestFor('bcc')"
-                :key="it"
-                type="button"
-                class="csuggest-item"
-                @mousedown.prevent="pickSuggest('bcc', it)"
-                @touchstart.prevent="pickSuggest('bcc', it)"
-              >{{ it }}</button>
+              <div v-if="suggestFor('bcc').length" class="csuggest">
+                <button
+                  v-for="it in suggestFor('bcc')"
+                  :key="it"
+                  type="button"
+                  class="csuggest-item"
+                  @mousedown.prevent="pickSuggest('bcc', it)"
+                  @touchstart.prevent="pickSuggest('bcc', it)"
+                >{{ it }}</button>
+              </div>
             </div>
             <p v-if="showCc && bccInvalid.length" class="cerr">{{ t('地址格式不对：{list}', { list: bccInvalid.join(t('，')) }) }}</p>
             <div class="crow">
@@ -1236,6 +1236,7 @@ function onKeydown(e) {
   padding: 0 16px;
 }
 .crow {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1260,13 +1261,24 @@ function onKeydown(e) {
   min-width: 0;
 }
 .csuggest {
-  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  position: absolute;
+  top: calc(100% + 1px);
+  left: 52px;
+  right: 0;
+  z-index: 40;
+  background: rgb(var(--v-theme-surface));
+  border: 1px solid rgb(var(--v-theme-outline-variant));
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px 0;
 }
 .csuggest-item {
   display: block;
   width: 100%;
   text-align: left;
-  padding: 10px 0 10px 52px;
+  padding: 10px 12px;
   font-size: 14px;
   color: rgb(var(--v-theme-on-surface));
   overflow-wrap: anywhere;

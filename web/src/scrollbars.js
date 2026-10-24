@@ -10,7 +10,6 @@ const SELECTOR = [
   '.v-select__content',
   '.v-autocomplete__content',
   '.v-combobox__content',
-  '.v-dialog--scrollable > .v-overlay__content > .v-card > .v-card-text',
   '.v-table__wrapper',
   '.v-virtual-scroll',
 ].join(',')
