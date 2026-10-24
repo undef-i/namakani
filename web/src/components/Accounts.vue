@@ -624,31 +624,6 @@ async function testWP() {
 }
 
 
-const sch = ref([])
-const schStatus = ref('loading')
-const schError = ref('')
-
-async function loadScheduled() {
-  schStatus.value = 'loading'
-  try {
-    sch.value = await api.listScheduled()
-    schStatus.value = 'ready'
-  } catch (err) {
-    schStatus.value = 'error'
-    schError.value = err.message
-  }
-}
-
-async function cancelSch(it) {
-  try {
-    await api.cancelScheduled(it.id)
-    sch.value = sch.value.filter((x) => x.id !== it.id)
-  } catch (err) {
-    schError.value = err.message
-    schStatus.value = 'error'
-  }
-}
-
 const appSetState = ref('loading')
 const appSetError = ref('')
 const appSetBusy = ref(false)
@@ -702,7 +677,6 @@ onMounted(() => {
   loadAppSet()
   loadTG()
   loadWP()
-  loadScheduled()
 })
 </script>
 
@@ -899,34 +873,6 @@ onMounted(() => {
         @update:model-value="emit('update:undoSeconds', $event)"
       />
     </div>
-    <h2 class="text-h6 mb-3">{{ t('定时发送') }}</h2>
-    <template v-if="schStatus === 'loading'">
-      <v-skeleton-loader type="list-item-two-line@2" max-width="640" class="skel-clip" />
-    </template>
-    <template v-else-if="schStatus === 'error'">
-      <v-alert type="error" variant="tonal" density="compact" max-width="640">
-        {{ t('定时发送加载失败：{error}', { error: schError }) }}
-        <v-btn variant="text" size="small" @click="loadScheduled">{{ t('重试') }}</v-btn>
-      </v-alert>
-    </template>
-    <template v-else>
-      <p v-if="sch.length === 0" class="text-body-2 text-medium-emphasis">{{ t('没有定时发送的邮件。') }}</p>
-      <v-list v-else density="comfortable" class="pa-0" style="max-width: 640px">
-        <v-list-item v-for="it in sch" :key="it.id" class="px-0">
-          <v-list-item-title class="text-body-2">{{ it.subject || t('(无主题)') }}</v-list-item-title>
-          <v-list-item-subtitle>
-            {{ t('发给 {to}，计划 {time}', { to: it.to, time: fmtDateTime(it.send_at) }) }}
-            <template v-if="it.status === 'sent'">{{ t('，已发送') }}</template>
-            <template v-else-if="it.status === 'failed'">{{ t('，发送失败') }}<template v-if="it.error">（{{ it.error }}）</template></template>
-            <template v-else>{{ t('，待发送') }}</template>
-          </v-list-item-subtitle>
-          <template v-if="it.status === 'pending'" #append>
-            <v-btn variant="text" size="small" color="error" @click="cancelSch(it)">{{ t('取消') }}</v-btn>
-          </template>
-        </v-list-item>
-      </v-list>
-    </template>
-
     </section>
 
     <section v-if="showSection('push')" class="settings-sec">
@@ -942,7 +888,7 @@ onMounted(() => {
       </v-alert>
     </template>
     <div v-else style="max-width: 640px">
-      <v-switch v-model="tg.enabled" :label="t('启用新邮件推送')" color="primary" hide-details class="mb-2" />
+      <v-switch v-model="tg.enabled" :label="t('开始推送')" color="primary" hide-details class="mb-2" />
       <v-text-field
         v-model="tg.bot_token"
         label="Bot Token"
@@ -972,7 +918,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <div class="text-subtitle-1 font-weight-medium mb-3 mt-8">{{ t('浏览器推送') }}</div>
+    <div class="text-subtitle-1 font-weight-medium mb-3 mt-8">Web Push</div>
     <template v-if="wpStatus === 'loading'">
       <v-skeleton-loader type="article" max-width="640" class="skel-clip" />
     </template>
@@ -985,7 +931,7 @@ onMounted(() => {
     <div v-else style="max-width: 640px">
       <v-switch
         :model-value="thisSub === true"
-        :label="t('本浏览器接收推送')"
+        :label="t('开启推送')"
         color="primary"
         hide-details
         class="mb-2"
@@ -994,8 +940,6 @@ onMounted(() => {
       />
       <p class="text-body-2 mb-2">
         {{ t('当前共有 {n} 个浏览器订阅。', { n: wp.subscriptions }) }}
-        <template v-if="thisSub === true">{{ t('本浏览器已订阅。') }}</template>
-        <template v-else-if="thisSub === false">{{ t('本浏览器未订阅。') }}</template>
       </p>
       <v-alert v-if="!wpSupported" type="warning" variant="tonal" density="compact" class="mb-2">
         {{ t('当前浏览器不支持 Web Push。') }}
@@ -1206,7 +1150,7 @@ onMounted(() => {
     <v-card>
       <v-card-title>{{ t('删除账号') }}</v-card-title>
       <v-card-text>
-        {{ t('删除账号「{label}」？本地同步的邮件会一并删除，服务器上的邮件不受影响。', { label: deleteTarget?.label }) }}
+        {{ t('删除账号「{label}」？', { label: deleteTarget?.label }) }}
       </v-card-text>
       <v-card-actions>
         <v-spacer />

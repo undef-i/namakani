@@ -32,7 +32,8 @@ body,
   background: transparent;
 }
 
-.os-scrollbar {
+.os-scrollbar.os-theme-dark,
+.os-scrollbar.os-theme-light {
   --os-size: 8px;
   --os-padding-perpendicular: 2px;
   --os-padding-axis: 2px;

@@ -6,3 +6,4 @@ server.key
 /namakani
 web/node_modules/
 web/dist/
+.deploy/

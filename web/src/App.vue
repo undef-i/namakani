@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useDisplay, useLocale, useTheme } from 'vuetify'
 import { intlLocale, lang, t } from './i18n'
 import Auth from './components/Auth.vue'
@@ -16,6 +16,7 @@ const SCOPES = computed(() => [
   { key: 'archive', label: t('归档'), icon: 'mdi-archive' },
   { key: 'junk', label: t('垃圾邮件'), icon: 'mdi-alert-octagon-outline' },
   { key: 'trash', label: t('回收站'), icon: 'mdi-delete' },
+  { key: 'scheduled', label: t('定时发件'), icon: 'mdi-clock-outline' },
 ])
 const PAGE_SIZE = 60
 
@@ -49,16 +50,33 @@ function snapCtxKey(snap) {
     : 'folder|' + snap.scope + '|' + (snap.folderId ?? 0)
 }
 
+function markTombstone(id) {
+  tombstones.set(id, snapCtxKey(listSnap.value))
+}
+function tombstoneLive(id, ctx) {
+  return tombstones.get(id) === ctx
+}
 function dropTombstoned(batch, snap) {
   const ctx = snapCtxKey(snap)
-  return batch.filter((m) => tombstones.get(m.id) !== ctx)
+  return batch.filter((m) => !tombstoneLive(m.id, ctx))
 }
 
-function clearTombstonesFor(snap) {
-  const ctx = snapCtxKey(snap)
-  for (const [id, c] of tombstones) {
-    if (c === ctx) tombstones.delete(id)
-  }
+const scopeCache = new Map()
+let listEpoch = 0
+function listCacheKey(snap) {
+  return snapCtxKey(snap) + '|t' + (threaded.value ? '1' : '0')
+}
+function stashList() {
+  const snap = listSnap.value
+  if (snap.kind !== 'folder' || listStatus.value !== 'ready') return
+  scopeCache.set(listCacheKey(snap), {
+    messages: messages.value,
+    offset: listOffset,
+    hasMore: listHasMore.value,
+    scroll: scrollEl(listEl.value)?.scrollTop ?? 0,
+    epoch: listEpoch,
+  })
+  if (scopeCache.size > 12) scopeCache.delete(scopeCache.keys().next().value)
 }
 const statuses = ref({})
 const settingsOpen = ref(location.hash === '#/settings')
@@ -107,6 +125,27 @@ function setSubjectEl(el) {
 const detailState = ref('idle')
 const detailError = ref('')
 const actionError = ref('')
+const purgeConfirm = ref(false)
+const purging = ref(false)
+async function doPurge() {
+  const f = activeFolder.value
+  if (!f || purging.value) return
+  purging.value = true
+  try {
+    await api.purgeFolder(f.id)
+    purgeConfirm.value = false
+    showToast(f.special_use === 'trash' ? t('已清空回收站') : t('已清空垃圾箱'))
+    loadFolders()
+    loadMessages(true)
+  } catch (err) {
+    purgeConfirm.value = false
+    showToast(f.special_use === 'trash' ? t('清空回收站失败') : t('清空垃圾箱失败'))
+    loadFolders()
+    loadMessages(true)
+  } finally {
+    purging.value = false
+  }
+}
 const opBusy = ref(false)
 let detailToken = 0
 
@@ -212,19 +251,138 @@ async function bulkAct(kind) {
   if (opBusy.value || !selectionActive.value) return
   opBusy.value = true
   const ids = [...selectedIds.value]
-  try {
-    for (const id of ids) {
-      if (kind === 'archive') await api.moveMessage(id, 'archive')
-      else if (kind === 'delete') await api.deleteMessage(id)
-      else if (kind === 'seen') await api.setFlags(id, { seen: true })
-      else if (kind === 'unseen') await api.setFlags(id, { seen: false })
-      if (kind === 'archive' || kind === 'delete') tombstones.set(id, snapCtxKey(listSnap.value))
-    }
+  const removable = kind === 'archive' || kind === 'delete'
+  const rows = removable ? displayMessages.value.filter((m) => selectedIds.value.has(m.id)) : []
+  const openRemoved = !!(selected.value && ids.includes(selected.value.id))
+  let opIds = ids
+  const needsExpansion =
+    removable && threaded.value && !searching.value && rows.some((x) => x.thread_count > 1)
+  const destFor = (x) => (x.folder_special === 'trash' || x.folder_special === 'junk' ? 'inbox' : 'archive')
+  const toastKind =
+    kind === 'delete' && listSnap.value.scope === 'scheduled'
+      ? 'cancel'
+      : kind === 'archive' && rows.length && rows.every((x) => destFor(x) === 'inbox')
+        ? 'inbox'
+        : kind
+  const specialById = new Map(rows.map((x) => [x.id, x.folder_special]))
+  let work = null
+  const movedItems = []
+  const itemById = new Map()
+  if (removable) {
+    work = (async () => {
+      if (needsExpansion) {
+        const per = await Promise.all(
+          rows.map(async (x) => {
+            if (!(x.thread_count > 1)) return [x]
+            const all = await api.getThreadMessagesAll(x.account_id, x.thread_key || 'id:' + x.id)
+            const inTrashView = x.folder_special === 'trash' || x.folder_special === 'junk'
+            const targets = all.filter((y) =>
+              inTrashView
+                ? y.folder_special === 'trash' || y.folder_special === 'junk'
+                : y.folder_special !== 'trash' && y.folder_special !== 'junk',
+            )
+            return targets.length ? targets : [x]
+          }),
+        )
+        const expanded = per.flat()
+        for (const x of expanded) specialById.set(x.id, x.folder_special)
+        opIds = [...new Set(expanded.map((x) => x.id))]
+        const extraItems = expanded
+          .filter(
+            (x) =>
+              x.id > 0 &&
+              x.folder_special !== 'scheduled' &&
+              (x.folder_id || x.folder_special) &&
+              (kind === 'archive'
+                ? x.folder_special !== destFor(x)
+                : x.folder_special !== 'trash' && x.folder_special !== 'junk'),
+          )
+          .map((x) => ({ id: x.id, special: x.folder_special, folder_id: x.folder_id, row: x }))
+        for (const it of extraItems) itemById.set(it.id, it)
+        const have = new Set(rows.map((x) => x.id))
+        const restItems = extraItems.filter((x) => !have.has(x.id))
+        if ((opIds.length !== ids.length || restItems.length) && toastShow.value && Date.now() < toastHideAt) {
+          showCountToast(
+            toastKind,
+            opIds.length - ids.length,
+            restItems.length ? { items: restItems, settled: settledMoved } : null,
+          )
+        }
+      }
+      for (const id of opIds) {
+        if (kind === 'archive')
+          await api.moveMessage(id, specialById.get(id) === 'trash' || specialById.get(id) === 'junk' ? 'inbox' : 'archive')
+        else if (listSnap.value.scope === 'scheduled') await api.cancelScheduled(-id)
+        else await api.deleteMessage(id)
+        markTombstone(id)
+        const ui = itemById.get(id)
+        if (ui) movedItems.push(ui)
+      }
+    })()
     clearSelectionIds()
-    if (selected.value && ids.includes(selected.value.id)) clearSelection()
-    if (kind === 'archive' || kind === 'delete') reloadLoaded()
-    else loadMessages(true)
+    if (openRemoved) clearSelection()
+    const undoItems = rows
+      .filter(
+        (x) =>
+          x.id > 0 &&
+          x.folder_special !== 'scheduled' &&
+          (x.folder_id || x.folder_special) &&
+          (kind === 'archive'
+            ? x.folder_special !== destFor(x)
+            : x.folder_special !== 'trash' && x.folder_special !== 'junk'),
+      )
+      .map((x) => ({ id: x.id, special: x.folder_special, folder_id: x.folder_id, row: x }))
+    for (const it of undoItems) itemById.set(it.id, it)
+    const settledMoved = work.then(
+      () => movedItems,
+      () => movedItems,
+    )
+    showCountToast(toastKind, opIds.length, undoItems.length ? { items: undoItems, settled: settledMoved } : null)
+  }
+  try {
+    if (!work) {
+      work = (async () => {
+        for (const id of ids) {
+          if (kind === 'seen') await api.setFlags(id, { seen: true })
+          else if (kind === 'unseen') await api.setFlags(id, { seen: false })
+        }
+      })()
+    }
+    if (removable) {
+      await Promise.all([collapseRows(rows), work])
+      messages.value = messages.value.filter((m) => !ids.includes(m.id))
+      exitMap.value = new Map()
+      exitAnim.value = false
+      for (const id of opIds) tombstones.delete(id)
+      for (const id of ids) exitNatural.delete(id)
+      reloadLoaded()
+    } else {
+      await work
+      clearSelectionIds()
+      if (openRemoved) clearSelection()
+      loadMessages(true)
+    }
     loadFolders()
+  } catch (err) {
+    if (removable) {
+      toastShow.value = false
+      for (const id of opIds) tombstones.delete(id)
+      const back = new Map()
+      for (const id of ids) if (exitNatural.has(id)) back.set(id, exitNatural.get(id))
+      if (back.size) {
+        exitMap.value = back
+        await sleep(250)
+      }
+      for (const id of ids) exitNatural.delete(id)
+      loadMessages(true)
+    }
+    exitMap.value = new Map()
+    exitAnim.value = false
+    if (removable && (toastKind === 'delete' || toastKind === 'archive' || toastKind === 'cancel' || toastKind === 'inbox')) {
+      showRemovalFailure(toastKind, opIds.length - movedItems.length)
+    } else {
+      actionError.value = err.message
+    }
   } finally {
     opBusy.value = false
   }
@@ -241,6 +399,17 @@ const displayMessages = computed(() => {
       (!f.accountId || m.account_id === f.accountId),
   )
 })
+function pinAnimating(batch) {
+  if (!exitMap.value.size) return batch
+  const have = new Set(batch.map((x) => x.id))
+  const out = [...batch]
+  messages.value.forEach((row, i) => {
+    if (exitMap.value.has(row.id) && !have.has(row.id)) {
+      out.splice(Math.min(i, out.length), 0, row)
+    }
+  })
+  return out
+}
 function resetSearchFilter() {
   searchFilter.value = { attach: false, unread: false, accountId: 0 }
 }
@@ -272,6 +441,27 @@ const listHeadTitle = computed(() => {
     ')'
   )
 })
+
+const selectionHasUnread = computed(() =>
+  displayMessages.value.some((m) => selectedIds.value.has(m.id) && !(m.flags & 1)),
+)
+const mobileSearch = ref(false)
+const mobileBarTitle = computed(() => {
+  if (searching.value) return t('搜索结果')
+  return liveScopeLabel.value
+})
+
+function openMobileSearch() {
+  mobileSearch.value = true
+  nextTick(() => {
+    searchEl.value?.focus?.()
+  })
+}
+
+function closeMobileSearch() {
+  mobileSearch.value = false
+  clearSearch()
+}
 function accountShort(m) {
   const s = m.account_label || ''
   const at = s.indexOf('@')
@@ -284,13 +474,41 @@ let listOffset = 0
 const detailCache = new Map()
 let es = null
 let esTimer = null
-let esDelay = 1000
+let esWasDown = false
 let statusTimer = null
 let booted = false
 
 function deepIdFromHash() {
   const m = /^#\/mail\/(\d+)$/.exec(location.hash) || /^#m-(\d+)$/.exec(location.hash)
   return m ? +m[1] : 0
+}
+
+function parseHash() {
+  const h = location.hash
+  if (h === '#/settings') return { type: 'settings' }
+  const mail = deepIdFromHash()
+  if (mail) return { type: 'mail', id: mail }
+  const sm = /^#\/search\/(.*)$/.exec(h)
+  if (sm) {
+    try {
+      return { type: 'search', query: decodeURIComponent(sm[1]) }
+    } catch {
+      return { type: 'search', query: sm[1] }
+    }
+  }
+  const sc = /^#\/([a-z]+)(?:\/(\d+))?$/.exec(h)
+  if (sc && SCOPES.value.some((s) => s.key === sc[1])) {
+    return { type: 'scope', scope: sc[1], account: sc[2] ? +sc[2] : 0 }
+  }
+  return { type: 'scope', scope: scope.value, account: rangeId.value }
+}
+
+function viewHash() {
+  if (settingsOpen.value) return '#/settings'
+  if (selected.value) return '#/mail/' + selected.value.id
+  if (convo.value) return '#/mail/' + convo.value.anchor
+  if (searching.value) return '#/search/' + encodeURIComponent(searchQuery.value)
+  return '#/' + scope.value + (rangeId.value ? '/' + rangeId.value : '')
 }
 
 function tgStartParam() {
@@ -348,6 +566,7 @@ function enrichSelected(d) {
 const snapScopeLabel = computed(
   () => SCOPES.value.find((s) => s.key === listSnap.value.scope)?.label ?? listSnap.value.scope,
 )
+const scheduledPending = ref(0)
 const scopeStats = computed(() => {
   const map = {}
   for (const f of folders.value) {
@@ -359,8 +578,17 @@ const scopeStats = computed(() => {
     cur.present = true
     map[f.special_use] = cur
   }
+  map['scheduled'] = { total: scheduledPending.value, unread: scheduledPending.value, present: true }
   return map
 })
+
+async function refreshScheduledCount() {
+  try {
+    const list = await api.listScheduled()
+    scheduledPending.value = list.length
+  } catch {
+  }
+}
 const visibleScopes = computed(() => SCOPES.value.filter((s) => scopeStats.value[s.key]?.present))
 
 function applyTheme() {
@@ -461,8 +689,9 @@ async function loadMessages(soft = false) {
     : {
         kind: 'folder',
         scope: scope.value,
-        folderId: rangeId.value ? (activeFolder.value?.id ?? -1) : 0,
+        folderId: scope.value === 'scheduled' ? 0 : rangeId.value ? (activeFolder.value?.id ?? -1) : 0,
       }
+  stashList()
   const gen = ++listGen
   listBusy.value = true
   if (!soft) {
@@ -478,6 +707,22 @@ async function loadMessages(soft = false) {
   convoOpenIds.value = new Set()
   convoDetails.value = {}
   cursorIdx.value = 0
+  const rawHit = !soft && target.kind === 'folder' ? scopeCache.get(listCacheKey(target)) : null
+  const hit = rawHit && rawHit.epoch === listEpoch ? rawHit : null
+  if (hit) {
+    messages.value = hit.messages
+    listOffset = hit.offset
+    listHasMore.value = hit.hasMore
+    listSnap.value = target
+    listStatus.value = 'ready'
+    listBusy.value = false
+    nextTick(() => {
+      const el = scrollEl(listEl.value)
+      if (el) el.scrollTop = hit.scroll
+    })
+    reloadLoaded()
+    return
+  }
   try {
     let batch
     if (target.kind === 'search') {
@@ -488,8 +733,7 @@ async function loadMessages(soft = false) {
       batch = await api.getMessages(target.scope, 0, PAGE_SIZE, threaded.value)
     }
     if (gen !== listGen) return
-    messages.value = dropTombstoned(batch, target)
-    clearTombstonesFor(target)
+    messages.value = pinAnimating(dropTombstoned(batch, target))
     if (target.kind === 'search') {
       listHasMore.value = false
     } else {
@@ -552,8 +796,7 @@ async function reloadLoaded() {
       : await api.getMessages(scope.value, 0, n, threaded.value)
     if (gen !== listGen) return
     const snap = { kind: 'folder', scope: scope.value, folderId }
-    messages.value = dropTombstoned(batch, snap)
-    clearTombstonesFor(snap)
+    messages.value = pinAnimating(dropTombstoned(batch, snap))
     listOffset = batch.length
     listHasMore.value = batch.length === n
     listSnap.value = snap
@@ -710,8 +953,171 @@ let swipeStart = null
 let swipeWidth = 0
 let swipeHeight = 0
 let suppressClickUntil = 0
+let pressTimer = 0
+
+const exitMap = ref(new Map())
+const exitAnim = ref(false)
+const toastText = ref('')
+const toastShow = ref(false)
+let toastTimer = 0
+function showRemovalFailure(kind, n) {
+  pendingUndo.value = null
+  if (kind === 'archive') showToast(n > 1 ? t('{n} 封邮件归档失败，已恢复', { n }) : t('归档失败，邮件已恢复'))
+  else if (kind === 'inbox') showToast(n > 1 ? t('{n} 封邮件移回收件箱失败，已恢复', { n }) : t('移回收件箱失败，邮件已恢复'))
+  else if (kind === 'cancel') showToast(t('取消发送失败'))
+  else showToast(n > 1 ? t('{n} 封邮件删除失败，已恢复', { n }) : t('删除失败，邮件已恢复'))
+}
+function onSnackSurfaceClick(e) {
+  if (e.target.closest('.v-btn')) return
+  dismissToast()
+}
+function dismissToast() {
+  clearTimeout(toastTimer)
+  toastShow.value = false
+  pendingUndo.value = null
+}
+function showToast(text) {
+  toastText.value = text
+  toastShow.value = true
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { toastShow.value = false }, toastTimeout.value)
+}
+let toastKind = ''
+let toastCount = 0
+let toastHideAt = 0
+const pendingUndo = ref(null)
+const undoBusy = ref(false)
+const toastTimeout = computed(() => (pendingUndo.value ? 6000 : 3500))
+watch(toastShow, (v) => {
+  if (!v) {
+    pendingUndo.value = null
+  }
+})
+function showCountToast(kind, n, undo = null) {
+  const now = Date.now()
+  const continuing = toastKind === kind && toastShow.value && now < toastHideAt
+  if (continuing) {
+    toastCount += n
+    if (undo && pendingUndo.value) {
+      pendingUndo.value = {
+        items: [...pendingUndo.value.items, ...undo.items],
+        settled: Promise.all([pendingUndo.value.settled, undo.settled]).then(([a, b]) => [...a, ...b]),
+      }
+    } else if (undo) {
+      pendingUndo.value = undo
+    }
+  } else {
+    toastKind = kind
+    toastCount = n
+    pendingUndo.value = undo
+  }
+  toastHideAt = now + (pendingUndo.value ? 6000 : 3500)
+  if (kind === 'delete') showToast(t('已删除 {n} 封邮件', { n: toastCount }))
+  else if (kind === 'archive') showToast(t('已归档 {n} 封邮件', { n: toastCount }))
+  else if (kind === 'inbox') showToast(t('已移回收件箱 {n} 封邮件', { n: toastCount }))
+  else showToast(t('已取消 {n} 封定时发送', { n: toastCount }))
+}
+function rowBelongsToCurrentView(row) {
+  if (searching.value) return false
+  if (rangeId.value && row.account_id !== rangeId.value) return false
+  if (activeFolder.value?.id) return row.folder_id === activeFolder.value.id
+  if (scope.value === 'all') return true
+  return row.folder_special === scope.value
+}
+
+function restoreRowsLocally(items) {
+  const have = new Set(messages.value.map((x) => x.id))
+  const back = []
+  for (const it of items) {
+    if (!it.row || have.has(it.id) || !rowBelongsToCurrentView(it.row)) continue
+    back.push(it.row)
+  }
+  if (!back.length) return
+  messages.value = [...messages.value, ...back].sort((a, b) => b.date_ts - a.date_ts || b.id - a.id)
+}
+
+async function undoRemoval() {
+  const u = pendingUndo.value
+  toastShow.value = false
+  pendingUndo.value = null
+  if (!u || undoBusy.value) return
+  undoBusy.value = true
+  for (const it of u.items) tombstones.delete(it.id)
+  restoreRowsLocally(u.items)
+  animateRowsIn(u.items.map((it) => it.id))
+  try {
+    const moved = await u.settled
+    for (const it of moved) {
+      if (it.folder_id) await api.moveMessageToFolder(it.id, it.folder_id)
+      else await api.moveMessage(it.id, it.special)
+    }
+    if (moved.length) loadFolders()
+    loadMessages(true)
+  } catch (err) {
+    actionError.value = err.message
+    loadMessages(true)
+  } finally {
+    undoBusy.value = false
+  }
+}
+
+const exitNatural = new Map()
+const enterMap = ref(new Map())
+const enterAnim = ref(false)
+async function animateRowsIn(ids) {
+  await nextTick()
+  const naturals = new Map()
+  for (const id of ids) {
+    const i = displayMessages.value.findIndex((x) => x.id === id)
+    if (i < 0) continue
+    const wrap = document.querySelector('[data-rowidx="' + i + '"]')?.closest('.mail-row-wrap')
+    if (wrap) naturals.set(id, wrap.offsetHeight)
+  }
+  if (!naturals.size) return
+  enterAnim.value = false
+  enterMap.value = new Map([...naturals.keys()].map((id) => [id, 0]))
+  await nextTick()
+  await new Promise((r) => requestAnimationFrame(r))
+  enterAnim.value = true
+  enterMap.value = naturals
+  await sleep(250)
+  enterMap.value = new Map()
+  enterAnim.value = false
+}
+
+async function collapseRows(rows) {
+  const heights = new Map()
+  for (const m of rows) {
+    const idx = displayMessages.value.indexOf(m)
+    const el = idx >= 0 ? document.querySelector('[data-rowidx="' + idx + '"]')?.closest('.mail-row-wrap') : null
+    heights.set(m.id, el ? el.offsetHeight : 0)
+  }
+  if (!heights.size) return
+  for (const [id, h] of heights) exitNatural.set(id, h)
+  exitAnim.value = false
+  exitMap.value = heights
+  await nextTick()
+  await new Promise((r) => requestAnimationFrame(r))
+  exitAnim.value = true
+  exitMap.value = new Map([...heights.keys()].map((id) => [id, 0]))
+  await sleep(240)
+}
 
 function rowWrapStyle(m) {
+  if (exitMap.value.has(m.id)) {
+    return {
+      height: exitMap.value.get(m.id) + 'px',
+      transition: exitAnim.value ? 'height 0.22s ease' : 'none',
+      overflow: 'hidden',
+    }
+  }
+  if (enterMap.value.has(m.id)) {
+    return {
+      height: enterMap.value.get(m.id) + 'px',
+      transition: enterAnim.value ? 'height 0.22s ease' : 'none',
+      overflow: 'hidden',
+    }
+  }
   if (exitId.value !== m.id) return {}
   return {
     height: exitH.value + 'px',
@@ -731,6 +1137,12 @@ function rowSwipeStyle(m) {
 function rowTouchStart(e, m) {
   if (exitId.value === m.id) return
   swipeStart = { id: m.id, x: e.touches[0].clientX, y: e.touches[0].clientY, engaged: false }
+  clearTimeout(pressTimer)
+  pressTimer = setTimeout(() => {
+    toggleRowSelection(m)
+    navigator.vibrate?.(15)
+    suppressClickUntil = Date.now() + 400
+  }, 450)
   swipeId.value = m.id
   swipeDx.value = 0
   swipeDragging.value = false
@@ -740,6 +1152,7 @@ function rowTouchMove(e, m) {
   if (!swipeStart || swipeStart.id !== m.id) return
   const dx = e.touches[0].clientX - swipeStart.x
   const dy = e.touches[0].clientY - swipeStart.y
+  if (Math.abs(dx) > 10 || Math.abs(dy) > 10) clearTimeout(pressTimer)
   if (!swipeStart.engaged) {
     if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.2) {
       swipeStart.engaged = true
@@ -757,6 +1170,7 @@ function rowTouchMove(e, m) {
 }
 
 function rowTouchEnd(e, m) {
+  clearTimeout(pressTimer)
   if (!swipeStart || swipeStart.id !== m.id) return
   const engaged = swipeStart.engaged
   swipeStart = null
@@ -770,7 +1184,7 @@ function rowTouchEnd(e, m) {
   const dx = swipeDx.value
   swipeWidth = e.currentTarget.offsetWidth || window.innerWidth
   swipeHeight = e.currentTarget.parentElement?.offsetHeight ?? e.currentTarget.offsetHeight
-  const canArchive = scope.value !== 'archive' && scope.value !== 'trash'
+  const canArchive = scope.value !== 'archive'
   if (dx >= SWIPE_COMMIT && canArchive) {
     settleSwipe(m, 'archive')
   } else if (dx <= -SWIPE_COMMIT) {
@@ -788,6 +1202,7 @@ function sleep(ms) {
 }
 
 async function settleSwipe(m, action) {
+  const p = action === 'archive' ? archiveFor(m) : deleteFor(m)
   swipeDx.value = action === 'archive' ? swipeWidth : -swipeWidth
   await sleep(200)
   exitTrans.value = false
@@ -798,8 +1213,7 @@ async function settleSwipe(m, action) {
   exitH.value = 0
   await sleep(240)
   try {
-    if (action === 'archive') await archiveFor(m)
-    else await deleteFor(m)
+    await p
     for (let i = 0; i < 40 && messages.value.some((x) => x.id === m.id); i++) {
       await sleep(50)
     }
@@ -879,9 +1293,28 @@ async function refreshData() {
   await Promise.all([loadFolders(), loadMessages(), loadStatuses()])
 }
 
+let discardRowId = 0
+function onDiscarded({ row_id, kind }) {
+  if (kind === 'draft') {
+    toastKind = ''
+    pendingUndo.value = { items: [{ id: row_id, special: 'drafts' }], settled: Promise.resolve([{ id: row_id, special: 'drafts' }]) }
+    toastHideAt = Date.now() + 6000
+    showToast(t('草稿已删除'))
+  } else {
+    showCountToast('cancel', 1, null)
+  }
+  const row = displayMessages.value.find((x) => x.id === row_id)
+  if (!row) return
+  discardRowId = row_id
+  animateRowRemoval(row, Promise.resolve()).then(() => {
+    discardRowId = 0
+    reloadLoaded()
+  })
+}
+
 async function onComposeDone() {
-  const jobs = [loadFolders(), loadStatuses()]
-  if (scope.value === 'drafts' || scope.value === 'sent') jobs.push(loadMessages(true))
+  const jobs = [loadFolders(), loadStatuses(), refreshScheduledCount()]
+  if ((scope.value === 'drafts' || scope.value === 'sent' || scope.value === 'scheduled') && !discardRowId) jobs.push(loadMessages(true))
   await Promise.all(jobs)
 }
 
@@ -913,7 +1346,7 @@ function rowMatchesScope(item) {
 }
 
 function insertFlat(item) {
-  if (tombstones.get(item.id) === snapCtxKey(listSnap.value)) return
+  if (tombstoneLive(item.id, snapCtxKey(listSnap.value))) return
   const i = messages.value.findIndex((m) => m.id === item.id)
   if (i >= 0) {
     messages.value[i] = { ...messages.value[i], ...item }
@@ -925,7 +1358,7 @@ function insertFlat(item) {
 }
 
 function insertThreaded(item) {
-  if (tombstones.get(item.id) === snapCtxKey(listSnap.value)) return
+  if (tombstoneLive(item.id, snapCtxKey(listSnap.value))) return
   const key = item.thread_key || 'id:' + item.id
   const i = messages.value.findIndex(
     (m) => m.account_id === item.account_id && (m.thread_key || 'id:' + m.id) === key,
@@ -980,13 +1413,10 @@ function applyRemovedEvent(ev) {
   if (threaded.value && messages.value.some((m) => ids.has(m.id))) {
     reloadLoaded()
   } else {
-    messages.value = messages.value.filter((m) => !ids.has(m.id))
+    messages.value = messages.value.filter((m) => !ids.has(m.id) || exitMap.value.has(m.id))
   }
   if (convo.value) {
     convo.value = { ...convo.value, msgs: convo.value.msgs.filter((m) => !ids.has(m.id)) }
-  }
-  if (selected.value && ids.has(selected.value.id)) {
-    clearSelection()
   }
 }
 
@@ -1003,6 +1433,7 @@ function applyFolderEvent(folder) {
 
 function onServerEvent(ev) {
   if (view.value !== 'app') return
+  if (ev.type === 'messages' || ev.type === 'removed') listEpoch++
   if (ev.type === 'messages') {
     const beforeCount = messages.value.length
     for (const item of ev.items ?? []) {
@@ -1018,6 +1449,8 @@ function onServerEvent(ev) {
       newMailPending.value += messages.value.length - beforeCount
     }
     scheduleStatusRefresh()
+    refreshScheduledCount()
+    if (scope.value === 'scheduled') loadMessages(true)
   } else if (ev.type === 'flags') {
     applyFlagsEvent(ev.items ?? [])
   } else if (ev.type === 'removed') {
@@ -1036,9 +1469,10 @@ function connectEvents() {
     return
   }
   es.onopen = () => {
-    const wasReconnect = esDelay > 1000
-    esDelay = 1000
+    const wasReconnect = esWasDown
+    esWasDown = false
     if (wasReconnect && view.value === 'app') {
+      checkVersion()
       loadFolders()
       reloadLoaded()
       loadStatuses()
@@ -1053,16 +1487,34 @@ function connectEvents() {
   es.onerror = () => {
     es?.close()
     es = null
+    esWasDown = true
     scheduleReconnect()
   }
+}
+
+async function checkVersion() {
+  try {
+    const st = await api.getState()
+    if (!st.version || !appVersion.value || st.version === appVersion.value) return
+    if (sessionStorage.getItem('wm_reloaded_for') === st.version) {
+      appVersion.value = st.version
+      return
+    }
+    sessionStorage.setItem('wm_reloaded_for', st.version)
+    location.reload()
+  } catch {
+  }
+}
+
+function onVisibility() {
+  if (!document.hidden && view.value === 'app') checkVersion()
 }
 
 function scheduleReconnect() {
   clearTimeout(esTimer)
   esTimer = setTimeout(() => {
     if (view.value === 'app') connectEvents()
-  }, esDelay)
-  esDelay = Math.min(esDelay * 2, 30000)
+  }, 1000)
 }
 
 function disconnectEvents() {
@@ -1074,13 +1526,69 @@ function disconnectEvents() {
 }
 
 
+function goScope(key) {
+  mobileSearch.value = false
+  if (!lgAndUp.value) drawerOpen.value = false
+  const want = '#/' + key + (rangeId.value ? '/' + rangeId.value : '')
+  if (location.hash === want) selectScope(key)
+  else location.hash = want
+}
+
+function goRange(id) {
+  const want = '#/' + scope.value + (id ? '/' + id : '')
+  if (location.hash === want) setRange(id)
+  else location.hash = want
+}
+
 function selectScope(key) {
+  mobileSearch.value = false
   scope.value = key
   clearSelection()
   if (!lgAndUp.value) drawerOpen.value = false
   searchQuery.value = ''
   searching.value = false
   loadMessages()
+}
+
+let schOpenSeq = 0
+async function openSchEditor(it) {
+  if (it.status !== 'pending') return
+  if (composeOpen.value && composeInit.value?.sched_id === it.id) return
+  const tk = ++schOpenSeq
+  openCompose({
+    account_id: it.account_id,
+    subject: it.subject || '',
+    sched_id: it.id,
+    sched_send_at: it.send_at,
+    draft_loading: true,
+  })
+  try {
+    const d = await api.getScheduled(it.id)
+    if (tk !== schOpenSeq) return
+    composeInit.value = {
+      account_id: d.account_id,
+      to: d.to || '',
+      cc: d.cc || '',
+      bcc: d.bcc || '',
+      subject: d.subject || '',
+      text: d.text || '',
+      html: d.html || '',
+      attachments: d.attachments || [],
+      sched_id: it.id,
+      sched_send_at: d.send_at,
+      fill_nonce: tk,
+    }
+  } catch (err) {
+    if (tk !== schOpenSeq) return
+    composeInit.value = {
+      account_id: it.account_id,
+      subject: it.subject || '',
+      sched_id: it.id,
+      sched_send_at: it.send_at,
+      fill_nonce: tk,
+      load_error: t('定时邮件加载失败，请关闭后重试') + ' (' + err.message + ')',
+    }
+  }
 }
 
 const frameCss = computed(() => {
@@ -1247,7 +1755,7 @@ function afterOpen(m) {
 
 
 function openMessageById(id) {
-  openMessage(placeholderMessage(id))
+  openMessage(placeholderMessage(id), { upgradeToThread: true })
 }
 
 let settingsPushed = false
@@ -1267,40 +1775,78 @@ function closeSettings() {
     return
   }
   settingsOpen.value = false
-  if (location.hash === '#/settings') {
-    const want = selected.value ? '#/mail/' + selected.value.id : ''
-    history.pushState(null, '', want === '' ? location.pathname + location.search : want)
-  }
 }
 
 function onHashChange() {
   if (!booted) return
-  if (location.hash === '#/settings') {
+  const route = parseHash()
+  if (route.type === 'settings') {
     settingsOpen.value = true
     return
   }
   if (settingsOpen.value) settingsOpen.value = false
-  const id = deepIdFromHash()
-  if (id) {
-    if (selected.value?.id !== id) openMessageById(id)
-  } else if (selected.value) {
-    clearSelection()
+  if (route.type === 'mail') {
+    if (selected.value?.id === route.id) return
+    if (convo.value && convo.value.msgs.some((x) => x.id === route.id)) {
+      if (selected.value) clearSelection()
+      if (route.id !== convo.value.anchor) {
+        convo.value = { ...convo.value, anchor: route.id }
+        convoOpenIds.value = new Set([route.id])
+        loadCardBody(route.id)
+        nextTick(() => {
+          document.querySelector('[data-convo-card="' + route.id + '"]')?.scrollIntoView({ block: 'start' })
+        })
+      }
+      return
+    }
+    openMessageById(route.id)
+    return
+  }
+  if (selected.value || convo.value) leaveReader()
+  if (route.type === 'search') {
+    if (!searching.value || searchQuery.value !== route.query) {
+      searchQuery.value = route.query
+      searching.value = route.query.trim().length > 0
+      loadMessages(true)
+    }
+    return
+  }
+  if (searching.value) {
+    searching.value = false
+    searchQuery.value = ''
+  }
+  if (route.scope !== scope.value && route.account !== rangeId.value) {
+    rangeId.value = route.account
+    localStorage.setItem('wm_range', String(route.account))
+    selectScope(route.scope)
+  } else if (route.scope !== scope.value) {
+    selectScope(route.scope)
+  } else if (route.account !== rangeId.value) {
+    setRange(route.account)
   }
 }
 
-watch(selected, (sel) => {
+watch([selected, convo, settingsOpen, searching, scope, rangeId], () => {
   if (!booted) return
-  const want = sel ? '#/mail/' + sel.id : ''
-  const cur =
-    location.hash.startsWith('#/mail/') || location.hash.startsWith('#m-') ? location.hash : ''
-  if (want !== cur) {
-    history.pushState(null, '', want === '' ? location.pathname + location.search : want)
+  const want = viewHash()
+  if (want !== location.hash) {
+    if (hashReplaceOnLeave) {
+      hashReplaceOnLeave = false
+      history.replaceState(null, '', want)
+    } else {
+      history.pushState(null, '', want)
+    }
   }
 })
 
-async function openMessage(m) {
+async function openMessage(m, opts) {
+  hashReplaceOnLeave = false
   cancelReaderLeave()
   closeConvo()
+  if (scope.value === 'scheduled' && !searching.value) {
+    openSchEditor({ id: -m.id, account_id: m.account_id, subject: m.subject || '', send_at: m.date_ts, status: 'pending' })
+    return
+  }
   if (scope.value === 'drafts' && !searching.value) {
     const hit = detailCache.get(m.id)
     if (hit) {
@@ -1353,6 +1899,10 @@ async function openMessage(m) {
   markSeen(m)
   const cached = detailCache.get(m.id)
   if (cached) {
+    if (opts?.upgradeToThread && (cached.thread_count ?? 1) > 1 && cached.thread_key) {
+      openConversation({ id: m.id, account_id: cached.account_id, thread_key: cached.thread_key, subject: cached.subject || m.subject || '', folder_special: cached.folder_special, flags: cached.flags ?? m.flags })
+      return
+    }
     detail.value = cached
     detailState.value = 'ready'
     enrichSelected(cached)
@@ -1366,6 +1916,10 @@ async function openMessage(m) {
     const d = await api.getMessage(m.id)
     detailCache.set(m.id, d)
     if (tk !== detailToken || selected.value?.id !== m.id) return
+    if (opts?.upgradeToThread && (d.thread_count ?? 1) > 1 && d.thread_key) {
+      openConversation({ id: m.id, account_id: d.account_id, thread_key: d.thread_key, subject: d.subject || m.subject || '', folder_special: d.folder_special, flags: d.flags ?? m.flags })
+      return
+    }
     detail.value = d
     detailState.value = 'ready'
     enrichSelected(d)
@@ -1379,12 +1933,14 @@ async function openMessage(m) {
 }
 
 async function openConversation(m) {
+  hashReplaceOnLeave = false
   cancelReaderLeave()
   clearSelection()
   const threadKey = m.thread_key || 'id:' + m.id
   convo.value = {
     accountId: m.account_id,
     threadKey,
+    anchor: m.id,
     subject: m.subject || '',
     status: 'loading',
     msgs: [],
@@ -1392,20 +1948,39 @@ async function openConversation(m) {
   convoOpenIds.value = new Set()
   convoDetails.value = {}
   try {
-    const msgs = await api.getThreadMessages(scope.value, m.account_id, threadKey)
+    const allMsgs = await api.getThreadMessagesAll(m.account_id, threadKey)
+    const inTrashView = m.folder_special === 'trash' || m.folder_special === 'junk'
+    let msgs = allMsgs.filter((x) =>
+      inTrashView
+        ? x.folder_special === 'trash' || x.folder_special === 'junk'
+        : x.folder_special !== 'trash' && x.folder_special !== 'junk',
+    )
+    if (!msgs.length) msgs = allMsgs
     if (!convo.value || convo.value.threadKey !== threadKey) return
     const sorted = [...msgs].sort((a, b) => a.date_ts - b.date_ts || a.id - b.id)
     convo.value = { ...convo.value, status: 'ready', msgs: sorted }
-    const open = new Set()
-    for (const msg of sorted) {
-      if (!(msg.flags & 1)) open.add(msg.id)
-    }
-    if (sorted.length) open.add(sorted[sorted.length - 1].id)
+    const open = new Set([m.id])
     convoOpenIds.value = open
+    const bodyLoads = []
     for (const msg of sorted) {
       if (open.has(msg.id)) {
-        loadCardBody(msg.id)
+        bodyLoads.push(loadCardBody(msg.id))
         markSeen(msg)
+      }
+    }
+    if (sorted.length > 1) {
+      await Promise.all(bodyLoads)
+      await nextTick()
+      if (convo.value && convo.value.threadKey === threadKey) {
+        const cardEl = document.querySelector('[data-convo-card="' + m.id + '"]')
+        if (cardEl) {
+          const host = cardEl.closest('.reader-scroll')
+          const r = cardEl.getBoundingClientRect()
+          const hr = host ? host.getBoundingClientRect() : null
+          if (!hr || r.top < hr.top || r.bottom > hr.bottom) {
+            cardEl.scrollIntoView({ block: 'start' })
+          }
+        }
       }
     }
   } catch {
@@ -1422,14 +1997,18 @@ function closeConvo() {
 }
 
 const readerLeaving = ref(false)
+const readerNoAnim = ref(false)
+let hashReplaceOnLeave = false
 let readerLeaveTimer = null
 
 function closeReaderNow() {
+  readerNoAnim.value = false
   if (convo.value) closeConvo()
   else if (selected.value) clearSelection()
 }
 
 function leaveReader() {
+  hashReplaceOnLeave = true
   if (lgAndUp.value || readerLeaving.value) {
     closeReaderNow()
     return
@@ -1516,9 +2095,14 @@ async function toggleCardSeen(msg) {
 
 function rowClick(m, idx) {
   if (Date.now() < suppressClickUntil) return
+  if (!lgAndUp.value && selectionActive.value) {
+    cursorIdx.value = idx
+    toggleRowSelection(m)
+    return
+  }
   cursorIdx.value = idx
   cursorActive.value = false
-  if (threaded.value && !searching.value && (m.thread_count ?? 1) > 1) {
+  if ((threaded.value || searching.value) && (m.thread_count ?? 1) > 1) {
     openConversation(m)
     return
   }
@@ -1584,7 +2168,7 @@ function forwardSelected() {
 }
 
 function afterRemoval(id) {
-  tombstones.set(id, snapCtxKey(listSnap.value))
+  markTombstone(id)
   listGen++
   if (convo.value) {
     const left = convo.value.msgs.filter((m) => m.id !== id)
@@ -1605,30 +2189,247 @@ function afterRemoval(id) {
   loadFolders()
 }
 
-async function archiveFor(m) {
-  if (!m || opBusy.value) return
-  opBusy.value = true
-  try {
-    await api.moveMessage(m.id, 'archive')
-    afterRemoval(m.id)
-  } finally {
-    opBusy.value = false
+async function animateRowRemoval(m, p, extraIds = [], failKind = '') {
+  const idx = displayMessages.value.indexOf(m)
+  const wrap = idx >= 0 ? document.querySelector('[data-rowidx="' + idx + '"]')?.closest('.mail-row-wrap') : null
+  const h = wrap ? wrap.offsetHeight : 0
+  markTombstone(m.id)
+  listGen++
+  if (convo.value) {
+    const left = convo.value.msgs.filter((x) => x.id !== m.id)
+    if (left.length === 0) closeConvo()
+    else convo.value = { ...convo.value, msgs: left }
+  }
+  if (selected.value?.id === m.id) clearSelection()
+  loadFolders()
+  let perr = null
+  const settled = p.catch((e) => { perr = e })
+  if (h > 0) {
+    exitAnim.value = false
+    exitMap.value = new Map([[m.id, h]])
+    await sleep(250)
+    await new Promise((r) => requestAnimationFrame(r))
+    exitAnim.value = true
+    exitMap.value = new Map([[m.id, 0]])
+    await sleep(240)
+  }
+  if (threaded.value && !searching.value) {
+    reloadLoaded()
+  } else {
+    messages.value = messages.value.filter((x) => x.id !== m.id)
+  }
+  exitMap.value = new Map()
+  exitAnim.value = false
+  await settled
+  for (const id of extraIds) tombstones.delete(id)
+  if (perr) {
+    tombstones.delete(m.id)
+    if (failKind) showRemovalFailure(failKind, 1)
+    else {
+      toastShow.value = false
+      actionError.value = perr.message
+    }
+    restoreRowsLocally([{ id: m.id, row: m }])
+    animateRowsIn([m.id])
+    loadMessages(true)
+  } else {
+    tombstones.delete(m.id)
+    loadMessages(true)
   }
 }
 
-async function deleteFor(m) {
-  if (!m || opBusy.value) return
+async function actOnThread(m, kind, animate = false) {
+  if (opBusy.value) return
   opBusy.value = true
+  const inTrashView = m.folder_special === 'trash' || m.folder_special === 'junk'
+  let settleResolve
+  const settledAll = new Promise((res) => { settleResolve = res })
+  const repUndoable =
+    (m.folder_id || m.folder_special) &&
+    (kind === 'archive' ? m.folder_special !== 'archive' : kind === 'inbox' ? true : !inTrashView)
+  markTombstone(m.id)
+  showCountToast(
+    kind,
+    m.thread_count || 1,
+    repUndoable
+      ? { items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }], settled: settledAll }
+      : null,
+  )
+  opBusy.value = false
+  if (animate) {
+    animateRowRemoval(m, settledAll, [], kind)
+  } else {
+    if (selected.value?.id === m.id) clearSelection()
+    reloadLoaded()
+  }
+  let members
   try {
-    await api.deleteMessage(m.id)
-    afterRemoval(m.id)
+    const all = await api.getThreadMessagesAll(m.account_id, m.thread_key || 'id:' + m.id)
+    members = all.filter((x) =>
+      inTrashView
+        ? x.folder_special === 'trash' || x.folder_special === 'junk'
+        : x.folder_special !== 'trash' && x.folder_special !== 'junk',
+    )
+  } catch (err) {
+    tombstones.delete(m.id)
+    showRemovalFailure(kind, m.thread_count || 1)
+    restoreRowsLocally([{ id: m.id, row: m }])
+    animateRowsIn([m.id])
+    loadMessages(true)
+    settleResolve([])
+    return
+  }
+  if (!members.length) members = [m]
+  const ids = members.map((x) => x.id)
+  for (const mem of members) markTombstone(mem.id)
+  const undoItems = members
+    .filter(
+      (x) =>
+        (x.folder_id || x.folder_special) &&
+        (kind === 'archive'
+          ? x.folder_special !== 'archive'
+          : kind === 'inbox'
+            ? x.folder_special !== 'inbox'
+            : x.folder_special !== 'trash' && x.folder_special !== 'junk'),
+    )
+    .map((x) => ({ id: x.id, special: x.folder_special, folder_id: x.folder_id }))
+  const restItems = undoItems.filter((x) => x.id !== m.id)
+  if (
+    (members.length !== (m.thread_count || 1) || restItems.length) &&
+    toastShow.value &&
+    toastKind === kind &&
+    Date.now() < toastHideAt
+  ) {
+    showCountToast(
+      kind,
+      members.length - (m.thread_count || 1),
+      restItems.length ? { items: restItems, settled: settledAll } : null,
+    )
+  }
+  const movedItems = []
+  try {
+    for (const mem of members) {
+      if (kind === 'archive' || kind === 'inbox') await api.moveMessage(mem.id, kind)
+      else await api.deleteMessage(mem.id)
+      const ui = undoItems.find((x) => x.id === mem.id)
+      if (ui) movedItems.push(ui)
+    }
+    for (const id of ids) tombstones.delete(id)
+    loadMessages(true)
+  } catch (err) {
+    for (const id of ids) tombstones.delete(id)
+    showRemovalFailure(kind, members.length - movedItems.length)
+    const movedIds = new Set(movedItems.map((x) => x.id))
+    const backMembers = members.filter((x) => !movedIds.has(x.id))
+    if (threaded.value && !searching.value) {
+      await loadMessages(true)
+      const rep = backMembers
+        .filter((x) => rowBelongsToCurrentView(x))
+        .sort((a, b) => b.date_ts - a.date_ts || b.id - a.id)[0]
+      if (rep) animateRowsIn([rep.id])
+    } else {
+      const backItems = backMembers.map((x) => ({ id: x.id, row: x }))
+      restoreRowsLocally(backItems)
+      animateRowsIn(backItems.map((x) => x.id))
+      loadMessages(true)
+    }
   } finally {
+    settleResolve(movedItems)
+  }
+}
+
+async function archiveFor(m, animate = false) {
+  if (!m || opBusy.value) return
+  if (m.folder_special === 'trash' || m.folder_special === 'junk') return inboxFor(m, animate)
+  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'archive', animate)
+  if (m.folder_special === 'scheduled') return deleteFor(m, animate)
+  return moveSingle(m, 'archive', animate)
+}
+
+function inboxFor(m, animate = false) {
+  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'inbox', animate)
+  return moveSingle(m, 'inbox', animate)
+}
+
+async function moveSingle(m, dest, animate = false) {
+  opBusy.value = true
+  const p = api.moveMessage(m.id, dest)
+  const undoable = !!m.folder_special && m.folder_special !== dest
+  showCountToast(
+    dest,
+    1,
+    undoable
+      ? {
+          items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }],
+          settled: p.then(
+            () => [{ id: m.id, special: m.folder_special, folder_id: m.folder_id }],
+            () => [],
+          ),
+        }
+      : null,
+  )
+  if (animate) {
     opBusy.value = false
+    animateRowRemoval(m, p, [], dest)
+    return
+  }
+  afterRemoval(m.id)
+  opBusy.value = false
+  try {
+    await p
+    tombstones.delete(m.id)
+    loadMessages(true)
+  } catch (err) {
+    tombstones.delete(m.id)
+    showRemovalFailure(dest, 1)
+    restoreRowsLocally([{ id: m.id, row: m }])
+    animateRowsIn([m.id])
+    loadMessages(true)
+  }
+}
+
+async function deleteFor(m, animate = false) {
+  if (!m || opBusy.value) return
+  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'delete', animate)
+  opBusy.value = true
+  const p = m.folder_special === 'scheduled' ? api.cancelScheduled(-m.id) : api.deleteMessage(m.id)
+  const okKind = m.folder_special === 'scheduled' ? 'cancel' : 'delete'
+  const undoable = !!m.folder_special && m.folder_special !== 'scheduled' && m.folder_special !== 'trash' && m.folder_special !== 'junk'
+  showCountToast(
+    okKind,
+    1,
+    undoable
+      ? {
+          items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }],
+          settled: p.then(
+            () => [{ id: m.id, special: m.folder_special, folder_id: m.folder_id }],
+            () => [],
+          ),
+        }
+      : null,
+  )
+  if (animate) {
+    opBusy.value = false
+    animateRowRemoval(m, p, [], okKind)
+    return
+  }
+  afterRemoval(m.id)
+  opBusy.value = false
+  try {
+    await p
+    tombstones.delete(m.id)
+    loadMessages(true)
+  } catch (err) {
+    tombstones.delete(m.id)
+    showRemovalFailure(okKind, 1)
+    restoreRowsLocally([{ id: m.id, row: m }])
+    animateRowsIn([m.id])
+    loadMessages(true)
   }
 }
 
 async function markAllRead() {
-  if (searching.value || opBusy.value || rangeId.value) return
+  if (searching.value || opBusy.value || rangeId.value || scope.value === 'scheduled') return
   opBusy.value = true
   try {
     await api.markAllRead(scope.value)
@@ -1769,11 +2570,7 @@ function onReaderTouchEnd(e) {
   const scroller = scrollEl(e.currentTarget.querySelector('.reader-scroll'))
   const atTop = !scroller || scroller.scrollTop <= 0
   if ((dx > 90 && Math.abs(dy) < 60) || (atTop && dy > 110 && Math.abs(dx) < 60)) {
-    if (convo.value) {
-      closeConvo()
-    } else {
-      clearSelection()
-    }
+    leaveReader()
   }
 }
 
@@ -1782,15 +2579,33 @@ function openAccounts() {
   if (!lgAndUp.value) drawerOpen.value = false
 }
 
-async function enter(st) {
+async function enter(st, deepId = 0) {
   view.value = 'app'
-  if (initialDeepId) openMessage(placeholderMessage(initialDeepId))
+  const r0 = parseHash()
+  if (r0.type === 'scope') {
+    scope.value = r0.scope
+    if (r0.account !== rangeId.value) {
+      rangeId.value = r0.account
+      localStorage.setItem('wm_range', String(r0.account))
+    }
+  } else if (r0.type === 'search') {
+    searchQuery.value = r0.query
+    searching.value = r0.query.trim().length > 0
+  }
+  const did = deepId || initialDeepId
+  if (did) {
+    readerNoAnim.value = true
+    history.replaceState(null, '', '#/' + scope.value + (rangeId.value ? '/' + rangeId.value : ''))
+    history.pushState(null, '', '#/mail/' + did)
+    openMessage(placeholderMessage(did))
+  }
   if (st && st.app_settings) maxAttachmentMB.value = st.app_settings.max_attachment_mb
   threaded.value = localStorage.getItem('wm_threaded') === '1'
   const storedUndo = parseInt(localStorage.getItem('wm_undo_seconds') ?? '', 10)
   if ([0, 5, 10, 20, 30].includes(storedUndo)) undoSeconds.value = storedUndo
   await refreshAccounts()
   connectEvents()
+  refreshScheduledCount()
   booted = true
   onHashChange()
 }
@@ -1801,10 +2616,14 @@ async function boot() {
     let st = await api.getState()
     appVersion.value = st.version || ''
     const tg = window.Telegram?.WebApp
-    if (tg?.initData) tg.disableVerticalSwipes?.()
+    const inTG = !!(tg || navigator.userAgent.includes('Telegram'))
+    if (tg?.initData) {
+      try {
+        tg.disableVerticalSwipes?.()
+      } catch {}
+    }
     if (st.setup && !st.authed) {
       if (tg?.initData) {
-        tg.ready()
         try {
           await api.telegramWebAppAuth(tg.initData)
           st = await api.getState()
@@ -1812,17 +2631,18 @@ async function boot() {
         } catch (err) {
           tgAuthError.value = err.message
         }
+        try {
+          tg.ready()
+        } catch {}
       }
     }
     const pathMatch = /^\/m\/(\d+)$/.exec(location.pathname)
     const mParam = pathMatch ? pathMatch[1] : new URLSearchParams(location.search).get('m') || ''
-    if (/^\d+$/.test(mParam)) {
-      history.replaceState(null, '', (pathMatch ? '/' : location.pathname) + location.hash)
-      if (!deepIdFromHash()) location.hash = '#/mail/' + mParam
-    }
-    const startParam = tgStartParam()
-    if (startParam && !deepIdFromHash()) {
-      location.hash = '#/mail/' + startParam
+    let bootDeepId = /^\d+$/.test(mParam) ? Number(mParam) : 0
+    if (pathMatch) history.replaceState(null, '', '/' + location.hash)
+    if (!bootDeepId) {
+      const sp = tgStartParam()
+      if (sp) bootDeepId = Number(sp)
     }
     if (!st.setup) {
       authMode.value = 'setup'
@@ -1831,7 +2651,7 @@ async function boot() {
       authMode.value = 'login'
       view.value = 'auth'
     } else {
-      await enter(st)
+      await enter(st, bootDeepId)
     }
   } catch (err) {
     bootError.value = err.message
@@ -1875,6 +2695,7 @@ function onOnlineChange() {
 
 onMounted(() => {
   window.addEventListener('hashchange', onHashChange)
+  document.addEventListener('visibilitychange', onVisibility)
   window.addEventListener('keydown', onGlobalKey)
   window.addEventListener('online', onOnlineChange)
   window.addEventListener('offline', onOnlineChange)
@@ -1884,6 +2705,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('hashchange', onHashChange)
+  document.removeEventListener('visibilitychange', onVisibility)
   window.removeEventListener('keydown', onGlobalKey)
   window.removeEventListener('online', onOnlineChange)
   window.removeEventListener('offline', onOnlineChange)
@@ -1953,10 +2775,15 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div v-else class="appbar-search">
-          <div class="search-wrap">
-            <button type="button" class="search-menu-btn" :aria-label="t('展开菜单')" @pointerdown="menuRipple" @click="toggleDrawer">
-              <v-icon icon="mdi-menu" size="22" />
-            </button>
+          <div v-if="selectionActive" class="d-flex align-center ga-1 mx-n2">
+            <v-btn icon="mdi-close" variant="text" :aria-label="t('取消选择')" @click="clearSelectionIds" />
+            <v-toolbar-title class="ml-4">{{ selectedIds.size }}</v-toolbar-title>
+            <v-btn v-if="scope !== 'scheduled'" :icon="(scope === 'trash' || scope === 'junk') ? 'mdi-inbox' : 'mdi-archive'" variant="text" :disabled="opBusy || scope === 'archive'" :aria-label="(scope === 'trash' || scope === 'junk') ? t('移回收件箱') : t('归档')" @click="bulkAct('archive')" />
+            <v-btn icon="mdi-delete" variant="text" :disabled="opBusy" :aria-label="t('删除')" @click="bulkAct('delete')" />
+            <v-btn v-if="scope !== 'scheduled'" :icon="selectionHasUnread ? 'mdi-email-open' : 'mdi-email'" variant="text" :disabled="opBusy" :aria-label="selectionHasUnread ? t('标为已读') : t('标为未读')" @click="bulkAct(selectionHasUnread ? 'seen' : 'unseen')" />
+          </div>
+          <div v-else-if="mobileSearch || searching" class="search-wrap">
+            <v-btn icon="mdi-arrow-left" variant="text" :aria-label="t('返回')" class="search-back-btn" @click="closeMobileSearch" />
             <v-text-field
               ref="searchEl"
               v-model="searchQuery"
@@ -1978,6 +2805,11 @@ onBeforeUnmount(() => {
               />
               </template>
             </v-text-field>
+          </div>
+          <div v-else class="d-flex align-center ga-1 mx-n2">
+            <v-btn icon="mdi-menu" variant="text" :aria-label="t('展开菜单')" @click="toggleDrawer" />
+            <v-toolbar-title class="ml-4">{{ mobileBarTitle }}</v-toolbar-title>
+            <v-btn icon="mdi-magnify" variant="text" :aria-label="t('搜索')" @click="openMobileSearch" />
           </div>
         </div>
       </v-app-bar>
@@ -2008,13 +2840,13 @@ onBeforeUnmount(() => {
               </template>
               <v-menu activator="parent">
                   <v-list density="compact">
-                    <v-list-item :title="t('全部账号')" :active="rangeId === 0" @click="setRange(0)" />
+                    <v-list-item :title="t('全部账号')" :active="rangeId === 0" @click="goRange(0)" />
                     <v-list-item
                       v-for="a in accounts"
                       :key="a.id"
                       :title="a.label || a.email"
                       :active="rangeId === a.id"
-                      @click="setRange(a.id)"
+                      @click="goRange(a.id)"
                     />
                   </v-list>
               </v-menu>
@@ -2038,7 +2870,7 @@ onBeforeUnmount(() => {
                 :prepend-icon="s.icon"
                 :title="s.label"
                 :active="scope === s.key"
-                @click="selectScope(s.key)"
+                @click="goScope(s.key)"
               >
                 <template #append>
                   <v-chip v-if="scopeStats[s.key].unread > 0" size="small">
@@ -2101,6 +2933,11 @@ onBeforeUnmount(() => {
                     <v-list-item :title="t('紧凑密度')" :append-icon="listDensity === 'compact' ? 'mdi-check' : undefined" @click="setDensity('compact')" />
                     <v-divider v-if="!searching && !rangeId" />
                     <v-list-item v-if="!searching && !rangeId" :title="t('全部标为已读')" @click="markAllRead" />
+                    <v-list-item
+                      v-if="activeFolder && (activeFolder.special_use === 'trash' || activeFolder.special_use === 'junk')"
+                      :title="activeFolder.special_use === 'trash' ? t('清空回收站') : t('清空垃圾箱')"
+                      @click="purgeConfirm = true"
+                    />
                   </v-list>
                 </v-menu>
               </div>
@@ -2164,21 +3001,17 @@ onBeforeUnmount(() => {
                 />
                 <template v-if="selectionActive">
                   <span class="text-body-2 ml-1">{{ t('已选 {n} 封', { n: selectedIds.size }) }}</span>
-                  <v-btn icon variant="text" size="small" :disabled="opBusy || scope === 'archive' || scope === 'trash'" @click="bulkAct('archive')">
-                    <v-icon icon="mdi-archive" />
-                    <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
+                  <v-btn v-if="scope !== 'scheduled'" icon variant="text" size="small" :disabled="opBusy || scope === 'archive'" @click="bulkAct('archive')">
+                    <v-icon :icon="(scope === 'trash' || scope === 'junk') ? 'mdi-inbox' : 'mdi-archive'" />
+                    <v-tooltip activator="parent" location="bottom">{{ (scope === 'trash' || scope === 'junk') ? t('移回收件箱') : t('归档') }}</v-tooltip>
                   </v-btn>
                   <v-btn icon variant="text" size="small" :disabled="opBusy" @click="bulkAct('delete')">
                     <v-icon icon="mdi-delete" />
                     <v-tooltip activator="parent" location="bottom">{{ t('删除') }}</v-tooltip>
                   </v-btn>
-                  <v-btn icon variant="text" size="small" :disabled="opBusy" @click="bulkAct('seen')">
-                    <v-icon icon="mdi-email-open" />
-                    <v-tooltip activator="parent" location="bottom">{{ t('标为已读') }}</v-tooltip>
-                  </v-btn>
-                  <v-btn icon variant="text" size="small" :disabled="opBusy" @click="bulkAct('unseen')">
-                    <v-icon icon="mdi-email" />
-                    <v-tooltip activator="parent" location="bottom">{{ t('标为未读') }}</v-tooltip>
+                  <v-btn v-if="scope !== 'scheduled'" icon variant="text" size="small" :disabled="opBusy" @click="bulkAct(selectionHasUnread ? 'seen' : 'unseen')">
+                    <v-icon :icon="selectionHasUnread ? 'mdi-email-open' : 'mdi-email'" />
+                    <v-tooltip activator="parent" location="bottom">{{ selectionHasUnread ? t('标为已读') : t('标为未读') }}</v-tooltip>
                   </v-btn>
                   <v-btn icon="mdi-close" variant="text" size="small" :aria-label="t('取消选择')" @click="clearSelectionIds" />
                 </template>
@@ -2204,30 +3037,13 @@ onBeforeUnmount(() => {
                   1 {{ t('至') }} {{ displayMessages.length }}
                 </span>
               </div>
-              <div class="list-progress">
-                <v-progress-linear v-if="listBusy" indeterminate color="primary" height="3" />
-              </div>
-              <div v-if="listErrorBar" class="list-error-bar">
-                <span class="text-truncate">{{ t('加载失败：{error}', { error: listErrorBar }) }}</span>
-                <v-btn variant="text" size="small" @click="loadMessages()">{{ t('重试') }}</v-btn>
-              </div>
             </template>
-            <div v-else class="d-flex align-center ga-1 px-2 py-2 border-b">
-              <h1 class="text-body-1 font-weight-bold text-truncate px-1">
-                {{ listSnap.kind === 'search' ? t('搜索结果') : snapScopeLabel }}
-              </h1>
-              <span v-if="listBusy" class="text-caption text-medium-emphasis d-flex align-center ga-1 text-no-wrap">
-                <template v-if="searchQuery.trim()">{{ t('搜索中') }}</template>
-              </span>
-              <span v-else-if="listSnap.kind === 'search' && listStatus === 'ready'" class="text-caption text-medium-emphasis">
-                {{ t('{n} 封', { n: messages.length }) }}
-              </span>
-              <span
-                v-else-if="listSnap.kind === 'folder' && foldersStatus === 'ready' && scopeStats[listSnap.scope]"
-                class="text-caption text-medium-emphasis text-no-wrap"
-              >
-                {{ t('{n} 封', { n: scopeStats[listSnap.scope].total }) }}<template v-if="scopeStats[listSnap.scope].unread">{{ t('（{n} 未读）', { n: scopeStats[listSnap.scope].unread }) }}</template>
-              </span>
+            <div v-if="listBusy" class="list-progress">
+              <v-progress-linear indeterminate color="primary" height="3" />
+            </div>
+            <div v-if="listErrorBar" class="list-error-bar">
+              <span class="text-truncate">{{ t('加载失败：{error}', { error: listErrorBar }) }}</span>
+              <v-btn variant="text" size="small" @click="loadMessages()">{{ t('重试') }}</v-btn>
             </div>
             <div v-if="actionError" class="px-3 py-1 text-caption text-error border-b">{{ actionError }}</div>
 
@@ -2307,14 +3123,14 @@ onBeforeUnmount(() => {
                 </p>
               </template>
               <template v-else>
-                <template v-for="(m, idx) in displayMessages" :key="m.id">
+                <template v-for="(m, idx) in displayMessages" :key="threaded && listSnap.kind !== 'search' && m.thread_key ? 't' + m.account_id + ':' + m.thread_key : m.id">
                   <div class="mail-row-wrap" :style="rowWrapStyle(m)">
                     <div
-                      v-if="scope !== 'archive' && scope !== 'trash'"
+                      v-if="scope !== 'archive' && scope !== 'scheduled'"
                       class="swipe-bg swipe-bg-left"
                       :style="{ opacity: swipeId === m.id && swipeDx > 0 ? 1 : 0 }"
                     >
-                      <v-icon icon="mdi-archive" size="20" />
+                      <v-icon :icon="(m.folder_special === 'trash' || m.folder_special === 'junk') ? 'mdi-inbox' : 'mdi-archive'" size="20" />
                     </div>
                     <div
                       class="swipe-bg swipe-bg-right"
@@ -2358,6 +3174,7 @@ onBeforeUnmount(() => {
                         >
                           {{ t('共 {n} 封', { n: m.thread_count }) }}<template v-if="m.thread_unread">{{ t('，{n} 未读', { n: m.thread_unread }) }}</template>
                         </span>
+                        <v-icon v-if="m.folder_special === 'scheduled'" icon="mdi-clock-outline" size="14" class="row-time-icon" />
                         <span class="row-time">{{ fmtListTime(m.date_ts) }}</span>
                       </div>
                       <div class="row-l2" :class="{ w600: !(m.flags & 1) }">
@@ -2381,15 +3198,19 @@ onBeforeUnmount(() => {
                     v-ripple
                     class="mail-row"
                     :data-rowidx="idx"
-                    :class="{ 'mail-row-active': (lgAndUp && selected?.id === m.id) || (cursorActive && idx === cursorIdx) }"
+                    :class="{ 'mail-row-active': (lgAndUp && selected?.id === m.id) || (cursorActive && idx === cursorIdx), 'mail-row-checked': selectedIds.has(m.id) }"
                     :style="rowSwipeStyle(m)"
                     @click="rowClick(m, idx)"
                     @touchstart.passive="rowTouchStart($event, m)"
                     @touchmove="rowTouchMove($event, m)"
                     @touchend="rowTouchEnd($event, m)"
                     @touchcancel="rowTouchEnd($event, m)"
+                    @contextmenu.prevent
                   >
-                    <v-avatar :color="avatarColor(m.from_email)" size="38" class="mail-avatar">
+                    <v-avatar v-if="selectedIds.has(m.id)" color="primary" size="38" class="mail-avatar">
+                      <v-icon icon="mdi-check" size="20" />
+                    </v-avatar>
+                    <v-avatar v-else :color="avatarColor(m.from_email)" size="38" class="mail-avatar">
                       <span class="avatar-letter text-body-2 font-weight-medium">{{ avatarLetter(m) }}</span>
                     </v-avatar>
                     <div class="flex-1-1" style="min-width: 0">
@@ -2408,7 +3229,8 @@ onBeforeUnmount(() => {
                           {{ t('共 {n} 封', { n: m.thread_count }) }}<template v-if="m.thread_unread">{{ t('，{n} 未读', { n: m.thread_unread }) }}</template>
                         </span>
                         <v-icon v-if="m.has_attach" icon="mdi-paperclip" size="14" class="text-medium-emphasis" />
-                        <span class="text-caption text-medium-emphasis text-no-wrap">{{ fmtListTime(m.date_ts) }}</span>
+                        <v-icon v-if="m.folder_special === 'scheduled'" icon="mdi-clock-outline" size="13" class="text-medium-emphasis" />
+                          <span class="text-caption text-medium-emphasis text-no-wrap">{{ fmtListTime(m.date_ts) }}</span>
                       </div>
                       <div class="text-body-2 text-truncate" :class="{ 'font-weight-bold': !(m.flags & 1) }">
                         {{ m.subject || t('(无主题)') }}
@@ -2439,7 +3261,7 @@ onBeforeUnmount(() => {
             <div v-if="lgAndUp" class="list-drag" @pointerdown="onListDragStart" />
           </section>
 
-          <section class="reader-section" :class="{ 'd-none': !lgAndUp && !selected && !convo, 'reader-overlay': !lgAndUp && (!!selected || !!convo), 'reader-leaving': readerLeaving }">
+          <section class="reader-section" :class="{ 'd-none': !lgAndUp && !selected && !convo, 'reader-overlay': !lgAndUp && (!!selected || !!convo), 'reader-leaving': readerLeaving, 'reader-noanim': readerNoAnim }">
             <div v-if="!selected && !convo" class="h-100 d-flex align-center justify-center">
               <div v-if="lgAndUp" class="reader-empty">
                 <v-icon icon="mdi-email-open-outline" size="48" />
@@ -2480,7 +3302,7 @@ onBeforeUnmount(() => {
                   </div>
                 </v-alert>
                 <div v-else class="convo-stack">
-                  <div v-for="msg in convo.msgs" :key="msg.id" class="convo-card">
+                  <div v-for="msg in convo.msgs" :key="msg.id" class="convo-card" :data-convo-card="msg.id">
                     <div v-ripple class="convo-card-head" @click="toggleCard(msg)">
                       <v-avatar :color="avatarColor(msg.from_email)" size="32" class="flex-none">
                         <span class="avatar-letter text-caption font-weight-medium">{{ avatarLetter(msg) }}</span>
@@ -2533,15 +3355,15 @@ onBeforeUnmount(() => {
                             <v-tooltip activator="parent" location="bottom">{{ t('转发') }}</v-tooltip>
                           </v-btn>
                           <v-btn
-                            v-if="scope !== 'archive' && scope !== 'trash'"
+                            v-if="scope !== 'archive'"
                             icon
                             variant="text"
                             size="small"
                             :disabled="opBusy"
                             @click="archiveFor(msg)"
                           >
-                            <v-icon icon="mdi-archive" />
-                            <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
+                            <v-icon :icon="(msg.folder_special === 'trash' || msg.folder_special === 'junk') ? 'mdi-inbox' : 'mdi-archive'" />
+                            <v-tooltip activator="parent" location="bottom">{{ msg.folder_special === 'junk' ? t('不是垃圾邮件') : msg.folder_special === 'trash' ? t('移回收件箱') : t('归档') }}</v-tooltip>
                           </v-btn>
                           <v-btn icon variant="text" size="small" :disabled="opBusy" @click="deleteFor(msg)">
                             <v-icon icon="mdi-delete" />
@@ -2610,17 +3432,17 @@ onBeforeUnmount(() => {
               </div>
               <div v-if="lgAndUp" class="reader-toolbar">
                 <v-btn
-                  v-if="scope !== 'archive' && scope !== 'trash'"
+                  v-if="scope !== 'archive'"
                   icon
                   variant="text"
                   size="small"
                   :disabled="opBusy"
-                  @click="archiveFor(selected)"
+                  @click="archiveFor(selected, true)"
                 >
-                  <v-icon icon="mdi-archive" />
-                  <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
+                  <v-icon :icon="(selected.folder_special === 'trash' || selected.folder_special === 'junk') ? 'mdi-inbox' : 'mdi-archive'" />
+                  <v-tooltip activator="parent" location="bottom">{{ selected.folder_special === 'junk' ? t('不是垃圾邮件') : selected.folder_special === 'trash' ? t('移回收件箱') : t('归档') }}</v-tooltip>
                 </v-btn>
-                <v-btn icon variant="text" size="small" :disabled="opBusy" @click="deleteFor(selected)">
+                <v-btn icon variant="text" size="small" :disabled="opBusy" @click="deleteFor(selected, true)">
                   <v-icon icon="mdi-delete" />
                   <v-tooltip activator="parent" location="bottom">
                     {{ scope === 'trash' || scope === 'junk' ? t('彻底删除') : t('删除') }}
@@ -2659,7 +3481,7 @@ onBeforeUnmount(() => {
                       {{ detail?.from?.name || selected.from_name || selected.from_email }}
                     </span>
                     <span class="reader-from-addr text-truncate">{{ detail?.from?.email || selected.from_email }}</span>
-                    <span class="reader-time">{{ fmtFull(selected.date_ts) }}</span>
+                    <span v-if="selected.date_ts" class="reader-time">{{ fmtFull(selected.date_ts) }}</span>
                   </div>
                   <div class="reader-to-row">
                     <span v-if="detail?.to?.length" style="overflow-wrap: anywhere">
@@ -2704,7 +3526,7 @@ onBeforeUnmount(() => {
                   <span style="overflow-wrap: anywhere">{{ fmtAddrList(detail.cc) }}</span>
                 </template>
                 <span class="text-medium-emphasis">{{ t('时间') }}</span>
-                <span>{{ fmtFull(selected.date_ts) }}</span>
+                <span v-if="selected.date_ts">{{ fmtFull(selected.date_ts) }}</span>
                 <span class="text-medium-emphasis">{{ t('账号') }}</span>
                 <span style="overflow-wrap: anywhere">{{ selected.account_label }}{{ t('，') }}{{ selected.folder_name }}</span>
               </div>
@@ -2725,16 +3547,16 @@ onBeforeUnmount(() => {
                   <v-tooltip activator="parent" location="bottom">{{ t('转发') }}</v-tooltip>
                 </v-btn>
                 <v-btn
-                  v-if="scope !== 'archive' && scope !== 'trash'"
+                  v-if="scope !== 'archive'"
                   icon
                   variant="text"
                   :disabled="opBusy"
-                  @click="archiveFor(selected)"
+                  @click="archiveFor(selected, true)"
                 >
-                  <v-icon icon="mdi-archive" />
-                  <v-tooltip activator="parent" location="bottom">{{ t('归档') }}</v-tooltip>
+                  <v-icon :icon="(selected.folder_special === 'trash' || selected.folder_special === 'junk') ? 'mdi-inbox' : 'mdi-archive'" />
+                  <v-tooltip activator="parent" location="bottom">{{ selected.folder_special === 'junk' ? t('不是垃圾邮件') : selected.folder_special === 'trash' ? t('移回收件箱') : t('归档') }}</v-tooltip>
                 </v-btn>
-                <v-btn icon variant="text" :disabled="opBusy" @click="deleteFor(selected)">
+                <v-btn icon variant="text" :disabled="opBusy" @click="deleteFor(selected, true)">
                   <v-icon icon="mdi-delete" />
                   <v-tooltip activator="parent" location="bottom">
                     {{ scope === 'trash' || scope === 'junk' ? t('彻底删除') : t('删除') }}
@@ -2815,6 +3637,24 @@ onBeforeUnmount(() => {
         </div>
       </v-main>
 
+      <v-snackbar v-model="toastShow" :timeout="-1" location="bottom" @click="onSnackSurfaceClick">
+        {{ toastText }}
+        <template v-if="pendingUndo" #actions>
+          <v-btn color="primary" variant="text" :disabled="undoBusy" @click="undoRemoval">{{ t('撤销') }}</v-btn>
+        </template>
+      </v-snackbar>
+      <v-dialog v-model="purgeConfirm" max-width="420">
+        <v-card>
+          <v-card-title>{{ activeFolder?.special_use === 'trash' ? t('清空回收站') : t('清空垃圾箱') }}</v-card-title>
+          <v-card-text>{{ activeFolder?.special_use === 'trash' ? t('回收站里的所有邮件将被永久删除，无法恢复。') : t('垃圾箱里的所有邮件将被永久删除，无法恢复。') }}</v-card-text>
+          <v-card-actions>
+            <v-spacer />
+            <v-btn variant="text" :disabled="purging" @click="purgeConfirm = false">{{ t('取消') }}</v-btn>
+            <v-btn color="error" variant="text" :loading="purging" @click="doPurge">{{ t('清空') }}</v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-dialog>
+
       <v-btn
         v-if="!lgAndUp && !selected && !convo"
         icon="mdi-pencil"
@@ -2873,7 +3713,7 @@ onBeforeUnmount(() => {
         </v-card>
       </v-dialog>
 
-      <Compose v-model="composeOpen" :z-index="composeZ" :accounts="accounts" :initial="composeInit" :undo-seconds="undoSeconds" :max-attachment-mb="maxAttachmentMB" @done="onComposeDone" />
+      <Compose v-model="composeOpen" :z-index="composeZ" :accounts="accounts" :initial="composeInit" :undo-seconds="undoSeconds" :max-attachment-mb="maxAttachmentMB" @done="onComposeDone" @discarded="onDiscarded" />
     </template>
   </v-app>
 </template>
@@ -2928,6 +3768,13 @@ body {
     min-height: 0;
     overflow: hidden;
   }
+}
+.search-back-btn {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
 }
 .search-wrap {
   position: relative;
@@ -3126,8 +3973,11 @@ body {
   color: rgb(var(--v-theme-on-surface-variant));
 }
 .list-progress {
-  height: 3px;
-  flex: none;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 6;
 }
 .list-error-bar {
   flex: none;
@@ -3351,6 +4201,9 @@ body {
 .reader-overlay.reader-leaving {
   animation: reader-out 0.21s cubic-bezier(0.32, 0.72, 0, 1) forwards;
 }
+.reader-overlay.reader-noanim {
+  animation: none;
+}
 @keyframes reader-in {
   from {
     transform: translateX(100%);
@@ -3553,6 +4406,8 @@ body {
 .mail-row {
   position: relative;
   overflow: hidden;
+  -webkit-touch-callout: none;
+  user-select: none;
   background: rgb(var(--v-theme-surface));
   display: flex;
   flex-direction: row;
@@ -3596,6 +4451,9 @@ body {
   }
 }
 .mail-row-active {
+  background: rgba(var(--v-theme-primary), var(--v-activated-opacity));
+}
+.mail-row-checked {
   background: rgba(var(--v-theme-primary), var(--v-activated-opacity));
 }
 

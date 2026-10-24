@@ -8,7 +8,6 @@ const SELECTOR = [
   '.list-scroll',
   '.v-navigation-drawer__content',
   '.compose-body',
-  '.compose-attach-chips',
   '.v-menu > .v-overlay__content',
   '.v-select__content',
   '.v-autocomplete__content',
