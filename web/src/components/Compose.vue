@@ -1132,7 +1132,6 @@ function onKeydown(e) {
   gap: 6px;
   max-height: 32dvh;
   overflow-y: auto;
-  overflow-y: overlay;
   padding: 8px 16px 0;
 }
 .compose-root-mobile .compose-card {
@@ -1251,7 +1250,6 @@ function onKeydown(e) {
 }
 .compose-root-mobile .compose-body {
   overflow-y: auto;
-  overflow-y: overlay;
   overflow-anchor: none;
 }
 .compose-root-mobile .compose-editarea {
@@ -1280,7 +1278,6 @@ function onKeydown(e) {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  overflow-y: overlay;
   padding: 12px 16px;
   outline: none;
   font-size: 14px;

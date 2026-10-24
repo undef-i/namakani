@@ -8,6 +8,7 @@ import '@fontsource/roboto/400.css'
 import '@fontsource/roboto/500.css'
 import '@fontsource/roboto/700.css'
 import App from './App.vue'
+import { initScrollbars } from './scrollbars.js'
 import { lang } from './i18n'
 
 const vuetify = createVuetify({
@@ -90,3 +91,4 @@ if ('serviceWorker' in navigator) {
 }
 
 createApp(App).use(vuetify).mount('#app')
+initScrollbars()

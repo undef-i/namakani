@@ -1193,7 +1193,6 @@ onMounted(() => {
   width: 240px;
   flex: none;
   overflow-y: auto;
-  overflow-y: overlay;
 }
 .settings-content {
   flex: 1;
@@ -1202,7 +1201,6 @@ onMounted(() => {
   margin-inline: auto;
   padding: 16px;
   overflow-y: auto;
-  overflow-y: overlay;
   min-height: 0;
 }
 .settings-sec {

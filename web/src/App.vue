@@ -6,6 +6,7 @@ import Auth from './components/Auth.vue'
 import Accounts from './components/Accounts.vue'
 import Compose from './components/Compose.vue'
 import * as api from './api.js'
+import { scrollEl } from './scrollbars.js'
 import { avatarColorFor, avatarLetterFor } from './avatar.js'
 
 const SCOPES = computed(() => [
@@ -205,7 +206,7 @@ function resetSearchFilter() {
 const newMailPending = ref(0)
 function jumpToNewMail() {
   newMailPending.value = 0
-  listEl.value?.scrollTo({ top: 0 })
+  scrollEl(listEl.value)?.scrollTo({ top: 0 })
   reloadLoaded()
 }
 const listErrorBar = ref('')
@@ -504,7 +505,7 @@ async function reloadLoaded() {
 }
 
 function onListScroll() {
-  const el = listEl.value
+  const el = scrollEl(listEl.value)
   if (!el) return
   if (el.scrollTop <= 80) newMailPending.value = 0
   if (el.scrollTop + el.clientHeight > el.scrollHeight - 500) loadMore()
@@ -570,7 +571,7 @@ const ptrArc = computed(() => {
 
 function ptrStart(e) {
   if (ptrBusy.value) return
-  const el = listEl.value
+  const el = scrollEl(listEl.value)
   if (!el || el.scrollTop > 0) {
     ptrTracking.value = false
     return
@@ -582,7 +583,7 @@ function ptrStart(e) {
 
 function ptrMove(e) {
   if (!ptrTracking.value || ptrBusy.value) return
-  const el = listEl.value
+  const el = scrollEl(listEl.value)
   if (!el) return
   if (el.scrollTop > 0) {
     ptrRaw.value = 0
@@ -944,7 +945,7 @@ function onServerEvent(ev) {
       listSnap.value.kind === 'folder' &&
       messages.value.length > beforeCount &&
       listEl.value &&
-      listEl.value.scrollTop > 80
+      scrollEl(listEl.value).scrollTop > 80
     ) {
       newMailPending.value += messages.value.length - beforeCount
     }
@@ -1610,7 +1611,7 @@ function onReaderTouchEnd(e) {
   const dx = t.clientX - readerTouch.x
   const dy = t.clientY - readerTouch.y
   readerTouch = null
-  const scroller = e.currentTarget.querySelector('.reader-scroll')
+  const scroller = scrollEl(e.currentTarget.querySelector('.reader-scroll'))
   const atTop = !scroller || scroller.scrollTop <= 0
   if ((dx > 90 && Math.abs(dy) < 60) || (atTop && dy > 110 && Math.abs(dx) < 60)) {
     if (convo.value) {
@@ -3160,8 +3161,6 @@ body {
 }
 .list-scroll {
   flex: 1;
-  overflow-y: auto;
-  overflow-y: overlay;
   overflow-anchor: none;
   overscroll-behavior-y: none;
 }
@@ -3178,8 +3177,6 @@ body {
   background: rgb(var(--v-theme-surface));
 }
 .v-navigation-drawer__content {
-  overflow-y: auto !important;
-  overflow-y: overlay !important;
   overflow-anchor: none;
 }
 .v-navigation-drawer--temporary {
@@ -3289,10 +3286,7 @@ body {
 .reader-scroll {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
-  overflow-y: overlay;
   overflow-anchor: none;
-  overflow-x: hidden;
 }
 @media (hover: none) {
   .v-tooltip {
