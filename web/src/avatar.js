@@ -12,6 +12,13 @@ export function avatarColorFor(email) {
 }
 
 export function avatarLetterFor(name, email) {
-  const s = (name || email || '?').trim()
-  return s ? s.charAt(0).toUpperCase() : '?'
+  const raw = (name || '').trim() || (email || '').split('@')[0].trim()
+  if (!raw) return '?'
+  const parts = raw.split(/[\s._\-]+/).filter(Boolean)
+  if (parts.length >= 2) {
+    const first = Array.from(parts[0])[0] || ''
+    const last = Array.from(parts[parts.length - 1])[0] || ''
+    return (first + last).toUpperCase()
+  }
+  return (Array.from(parts[0] || '?')[0] || '?').toUpperCase()
 }

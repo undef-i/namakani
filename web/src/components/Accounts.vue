@@ -1,8 +1,7 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { intlLocale, lang, setLang, t } from '../i18n'
-import { avatarColorFor, avatarLetterFor } from '../avatar.js'
 import * as api from '../api.js'
 
 const display = useDisplay()
@@ -30,71 +29,38 @@ function kindText(a) {
   )
 }
 
-function kindShort(a) {
-  if (a.kind === 'proton') return 'Proton Mail'
-  if (a.kind === 'tuta') return 'Tuta Mail'
-  return 'IMAP/SMTP'
-}
 
-function statusChip(a) {
-  const st = props.statuses[a.id]
-  if (!st) return null
-  if (st.state === 'idle') return { text: t('已同步'), color: 'secondary-container' }
-  if (st.state === 'syncing' || st.state === 'connecting')
-    return { text: t('同步中'), color: 'surface-container-high' }
-  if (st.state === 'repair') return { text: t('需要手动修复'), color: 'error-container' }
-  if (st.state === 'error') return { text: t('同步失败'), color: 'error-container' }
-  return { text: t('未同步'), color: 'surface-container-high' }
-}
-
-const props = defineProps({
-  accounts: { type: Array, default: () => [] },
-  accountsStatus: { type: String, default: 'ready' },
-  statuses: { type: Object, default: () => ({}) },
-  themeMode: { type: String, default: 'system' },
-  threaded: { type: Boolean, default: false },
-  undoSeconds: { type: Number, default: 5 },
-  version: { type: String, default: '' },
-})
-const emit = defineEmits(['changed', 'update:themeMode', 'update:threaded', 'update:undoSeconds', 'appSettings'])
-
-const undoItems = computed(() => [
-  { title: t('关闭（立即发送）'), value: 0 },
-  { title: t('{n} 秒', { n: 5 }), value: 5 },
-  { title: t('{n} 秒', { n: 10 }), value: 10 },
-  { title: t('{n} 秒', { n: 20 }), value: 20 },
-  { title: t('{n} 秒', { n: 30 }), value: 30 },
-])
-
-function fmtListTime(ts) {
-  const d = new Date(ts * 1000)
-  const now = new Date()
-  if (d.toDateString() === now.toDateString())
-    return new Intl.DateTimeFormat(intlLocale(), { hour: '2-digit', minute: '2-digit', hour12: false }).format(d)
-  if (d.getFullYear() === now.getFullYear())
-    return new Intl.DateTimeFormat(intlLocale(), { month: 'numeric', day: 'numeric' }).format(d)
-  return new Intl.DateTimeFormat(intlLocale(), { year: 'numeric', month: 'numeric', day: 'numeric' }).format(d)
-}
-
-function fmtDateTime(ts) {
-  return new Intl.DateTimeFormat(intlLocale(), {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).format(new Date(ts * 1000))
-}
-
-function detailText(a) {
+function statusText(a) {
   const st = props.statuses[a.id]
   if (!st) return ''
-  const parts = []
-  if (st.last_sync_at) parts.push(t('上次同步 {time}', { time: fmtListTime(st.last_sync_at) }))
-  const cache = cacheText(a)
-  if (cache) parts.push(cache)
-  return parts.join(t('，'))
+  if (st.state === 'idle') return t('已同步 {time}', { time: fmtListTime(st.last_sync_at) })
+  if (st.state === 'syncing') return t('同步中')
+  if (st.state === 'connecting') return t('连接中')
+  if (st.state === 'repair') return t('需要手动修复')
+  if (st.state === 'error') return t('同步失败')
+  return t('未同步')
+}
+
+const testState = reactive({})
+
+async function runTest(a) {
+  testState[a.id] = { busy: true, ok: false, text: t('连接中') }
+  try {
+    const res = await api.testAccount(a.id)
+    testState[a.id] = {
+      busy: false,
+      ok: true,
+      text: t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
+        folders: (res.folders || []).length,
+        caps: (res.capabilities || []).length,
+        sample: (res.capabilities || [])
+          .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
+          .join('/'),
+      }),
+    }
+  } catch (err) {
+    testState[a.id] = { busy: false, ok: false, text: t('连接失败：{error}', { error: err.message }) }
+  }
 }
 
 const reconnecting = ref(null)
@@ -722,13 +688,7 @@ onMounted(() => {
     </div>
 
     <template v-if="accountsStatus === 'loading'">
-      <div class="d-flex flex-column ga-3">
-        <v-card v-for="i in (accounts.length || 3)" :key="i" variant="outlined">
-          <v-card-text>
-            <v-skeleton-loader type="list-item-avatar-three-line" class="skel-clip" />
-          </v-card-text>
-        </v-card>
-      </div>
+      <v-skeleton-loader type="card@2" />
     </template>
     <template v-else-if="accountsStatus === 'error'">
       <v-alert type="error" variant="tonal" density="compact">
@@ -740,50 +700,46 @@ onMounted(() => {
       {{ t('还没有账号。添加第一个邮箱后，它的邮件会自动同步进聚合收件箱。') }}
     </p>
     <div v-else class="d-flex flex-column ga-3">
-      <v-card v-for="a in accounts" :key="a.id" variant="outlined">
+      <v-card v-for="a in accounts" :key="a.id" variant="outlined" rounded="lg">
         <v-card-text>
-          <div class="d-flex align-start ga-3">
-            <v-avatar :color="avatarColorFor(a.email)" size="40" class="flex-none">
-              <span class="avatar-letter" style="font-size: 16px">{{ avatarLetterFor(a.label, a.email) }}</span>
-            </v-avatar>
-            <div class="flex-grow-1" style="min-width: 0">
-              <div class="text-body-1 font-weight-bold text-truncate">{{ a.label }}</div>
+          <div class="d-flex align-start">
+            <div style="min-width: 0">
+              <div class="text-body-1 font-weight-medium text-truncate">{{ a.label }}</div>
               <div class="text-body-2 text-medium-emphasis" style="overflow-wrap: anywhere">{{ a.email }}</div>
             </div>
-            <v-menu>
-              <template #activator="{ props: mp }">
-                <v-btn v-bind="mp" icon="mdi-dots-vertical" variant="text" size="small" class="flex-none" :aria-label="t('更多')" />
-              </template>
-              <v-list density="compact">
-                <v-list-item :title="t('编辑')" @click="openEdit(a)" />
-                <v-list-item :title="t('删除')" @click="askDelete(a)" />
-              </v-list>
-            </v-menu>
+            <v-spacer />
+            <v-btn icon="mdi-connection" variant="text" size="small" :title="t('测试连接')" :loading="!!(testState[a.id] && testState[a.id].busy)" @click="runTest(a)" />
+            <v-btn icon="mdi-pencil" variant="text" size="small" :title="t('编辑')" @click="openEdit(a)" />
+            <v-btn icon="mdi-delete" variant="text" size="small" :title="t('删除')" @click="askDelete(a)" />
           </div>
-          <div class="d-flex flex-wrap ga-2 mt-3">
-            <v-chip size="small" variant="tonal">{{ kindShort(a) }}</v-chip>
-            <v-chip v-if="statusChip(a)" size="small" variant="flat" :color="statusChip(a).color">
-              {{ statusChip(a).text }}
-            </v-chip>
-          </div>
-          <div v-if="a.kind === 'imap'" class="text-body-2 text-medium-emphasis mt-3" style="overflow-wrap: anywhere">
+          <div class="text-body-2 text-medium-emphasis mt-2" style="overflow-wrap: anywhere">
             {{ kindText(a) }}
           </div>
-          <div v-if="detailText(a)" class="text-body-2 text-medium-emphasis mt-1" style="overflow-wrap: anywhere">
-            {{ detailText(a) }}
+          <div
+            v-if="statuses[a.id]"
+            class="text-body-2 mt-1"
+            :class="(statuses[a.id].state === 'error' || statuses[a.id].state === 'repair') ? 'text-error font-weight-medium' : 'text-medium-emphasis'"
+            style="overflow-wrap: anywhere"
+          >
+            {{ statusText(a) }}<template v-if="cacheText(a)">{{ t('，') }}{{ cacheText(a) }}</template>
           </div>
-          <div v-if="statuses[a.id] && statuses[a.id].state === 'repair'" class="mt-3">
-            <div v-if="statuses[a.id].last_error" class="text-body-2 text-error" style="overflow-wrap: anywhere">
-              {{ statuses[a.id].last_error }}
-            </div>
-            <v-btn
-              size="small"
-              variant="outlined"
-              color="primary"
-              class="mt-2"
-              :loading="reconnecting === a.id"
-              @click="reconnect(a)"
-            >
+          <div
+            v-if="statuses[a.id] && statuses[a.id].last_error && (statuses[a.id].state === 'error' || statuses[a.id].state === 'repair')"
+            class="text-body-2 text-error mt-1"
+            style="overflow-wrap: anywhere"
+          >
+            {{ statuses[a.id].last_error }}
+          </div>
+          <div
+            v-if="testState[a.id] && testState[a.id].text"
+            class="text-body-2 mt-1"
+            :class="testState[a.id].ok ? '' : 'text-error'"
+            style="overflow-wrap: anywhere"
+          >
+            {{ testState[a.id].text }}
+          </div>
+          <div v-if="statuses[a.id] && statuses[a.id].state === 'repair'" class="mt-2">
+            <v-btn size="small" variant="outlined" color="primary" :loading="reconnecting === a.id" @click="reconnect(a)">
               {{ t('重新连接') }}
             </v-btn>
           </div>
