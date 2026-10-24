@@ -143,24 +143,22 @@ func tgChatOf(m *tgUpdateMsg) tgChat {
 	return tgChat{ID: fmt.Sprint(m.Chat.ID), Type: m.Chat.Type, Title: title}
 }
 
-func (s *Server) tgSupervise() {
-	var cancel context.CancelFunc
-	var running string
-	for {
-		token := s.tgLoadConfig().Token
-		if token != running {
-			if cancel != nil {
-				cancel()
-				cancel = nil
-			}
-			running = token
-			if token != "" {
-				ctx, c := context.WithCancel(context.Background())
-				cancel = c
-				go s.tgPoll(ctx, token)
-			}
-		}
-		time.Sleep(5 * time.Second)
+func (s *Server) tgReconcile() {
+	s.tgMu.Lock()
+	defer s.tgMu.Unlock()
+	token := s.tgLoadConfig().Token
+	if token == s.tgRunning {
+		return
+	}
+	if s.tgCancel != nil {
+		s.tgCancel()
+		s.tgCancel = nil
+	}
+	s.tgRunning = token
+	if token != "" {
+		ctx, c := context.WithCancel(context.Background())
+		s.tgCancel = c
+		go s.tgPoll(ctx, token)
 	}
 }
 
@@ -332,6 +330,7 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store enabled flag failed")
 		return
 	}
+	s.tgReconcile()
 	s.handleGetTelegram(w, r)
 }
 
@@ -367,6 +366,16 @@ func (s *Server) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 	if err := tgSendMessage(token, chatID, chatID); err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
+	}
+	if _, err := tgCall(token, "setChatMenuButton", map[string]any{
+		"chat_id": chatID,
+		"menu_button": map[string]any{
+			"type":    "web_app",
+			"text":    "邮箱",
+			"web_app": map[string]any{"url": tgNamakaniBase},
+		},
+	}); err != nil {
+		log.Printf("tg setChatMenuButton failed: %v", err)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

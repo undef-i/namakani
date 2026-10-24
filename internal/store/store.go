@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS scheduled_sends (
 	status     TEXT NOT NULL DEFAULT 'pending',
 	error      TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS pending_removals (
+	message_id     INTEGER PRIMARY KEY,
+	from_folder_id INTEGER NOT NULL DEFAULT 0,
+	created_at     INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS sessions (
 	token_hash  TEXT PRIMARY KEY,
 	created_at  INTEGER NOT NULL,
@@ -154,6 +159,9 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if _, err := db.Exec(`DELETE FROM pending_removals`); err != nil {
+		return nil, fmt.Errorf("clear pending removals: %w", err)
 	}
 	hasFromName, err := columnExists(db, "accounts", "from_name")
 	if err != nil {

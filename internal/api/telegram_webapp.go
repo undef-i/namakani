@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/hmac"
+	"log"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -82,6 +83,7 @@ func verifyTGInitData(token, initData string, now time.Time) (tgInitData, error)
 
 func (s *Server) recoverCredentialKey() ([]byte, bool) {
 	if s.serverKey == nil {
+		log.Printf("tg webapp-auth: recover key: no server key")
 		return nil, false
 	}
 	var wrapped string
@@ -90,10 +92,12 @@ func (s *Server) recoverCredentialKey() ([]byte, bool) {
 		time.Now().Unix(),
 	).Scan(&wrapped)
 	if err != nil {
+		log.Printf("tg webapp-auth: recover key: no unexpired session with a wrapped key")
 		return nil, false
 	}
 	plain, err := auth.Decrypt(s.serverKey, wrapped)
 	if err != nil || plain == "" {
+		log.Printf("tg webapp-auth: recover key: decrypt failed: %v", err)
 		return nil, false
 	}
 	return []byte(plain), true
@@ -104,32 +108,40 @@ func (s *Server) handleTelegramWebAppAuth(w http.ResponseWriter, r *http.Request
 		InitData string `json:"init_data"`
 	}
 	if err := decodeJSON(r, &req); err != nil || req.InitData == "" {
+		log.Printf("tg webapp-auth: bad request from %s: init_data empty or invalid json", r.RemoteAddr)
 		writeErr(w, http.StatusBadRequest, "init_data required")
 		return
 	}
+	log.Printf("tg webapp-auth: request from %s ua=%q init_data_len=%d", r.RemoteAddr, r.UserAgent(), len(req.InitData))
 	cfg := s.tgLoadConfig()
 	if cfg.Token == "" || cfg.ChatID == "" {
+		log.Printf("tg webapp-auth: rejected: telegram not configured (token set=%v chat set=%v)", cfg.Token != "", cfg.ChatID != "")
 		writeErr(w, http.StatusServiceUnavailable, "telegram not configured")
 		return
 	}
 	init, err := verifyTGInitData(cfg.Token, req.InitData, time.Now())
 	if err != nil {
+		log.Printf("tg webapp-auth: verify failed: %v", err)
 		writeErr(w, http.StatusUnauthorized, "telegram sign-in verification failed")
 		return
 	}
 	if strconv.FormatInt(init.UserID, 10) != cfg.ChatID {
+		log.Printf("tg webapp-auth: user mismatch: got %d, bound chat is %s", init.UserID, cfg.ChatID)
 		writeErr(w, http.StatusForbidden, "telegram user is not the bound chat")
 		return
 	}
 	key, ok := s.recoverCredentialKey()
 	if !ok {
+		log.Printf("tg webapp-auth: rejected: credential key not recoverable")
 		writeErr(w, http.StatusConflict, "no live session to recover credentials from; sign in with the master password once first")
 		return
 	}
 	if err := s.startSession(w, r, key); err != nil {
+		log.Printf("tg webapp-auth: start session failed: %v", err)
 		writeErr(w, http.StatusInternalServerError, "session failed")
 		return
 	}
 	s.startAllWorkers(key)
+	log.Printf("tg webapp-auth: ok for user %d", init.UserID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

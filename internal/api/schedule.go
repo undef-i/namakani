@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"strings"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -111,7 +113,7 @@ type scheduledOut struct {
 
 func (s *Server) handleListScheduled(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.st.DB.Query(`SELECT id, account_id, payload, send_at, created_at, status, error
-		FROM scheduled_sends ORDER BY send_at DESC LIMIT 100`)
+		FROM scheduled_sends WHERE status = 'pending' ORDER BY send_at ASC LIMIT 100`)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list failed")
 		return
@@ -299,4 +301,236 @@ func (s *Server) fireScheduled(key []byte, id int64) {
 		_ = s.deleteMessageEverywhere(key, req.DraftID)
 	}
 	mark("sent", note)
+}
+
+type scheduledDetailAtt struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	File        string `json:"file"`
+	Size        int64  `json:"size"`
+}
+
+type scheduledDetail struct {
+	ID          int64                `json:"id"`
+	AccountID   int64                `json:"account_id"`
+	SendAt      int64                `json:"send_at"`
+	Status      string               `json:"status"`
+	To          string               `json:"to"`
+	Cc          string               `json:"cc"`
+	Bcc         string               `json:"bcc"`
+	Subject     string               `json:"subject"`
+	Text        string               `json:"text"`
+	HTML        string               `json:"html"`
+	Attachments []scheduledDetailAtt `json:"attachments"`
+}
+
+func (s *Server) handleGetScheduled(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	var d scheduledDetail
+	var payload string
+	if err := s.st.DB.QueryRow("SELECT account_id, payload, send_at, status FROM scheduled_sends WHERE id = ?", id).
+		Scan(&d.AccountID, &payload, &d.SendAt, &d.Status); err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	d.ID = id
+	var sp scheduledPayload
+	if err := json.Unmarshal([]byte(payload), &sp); err != nil {
+		writeErr(w, http.StatusInternalServerError, "payload invalid")
+		return
+	}
+	d.To = sp.Req.To
+	d.Cc = sp.Req.Cc
+	d.Bcc = sp.Req.Bcc
+	d.Subject = sp.Req.Subject
+	d.Text = sp.Req.Text
+	d.HTML = sp.Req.HTML
+	d.Attachments = []scheduledDetailAtt{}
+	for _, a := range sp.Attachments {
+		var size int64
+		if fi, err := os.Stat(filepath.Join(s.scheduledDir(id), a.File)); err == nil {
+			size = fi.Size()
+		}
+		d.Attachments = append(d.Attachments, scheduledDetailAtt{Filename: a.Filename, ContentType: a.ContentType, File: a.File, Size: size})
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+type scheduleUpdateReq struct {
+	scheduleReq
+	KeepFiles []string `json:"keep_files"`
+}
+
+func (s *Server) handleUpdateScheduled(w http.ResponseWriter, r *http.Request) {
+	key, _ := s.credentialKey(r)
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad id")
+		return
+	}
+	var status, payload string
+	if err := s.st.DB.QueryRow("SELECT status, payload FROM scheduled_sends WHERE id = ?", id).Scan(&status, &payload); err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if status != "pending" {
+		writeErr(w, http.StatusConflict, "already "+status)
+		return
+	}
+	var req scheduleUpdateReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad request")
+		return
+	}
+	if req.SendAt <= 0 {
+		writeErr(w, http.StatusBadRequest, "send_at required")
+		return
+	}
+	if _, err := s.prepareOutgoing(key, req.composeReq, true); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var old scheduledPayload
+	_ = json.Unmarshal([]byte(payload), &old)
+	keep := map[string]bool{}
+	for _, f := range req.KeepFiles {
+		keep[f] = true
+	}
+	dir := s.scheduledDir(id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		writeErr(w, http.StatusInternalServerError, "update failed")
+		return
+	}
+	sp := scheduledPayload{Req: req.composeReq}
+	sp.Req.Attachments = nil
+	used := map[string]bool{}
+	for _, a := range old.Attachments {
+		if keep[a.File] {
+			sp.Attachments = append(sp.Attachments, a)
+			used[a.File] = true
+		} else {
+			_ = os.Remove(filepath.Join(dir, a.File))
+		}
+	}
+	n := 0
+	for _, a := range req.Attachments {
+		data, err := base64.StdEncoding.DecodeString(a.DataB64)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "附件 "+a.Filename+" 的数据无效")
+			return
+		}
+		var name string
+		for {
+			name = "att" + strconv.Itoa(n)
+			n++
+			if !used[name] {
+				break
+			}
+		}
+		used[name] = true
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+			writeErr(w, http.StatusInternalServerError, "update failed")
+			return
+		}
+		sp.Attachments = append(sp.Attachments, scheduledAttachment{Filename: a.Filename, ContentType: a.ContentType, File: name})
+	}
+	raw, err := json.Marshal(sp)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "update failed")
+		return
+	}
+	if _, err := s.st.DB.Exec("UPDATE scheduled_sends SET payload = ?, send_at = ? WHERE id = ? AND status = 'pending'", string(raw), req.SendAt, id); err != nil {
+		writeErr(w, http.StatusInternalServerError, "update failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func firstRecipient(to string) (string, string) {
+	first := strings.TrimSpace(strings.Split(to, ",")[0])
+	if i := strings.Index(first, "<"); i >= 0 {
+		if j := strings.Index(first[i:], ">"); j >= 0 {
+			name := strings.Trim(strings.TrimSpace(first[:i]), "\"")
+			return name, strings.TrimSpace(first[i+1 : i+j])
+		}
+	}
+	return "", first
+}
+
+func snippetOf(text string) string {
+	clean := strings.Join(strings.Fields(text), " ")
+	r := []rune(clean)
+	if len(r) > 140 {
+		return string(r[:140])
+	}
+	return clean
+}
+
+func (s *Server) listScheduledAsMessages(w http.ResponseWriter, q url.Values, limit, offset int) {
+	labels := map[int64]string{}
+	if lrows, err := s.st.DB.Query("SELECT id, label, email FROM accounts"); err == nil {
+		defer lrows.Close()
+		for lrows.Next() {
+			var id int64
+			var label, email string
+			if err := lrows.Scan(&id, &label, &email); err == nil {
+				if label == "" {
+					label = email
+				}
+				labels[id] = label
+			}
+		}
+	}
+	rows, err := s.st.DB.Query(`SELECT id, account_id, payload, send_at FROM scheduled_sends WHERE status = 'pending' ORDER BY send_at ASC`)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "list failed")
+		return
+	}
+	defer rows.Close()
+	all := []messageOut{}
+	for rows.Next() {
+		var id, accountID, sendAt int64
+		var payload string
+		if err := rows.Scan(&id, &accountID, &payload, &sendAt); err != nil {
+			writeErr(w, http.StatusInternalServerError, "list failed")
+			return
+		}
+		mo := messageOut{
+			ID:            -id,
+			AccountID:     accountID,
+			AccountLabel:  labels[accountID],
+			FolderSpecial: "scheduled",
+			DateTS:        sendAt,
+			Flags:         1,
+		}
+		var sp scheduledPayload
+		if err := json.Unmarshal([]byte(payload), &sp); err == nil {
+			mo.Subject = sp.Req.Subject
+			mo.FromName, mo.FromEmail = firstRecipient(sp.Req.To)
+			mo.Snippet = snippetOf(sp.Req.Text)
+			mo.HasAttach = len(sp.Attachments) > 0
+		}
+		all = append(all, mo)
+	}
+	if offset > len(all) {
+		offset = len(all)
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	page := all[offset:end]
+	if q.Get("threaded") == "1" {
+		out := []threadOut{}
+		for _, mo := range page {
+			out = append(out, threadOut{messageOut: mo, ThreadCount: 1})
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
 }
