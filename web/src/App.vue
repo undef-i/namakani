@@ -2435,7 +2435,7 @@ onBeforeUnmount(() => {
                         </div>
                         <div
                           v-else-if="convoDetails[msg.id].text"
-                          class="py-2 text-body-2"
+                          class="py-2 px-3 text-body-2 mail-text-body"
                           :class="{ 'reader-text': lgAndUp }"
                           :style="lgAndUp ? 'white-space: pre-wrap' : 'white-space: pre-wrap; line-height: 1.6'"
                         >
@@ -2652,7 +2652,7 @@ onBeforeUnmount(() => {
                   </div>
                   <div
                     v-else-if="detail.text"
-                    class="py-3 text-body-2"
+                    class="py-3 px-3 text-body-2 mail-text-body"
                     :class="{ 'reader-text': lgAndUp }"
                     :style="lgAndUp ? 'white-space: pre-wrap' : 'white-space: pre-wrap; line-height: 1.6'"
                   >
@@ -3283,6 +3283,11 @@ body {
   gap: 12px;
   color: rgb(var(--v-theme-on-surface-variant));
   font-size: 14px;
+}
+.mail-text-body {
+  background: #ffffff;
+  color: #000000;
+  border-radius: 4px;
 }
 .reader-text {
   font-size: 15px;
