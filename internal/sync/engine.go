@@ -574,7 +574,7 @@ func (m *Manager) watchSession(ctx context.Context, acct mail.Account, r folderR
 		}
 		done := make(chan error, 1)
 		go func() { done <- idleCmd.Wait() }()
-		poll := time.NewTimer(2 * time.Minute)
+		poll := time.NewTimer(60 * time.Second)
 		var idleErr error
 		gotDone := false
 	idleWait:
@@ -665,7 +665,7 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 				row := &store.MessageRow{
 					UID:       msg.UID,
 					MessageID: msg.MessageID,
-					ThreadKey: m.st.ComputeThreadKey(acct.ID, msg.MessageID, msg.InReplyTo),
+					ThreadKey: m.st.ComputeThreadKey(acct.ID, msg.MessageID, msg.InReplyTo, msg.Subject),
 					Subject:   msg.Subject,
 					FromJSON:  addrsJSON(msg.From),
 					ToJSON:    addrsJSON(msg.To),
@@ -683,7 +683,7 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 				if inserted {
 					change.Inserted = append(change.Inserted, id)
 					if row.ThreadKey != "" && msg.MessageID != "" {
-						_ = m.st.AdoptThreadKey(acct.ID, msg.MessageID, row.ThreadKey, id)
+						_ = m.st.AdoptThreadKey(acct.ID, msg.MessageID, row.ThreadKey, id, msg.Subject)
 					}
 				}
 				if msg.ModSeq > state.HighestModSeq {

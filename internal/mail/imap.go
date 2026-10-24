@@ -345,6 +345,27 @@ func (cl *Client) MoveMessage(uid uint32, dest string) (uint32, error) {
 	return destUID, nil
 }
 
+func (cl *Client) FindUIDByMessageID(folder, messageID string) (uint32, error) {
+	if _, err := cl.c.Select(folder, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		return 0, err
+	}
+	value := messageID
+	if !strings.HasPrefix(value, "<") {
+		value = "<" + value + ">"
+	}
+	data, err := cl.c.UIDSearch(&imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Message-Id", Value: value}},
+	}, nil).Wait()
+	if err != nil {
+		return 0, err
+	}
+	uids := data.AllUIDs()
+	if len(uids) == 0 {
+		return 0, nil
+	}
+	return uint32(uids[len(uids)-1]), nil
+}
+
 func (cl *Client) AppendMessage(folder string, raw []byte, flags ...imap.Flag) (uint32, error) {
 	cmd := cl.c.Append(folder, int64(len(raw)), &imap.AppendOptions{Flags: flags})
 	if _, err := cmd.Write(raw); err != nil {

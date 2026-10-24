@@ -137,7 +137,7 @@ var (
 	protonEventIdleWait  = 5 * time.Second
 	protonEventErrBase   = 5 * time.Second
 	protonEventErrMax    = 60 * time.Second
-	protonEventRebaseAge = 5 * time.Minute
+	protonEventRebaseAge = 1 * time.Minute
 )
 
 func protonEventLoop(ctx context.Context, src protonEventSource, accountID int64, out chan<- *protonmail.Event) {

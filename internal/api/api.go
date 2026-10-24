@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -45,6 +46,9 @@ type Server struct {
 	loginLastFail time.Time
 	tgSeenMu      sync.Mutex
 	tgSeen        map[string]tgChat
+	tgMu          sync.Mutex
+	tgCancel      context.CancelFunc
+	tgRunning     string
 	protonAuthMu  sync.Mutex
 	protonAuth    map[string]protonAuthEntry
 }
@@ -56,7 +60,7 @@ type protonAuthEntry struct {
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
 	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry)}
-	go s.tgSupervise()
+	s.tgReconcile()
 	go s.scheduleLoop()
 	if key, err := auth.LoadOrCreateServerKey(filepath.Join(st.DataDir(), "server.key")); err == nil {
 		s.serverKey = key
@@ -82,6 +86,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/accounts/{id}/sync", s.authOnly(s.handleSyncStatus))
 	mux.HandleFunc("POST /api/accounts/{id}/reconnect", s.authOnly(s.handleReconnectAccount))
 	mux.HandleFunc("GET /api/folders", s.authOnly(s.handleListFolders))
+	mux.HandleFunc("POST /api/folders/{id}/purge", s.authOnly(s.handlePurgeFolder))
 	mux.HandleFunc("GET /api/messages", s.authOnly(s.handleListMessages))
 	mux.HandleFunc("GET /api/messages/{id}", s.authOnly(s.handleGetMessage))
 	mux.HandleFunc("GET /api/messages/{id}/attachments/{attId}", s.authOnly(s.handleDownloadAttachment))
@@ -92,6 +97,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/send/schedule", s.authOnly(s.handleScheduleSend))
 	mux.HandleFunc("GET /api/scheduled", s.authOnly(s.handleListScheduled))
 	mux.HandleFunc("DELETE /api/scheduled/{id}", s.authOnly(s.handleCancelScheduled))
+	mux.HandleFunc("GET /api/scheduled/{id}", s.authOnly(s.handleGetScheduled))
+	mux.HandleFunc("PUT /api/scheduled/{id}", s.authOnly(s.handleUpdateScheduled))
 	mux.HandleFunc("GET /api/contacts", s.authOnly(s.handleContacts))
 	mux.HandleFunc("POST /api/drafts", s.authOnly(s.handleSaveDraft))
 	mux.HandleFunc("GET /api/search", s.authOnly(s.handleSearch))
@@ -1184,6 +1191,86 @@ type folderOut struct {
 	Unread       int    `json:"unread"`
 }
 
+func (s *Server) handlePurgeFolder(w http.ResponseWriter, r *http.Request) {
+	key, _ := s.credentialKey(r)
+	folderID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad folder id")
+		return
+	}
+	var accountID int64
+	var name, special string
+	if err := s.st.DB.QueryRow("SELECT account_id, name, special_use FROM folders WHERE id = ?", folderID).Scan(&accountID, &name, &special); err != nil {
+		writeErr(w, http.StatusNotFound, "folder not found")
+		return
+	}
+	if special != "trash" && special != "junk" {
+		writeErr(w, http.StatusBadRequest, "only trash or junk folders can be purged")
+		return
+	}
+	rows, err := s.st.DB.Query("SELECT id FROM messages WHERE folder_id = ?", folderID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "list messages failed")
+		return
+	}
+	var ids []int64
+	for rows.Next() {
+		var mid int64
+		if err := rows.Scan(&mid); err != nil {
+			rows.Close()
+			writeErr(w, http.StatusInternalServerError, "scan failed")
+			return
+		}
+		ids = append(ids, mid)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "list messages failed")
+		return
+	}
+	if len(ids) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": 0})
+		return
+	}
+	cl, err := s.openConn(key, accountID)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer cl.Close()
+	if _, err := cl.SelectRW(name); err != nil {
+		log.Printf("namakani: purge folder %d select failed: %v", folderID, err)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	deletedIDs := make([]int64, 0, len(ids))
+	for _, mid := range ids {
+		route, err := s.st.MessageRoute(mid)
+		if err != nil {
+			continue
+		}
+		s.st.MarkPendingRemoval(mid, folderID)
+		if err := cl.DeleteMessage(route.UID); err != nil {
+			s.st.ClearPendingRemoval(mid)
+			log.Printf("namakani: purge folder %d msg %d failed: %v", folderID, mid, err)
+			if len(deletedIDs) > 0 {
+				s.broadcastRemoved(folderID, deletedIDs)
+				s.broadcastFolder(folderID)
+			}
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		s.st.ClearPendingRemoval(mid)
+		if err := s.st.DeleteLocalMessage(mid); err != nil {
+			log.Printf("namakani: purge folder %d local delete %d failed: %v", folderID, mid, err)
+		}
+		deletedIDs = append(deletedIDs, mid)
+	}
+	s.broadcastRemoved(folderID, deletedIDs)
+	s.broadcastFolder(folderID)
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": len(deletedIDs)})
+}
+
 func (s *Server) handleListFolders(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.st.DB.Query(`SELECT f.id, f.account_id, a.label, f.name, f.special_use, f.total, f.unread
 		FROM folders f JOIN accounts a ON a.id = f.account_id
@@ -1291,7 +1378,8 @@ func listScope(q map[string][]string) (string, []any) {
 	}
 	where := "1 = 1"
 	var args []any
-	if fid := get("folder_id"); fid != "" {
+	if get("thread_all") == "1" {
+	} else if fid := get("folder_id"); fid != "" {
 		where += " AND m.folder_id = ?"
 		args = append(args, fid)
 	} else {
@@ -1306,6 +1394,7 @@ func listScope(q map[string][]string) (string, []any) {
 		where += " AND m.account_id = ? AND COALESCE(NULLIF(m.thread_key, ''), 'id:' || m.id) = ?"
 		args = append(args, get("account_id"), tk)
 	}
+	where += " AND NOT EXISTS (SELECT 1 FROM pending_removals pr WHERE pr.message_id = m.id)"
 	return where, args
 }
 
@@ -1318,6 +1407,10 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	offset, err := strconv.Atoi(q.Get("offset"))
 	if err != nil || offset < 0 {
 		offset = 0
+	}
+	if q.Get("special") == "scheduled" {
+		s.listScheduledAsMessages(w, q, limit, offset)
+		return
 	}
 	where, args := listScope(q)
 
@@ -1500,7 +1593,11 @@ func (s *Server) openConn(key []byte, accountID int64) (mail.Conn, error) {
 		return &turnConn{Conn: sess, end: sess.UserTurn()}, nil
 	}
 	if acct.Kind == "tuta" {
-		return tuta.Connect(s.st, acct)
+		sess, err := tuta.Connect(s.st, acct)
+		if err != nil {
+			return nil, err
+		}
+		return &turnConn{Conn: sess, end: sess.UserTurn()}, nil
 	}
 	return mail.Connect(acct, nil)
 }
@@ -1522,6 +1619,9 @@ type messageDetail struct {
 	Text         string                `json:"text"`
 	HTML         string                `json:"html"`
 	Attachments  []store.AttachmentRow `json:"attachments"`
+	ThreadKey    string                `json:"thread_key"`
+	FolderSpecial string               `json:"folder_special"`
+	ThreadCount  int                   `json:"thread_count"`
 }
 
 func parseAddrs(jsonStr string) []mail.Addr {
@@ -1592,17 +1692,21 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		hasAttach int
 	)
 	err = s.st.DB.QueryRow(`SELECT m.account_id, a.label, m.folder_id, f.name, m.subject,
-		m.from_json, m.to_json, m.cc_json, m.date_ts, m.flags, m.size, m.has_attach
+		m.from_json, m.to_json, m.cc_json, m.date_ts, m.flags, m.size, m.has_attach, m.thread_key, f.special_use
 		FROM messages m JOIN accounts a ON a.id = m.account_id JOIN folders f ON f.id = m.folder_id
 		WHERE m.id = ?`, id).
 		Scan(&d.AccountID, &d.AccountLabel, &d.FolderID, &d.FolderName, &d.Subject,
-			&fromJSON, &toJSON, &ccJSON, &d.DateTS, &d.Flags, &d.Size, &hasAttach)
+			&fromJSON, &toJSON, &ccJSON, &d.DateTS, &d.Flags, &d.Size, &hasAttach, &d.ThreadKey, &d.FolderSpecial)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "message not found")
 		return
 	}
 	d.ID = id
 	d.HasAttach = hasAttach != 0
+	if d.ThreadKey != "" {
+		_ = s.st.DB.QueryRow("SELECT COUNT(*) FROM messages WHERE account_id = ? AND thread_key = ?",
+			d.AccountID, d.ThreadKey).Scan(&d.ThreadCount)
+	}
 	from := parseAddrs(fromJSON)
 	if len(from) > 0 {
 		d.From = &from[0]
@@ -1780,8 +1884,31 @@ func (s *Server) handleSetFlags(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]uint32{"flags": flags})
 }
 
+func isNotInFolder(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "not found in")
+}
+
 type moveReq struct {
-	To string `json:"to"`
+	To         string `json:"to"`
+	ToFolderID int64  `json:"to_folder_id"`
+}
+
+func (s *Server) findMovedUID(cl mail.Conn, id int64, destFolder string) uint32 {
+	var mid string
+	if err := s.st.DB.QueryRow("SELECT message_id FROM messages WHERE id = ?", id).Scan(&mid); err != nil || mid == "" {
+		return 0
+	}
+	finder, ok := cl.(interface {
+		FindUIDByMessageID(string, string) (uint32, error)
+	})
+	if !ok {
+		return 0
+	}
+	uid, err := finder.FindUIDByMessageID(destFolder, mid)
+	if err != nil {
+		return 0
+	}
+	return uid
 }
 
 func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
@@ -1792,8 +1919,8 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req moveReq
-	if err := decodeJSON(r, &req); err != nil || req.To == "" {
-		writeErr(w, http.StatusBadRequest, "destination special use required")
+	if err := decodeJSON(r, &req); err != nil || (req.To == "" && req.ToFolderID == 0) {
+		writeErr(w, http.StatusBadRequest, "destination required")
 		return
 	}
 	route, err := s.st.MessageRoute(id)
@@ -1801,10 +1928,23 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "message not found")
 		return
 	}
-	destID, dest, ok, err := s.st.FolderBySpecial(route.AccountID, req.To)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "folder lookup failed")
-		return
+	var destID int64
+	var dest string
+	var ok bool
+	if req.ToFolderID > 0 {
+		destID = req.ToFolderID
+		if err := s.st.DB.QueryRow("SELECT name FROM folders WHERE id = ? AND account_id = ?", req.ToFolderID, route.AccountID).Scan(&dest); err != nil {
+			writeErr(w, http.StatusBadRequest, "folder not found for this account")
+			return
+		}
+		ok = true
+	} else {
+		var err error
+		destID, dest, ok, err = s.st.FolderBySpecial(route.AccountID, req.To)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "folder lookup failed")
+			return
+		}
 	}
 	if !ok {
 		writeErr(w, http.StatusBadRequest, "this account has no folder for "+req.To)
@@ -1814,6 +1954,8 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
+	s.st.MarkPendingRemoval(id, route.FolderID)
+	defer s.st.ClearPendingRemoval(id)
 	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
@@ -1821,13 +1963,18 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cl.Close()
 	if _, err := cl.SelectRW(route.Folder); err != nil {
+		log.Printf("namakani: msg %d select %q failed: %v", id, route.Folder, err)
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	destUID, err := cl.MoveMessage(route.UID, dest)
-	if err != nil {
+	if err != nil && !isNotInFolder(err) {
+		log.Printf("namakani: msg %d move to %q failed: %v", id, dest, err)
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
+	}
+	if destUID == 0 {
+		destUID = s.findMovedUID(cl, id, dest)
 	}
 	if destUID > 0 {
 		err = s.st.MoveLocalMessage(id, destID, destUID)
@@ -1838,17 +1985,14 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "local move failed")
 		return
 	}
+	s.st.ClearPendingRemoval(id)
 	s.broadcastRemoved(route.FolderID, []int64{id})
 	s.broadcastFolder(route.FolderID)
 	s.broadcastFolder(destID)
 	if destUID > 0 {
-		var newID int64
-		if err := s.st.DB.QueryRow("SELECT id FROM messages WHERE account_id = ? AND folder_id = ? AND uid = ?",
-			route.AccountID, destID, destUID).Scan(&newID); err == nil && newID > 0 {
-			s.broadcastMessages([]int64{newID})
-		}
+		s.broadcastMessages([]int64{id})
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
@@ -1866,6 +2010,8 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	var special string
 	_ = s.st.DB.QueryRow("SELECT special_use FROM folders WHERE id = ?", route.FolderID).Scan(&special)
 
+	s.st.MarkPendingRemoval(id, route.FolderID)
+	defer s.st.ClearPendingRemoval(id)
 	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
@@ -1873,12 +2019,14 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cl.Close()
 	if _, err := cl.SelectRW(route.Folder); err != nil {
+		log.Printf("namakani: msg %d select %q failed: %v", id, route.Folder, err)
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	permanent := special == "trash" || special == "junk"
 	if permanent {
-		if err := cl.DeleteMessage(route.UID); err != nil {
+		if err := cl.DeleteMessage(route.UID); err != nil && !isNotInFolder(err) {
+			log.Printf("namakani: msg %d permanent delete failed: %v", id, err)
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
@@ -1899,9 +2047,13 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		destUID, err := cl.MoveMessage(route.UID, dest)
-		if err != nil {
+		if err != nil && !isNotInFolder(err) {
+			log.Printf("namakani: msg %d move to trash %q failed: %v", id, dest, err)
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
+		}
+		if destUID == 0 {
+			destUID = s.findMovedUID(cl, id, dest)
 		}
 		if destUID > 0 {
 			err = s.st.MoveLocalMessage(id, destID, destUID)
@@ -1912,11 +2064,15 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, "local move failed")
 			return
 		}
+		s.st.ClearPendingRemoval(id)
 		s.broadcastRemoved(route.FolderID, []int64{id})
 		s.broadcastFolder(route.FolderID)
 		s.broadcastFolder(destID)
+		if destUID > 0 {
+			s.broadcastMessages([]int64{id})
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 type markAllReadReq struct {
@@ -2186,7 +2342,7 @@ func (s *Server) appendCopy(key []byte, accountID int64, special string,
 	row := &store.MessageRow{
 		UID:       uid,
 		MessageID: out.messageID,
-		ThreadKey: s.st.ComputeThreadKey(accountID, out.messageID, out.inReplyTo),
+		ThreadKey: s.st.ComputeThreadKey(accountID, out.messageID, out.inReplyTo, out.subject),
 		Subject:   out.subject,
 		FromJSON:  mustJSON([]mail.Addr{out.from}),
 		ToJSON:    mustJSON(out.to),
@@ -2226,7 +2382,7 @@ func (s *Server) fileSentCopy(acct mail.Account, sess uidAssigner, sentID string
 	row := &store.MessageRow{
 		UID:       uid,
 		MessageID: out.messageID,
-		ThreadKey: s.st.ComputeThreadKey(acct.ID, out.messageID, out.inReplyTo),
+		ThreadKey: s.st.ComputeThreadKey(acct.ID, out.messageID, out.inReplyTo, out.subject),
 		Subject:   out.subject,
 		FromJSON:  mustJSON([]mail.Addr{out.from}),
 		ToJSON:    mustJSON(out.to),
@@ -2376,7 +2532,7 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
-		writeJSON(w, http.StatusOK, []messageOut{})
+		writeJSON(w, http.StatusOK, []threadOut{})
 		return
 	}
 	limit := 60
@@ -2385,26 +2541,34 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	rows, err := s.st.DB.Query(`SELECT m.id, m.account_id, a.label, m.folder_id, f.name, m.subject,
-		m.from_json, m.date_ts, m.flags, m.has_attach, m.snippet, m.size
-		FROM messages_fts
-		JOIN messages m ON m.id = messages_fts.rowid
+	rows, err := s.st.DB.Query(`SELECT m.id, m.account_id, a.label, m.folder_id, f.name, f.special_use, m.thread_key, m.subject,
+		m.from_json, m.date_ts, m.flags, m.has_attach, m.snippet, m.size,
+		(SELECT COUNT(*) FROM messages t WHERE t.account_id = m.account_id AND t.thread_key = m.thread_key AND m.thread_key <> '')
+		FROM (SELECT mm.id, ROW_NUMBER() OVER (PARTITION BY mm.account_id,
+			CASE WHEN mm.message_id = '' THEN 'id:' || mm.id ELSE mm.message_id END, mm.date_ts
+			ORDER BY CASE WHEN ff.special_use = 'all' THEN 1 ELSE 0 END, mm.id) AS rn
+			FROM messages_fts
+			JOIN messages mm ON mm.id = messages_fts.rowid
+			JOIN folders ff ON ff.id = mm.folder_id
+			WHERE messages_fts MATCH ? AND NOT EXISTS (SELECT 1 FROM pending_removals pr WHERE pr.message_id = mm.id)) picked
+		JOIN messages m ON m.id = picked.id
 		JOIN accounts a ON a.id = m.account_id
 		JOIN folders f ON f.id = m.folder_id
-		WHERE messages_fts MATCH ? ORDER BY m.date_ts DESC LIMIT ?`,
+		WHERE picked.rn = 1 ORDER BY m.date_ts DESC LIMIT ?`,
 		store.BuildFTSQuery(q), limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "search failed")
 		return
 	}
 	defer rows.Close()
-	out := []messageOut{}
+	out := []threadOut{}
 	for rows.Next() {
 		var row messageOut
 		var fromJSON string
 		var hasAttach int
-		if err := rows.Scan(&row.ID, &row.AccountID, &row.AccountLabel, &row.FolderID, &row.FolderName,
-			&row.Subject, &fromJSON, &row.DateTS, &row.Flags, &hasAttach, &row.Snippet, &row.Size); err != nil {
+		var cnt int
+		if err := rows.Scan(&row.ID, &row.AccountID, &row.AccountLabel, &row.FolderID, &row.FolderName, &row.FolderSpecial, &row.ThreadKey,
+			&row.Subject, &fromJSON, &row.DateTS, &row.Flags, &hasAttach, &row.Snippet, &row.Size, &cnt); err != nil {
 			writeErr(w, http.StatusInternalServerError, "scan failed")
 			return
 		}
@@ -2413,7 +2577,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			row.FromName = from[0].Name
 			row.FromEmail = from[0].Email
 		}
-		out = append(out, row)
+		out = append(out, threadOut{messageOut: row, ThreadCount: cnt})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -2479,9 +2643,17 @@ func (s *Server) handleContacts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) spaHandler() http.Handler {
 	fileServer := http.FileServer(http.FS(s.uiFS))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/m/") {
+			log.Printf("entry: %s %s ua=%q referer=%q", r.Method, r.URL.Path, r.UserAgent(), r.Referer())
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			writeErr(w, http.StatusNotFound, "no such endpoint")
 			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
 		}
 		f, err := s.uiFS.Open(strings.TrimPrefix(r.URL.Path, "/"))
 		if err != nil {

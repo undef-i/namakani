@@ -79,6 +79,18 @@ func (s *Server) broadcastMessages(ids []int64) {
 	if len(ids) == 0 {
 		return
 	}
+	if pending := s.st.PendingRemovalSet(ids); len(pending) > 0 {
+		keep := make([]int64, 0, len(ids))
+		for _, id := range ids {
+			if !pending[id] {
+				keep = append(keep, id)
+			}
+		}
+		ids = keep
+	}
+	if len(ids) == 0 {
+		return
+	}
 	rows := s.messageRowsByIDs(ids)
 	if len(rows) > 0 {
 		s.hub.broadcast(map[string]any{"type": "messages", "items": rows})
