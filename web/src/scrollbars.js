@@ -24,7 +24,10 @@ function initEl(el) {
     options.overflow = { x: 'scroll', y: 'scroll' }
   }
   try {
-    OverlayScrollbars(el, options)
+    const inst = OverlayScrollbars(el, options)
+    if (inst) {
+      el.dispatchEvent(new CustomEvent('os-viewport', { detail: inst.elements().viewport }))
+    }
   } catch {}
 }
 

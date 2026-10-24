@@ -621,6 +621,14 @@ async function ptrEnd() {
   }
 }
 
+let listVp = null
+function bindListVp(vp) {
+  if (!vp || vp === listVp) return
+  if (listVp) listVp.removeEventListener('scroll', onListScroll)
+  listVp = vp
+  vp.addEventListener('scroll', onListScroll, { passive: true })
+}
+
 watch(listEl, (el) => {
   if (!el || el === ptrAttachedEl) return
   ptrAttachedEl = el
@@ -628,6 +636,9 @@ watch(listEl, (el) => {
   el.addEventListener('touchmove', ptrMove, { passive: false })
   el.addEventListener('touchend', ptrEnd)
   el.addEventListener('touchcancel', ptrEnd)
+  el.addEventListener('os-viewport', (e) => bindListVp(e.detail))
+  const vp = scrollEl(el)
+  if (vp && vp !== el) bindListVp(vp)
 })
 
 
