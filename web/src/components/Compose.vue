@@ -795,14 +795,13 @@ function onKeydown(e) {
     @paste="onPaste"
   >
     <v-card class="compose-card">
-      <v-toolbar density="compact" color="transparent" class="compose-headbar">
-        <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" :disabled="sending" @click.stop="closeCompose" />
-        <span class="text-body-2 font-weight-medium ml-1">{{ title }}</span>
+      <v-toolbar color="transparent" class="compose-headbar">
+        <v-btn icon="mdi-close" variant="text" :aria-label="t('关闭')" :disabled="sending" @click.stop="closeCompose" />
+        <v-toolbar-title>{{ title }}</v-toolbar-title>
         <v-spacer />
         <v-btn
           v-if="lgAndUp"
           icon
-          size="small"
           variant="text"
           :aria-label="t('最小化')"
           @click.stop="minimized = !minimized"
@@ -812,14 +811,13 @@ function onKeydown(e) {
         <v-btn
           v-if="lgAndUp"
           icon
-          size="small"
           variant="text"
           :aria-label="maximized ? t('还原') : t('全屏')"
           @click.stop="maximized = !maximized"
         >
           <v-icon :icon="maximized ? 'mdi-arrow-collapse' : 'mdi-arrow-expand'" />
         </v-btn>
-        <v-btn-group color="primary" variant="tonal" density="comfortable" class="ml-2">
+        <v-btn-group color="primary" variant="tonal" class="ml-2">
           <v-btn prepend-icon="mdi-send" :disabled="busy || draftLoading" :loading="sending" @click="doSend">
             {{ sending ? t('发送中') : t('发送') }}
           </v-btn>
@@ -827,7 +825,7 @@ function onKeydown(e) {
             <template #activator="{ props: mp }">
               <v-btn v-bind="mp" icon="mdi-chevron-down" :disabled="busy || draftLoading" :aria-label="t('定时发送')" />
             </template>
-            <v-card width="280" class="pa-2">
+            <v-card class="pa-2">
               <v-list density="compact">
                 <v-list-item :title="t('1 小时后')" @click="scheduleOption('h1')" />
                 <v-list-item :title="t('今晚 20:00')" @click="scheduleOption('tonight')" />
@@ -839,7 +837,7 @@ function onKeydown(e) {
                   v-model="schedWhen"
                   type="datetime-local"
                   density="compact"
-                  variant="outlined"
+                  variant="filled"
                   hide-details
                   class="ma-2"
                 />
@@ -1118,7 +1116,7 @@ function onKeydown(e) {
                     v-model="linkUrl"
                     :label="t('链接地址')"
                     density="compact"
-                    variant="outlined"
+                    variant="filled"
                     hide-details
                     class="mb-2"
                     @keydown.enter.prevent="applyLink"
@@ -1286,9 +1284,6 @@ function onKeydown(e) {
   flex: none;
   background: rgba(var(--v-theme-on-surface), 0.06);
   border-radius: inherit;
-}
-.compose-headbar .v-toolbar__content {
-  padding: 0 8px;
 }
 .compose-main {
   display: flex;

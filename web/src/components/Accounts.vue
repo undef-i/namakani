@@ -820,7 +820,7 @@ onMounted(() => {
           { title: 'English', value: 'en' },
         ]"
         :label="t('语言')"
-        variant="outlined"
+        variant="filled"
         density="comfortable"
         hide-details
         style="max-width: 260px"
@@ -847,7 +847,7 @@ onMounted(() => {
           v-model.number="appSet.cache_budget_gb"
           type="number"
           :label="t('缓存预算 (GB)')"
-          variant="outlined"
+          variant="filled"
           density="comfortable"
           hide-details
           style="max-width: 200px"
@@ -856,7 +856,7 @@ onMounted(() => {
           v-model.number="appSet.sync_batch"
           type="number"
           :label="t('同步批量')"
-          variant="outlined"
+          variant="filled"
           density="comfortable"
           hide-details
           style="max-width: 200px"
@@ -865,7 +865,7 @@ onMounted(() => {
           v-model.number="appSet.max_attachment_mb"
           type="number"
           :label="t('附件上限 (MB)')"
-          variant="outlined"
+          variant="filled"
           density="comfortable"
           hide-details
           style="max-width: 200px"
@@ -874,7 +874,7 @@ onMounted(() => {
           v-model.number="appSet.push_window_minutes"
           type="number"
           :label="t('推送窗口 (分钟)')"
-          variant="outlined"
+          variant="filled"
           density="comfortable"
           hide-details
           style="max-width: 200px"
@@ -892,7 +892,7 @@ onMounted(() => {
         :model-value="undoSeconds"
         :items="undoItems"
         :label="t('撤销发送等待')"
-        variant="outlined"
+        variant="filled"
         density="comfortable"
         hide-details
         style="max-width: 260px"
@@ -947,7 +947,7 @@ onMounted(() => {
         v-model="tg.bot_token"
         label="Bot Token"
         type="password"
-        variant="outlined"
+        variant="filled"
         density="comfortable"
         autocomplete="off"
         :placeholder="tg.has_token ? t('已保存，留空不改') : t('如 123456:ABC-DEF...')"
@@ -956,7 +956,7 @@ onMounted(() => {
       <v-text-field
         v-model="tg.chat_id"
         label="Chat ID"
-        variant="outlined"
+        variant="filled"
         density="comfortable"
         autocomplete="off"
         :placeholder="t('如 123456789')"
@@ -1029,17 +1029,17 @@ onMounted(() => {
               { title: 'Tuta Mail', value: 'tuta' },
             ]"
             :disabled="!!editing"
-            variant="outlined"
+            variant="filled"
             density="comfortable"
             class="mb-2"
           />
-          <v-text-field v-model="form.label" :label="t('名称')" variant="outlined" density="comfortable" :placeholder="t('如 工作邮箱')" required class="mb-2" />
-          <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="outlined" density="comfortable" required class="mb-2" />
-          <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="outlined" density="comfortable" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
+          <v-text-field v-model="form.label" :label="t('名称')" variant="filled" density="comfortable" :placeholder="t('如 工作邮箱')" required class="mb-2" />
+          <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="filled" density="comfortable" required class="mb-2" />
+          <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="filled" density="comfortable" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
           <v-textarea
             v-model="form.signature"
             :label="t('签名')"
-            variant="outlined"
+            variant="filled"
             density="comfortable"
             rows="3"
             class="mb-2"
@@ -1051,7 +1051,7 @@ onMounted(() => {
               v-model="form.password"
               :label="t('登录密码')"
               type="password"
-              variant="outlined"
+              variant="filled"
               density="comfortable"
               :placeholder="editing ? t('留空 = 不修改') : ''"
               :required="!editing"
@@ -1061,7 +1061,7 @@ onMounted(() => {
               v-model="form.mailbox_password"
               :label="t('邮箱密码（可选）')"
               type="password"
-              variant="outlined"
+              variant="filled"
               density="comfortable"
               :placeholder="t('留空 = 与登录密码相同')"
               class="mb-2"
@@ -1070,7 +1070,7 @@ onMounted(() => {
               v-if="needsTotp"
               v-model="form.totp"
               :label="t('两步验证码')"
-              variant="outlined"
+              variant="filled"
               density="comfortable"
               class="mb-2"
             />
@@ -1085,7 +1085,7 @@ onMounted(() => {
               v-model="form.password"
               :label="t('登录密码')"
               type="password"
-              variant="outlined"
+              variant="filled"
               density="comfortable"
               :placeholder="editing ? t('留空 = 不修改') : ''"
               :required="!editing"
@@ -1095,18 +1095,18 @@ onMounted(() => {
               v-if="needsTotp"
               v-model="form.totp"
               :label="t('两步验证码')"
-              variant="outlined"
+              variant="filled"
               density="comfortable"
               class="mb-2"
             />
           </template>
           <template v-else>
-            <v-text-field v-model="form.username" :label="t('用户名')" variant="outlined" density="comfortable" required class="mb-2" />
+            <v-text-field v-model="form.username" :label="t('用户名')" variant="filled" density="comfortable" required class="mb-2" />
             <v-text-field
               v-model="form.password"
               :label="t('密码')"
               type="password"
-              variant="outlined"
+              variant="filled"
               density="comfortable"
               :placeholder="editing ? t('留空 = 不修改') : ''"
               :required="!editing"
@@ -1114,22 +1114,22 @@ onMounted(() => {
             />
             <v-row dense class="mb-2">
               <v-col cols="12" sm="6">
-                <v-text-field v-model="form.imap_host" :label="t('IMAP 服务器')" variant="outlined" density="comfortable" placeholder="imap.example.com" required hide-details />
+                <v-text-field v-model="form.imap_host" :label="t('IMAP 服务器')" variant="filled" density="comfortable" placeholder="imap.example.com" required hide-details />
               </v-col>
               <v-col cols="6" sm="3">
-                <v-text-field v-model.number="form.imap_port" :label="t('端口')" type="number" variant="outlined" density="comfortable" required hide-details />
+                <v-text-field v-model.number="form.imap_port" :label="t('端口')" type="number" variant="filled" density="comfortable" required hide-details />
               </v-col>
               <v-col cols="6" sm="3">
-                <v-select v-model="form.imap_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
+                <v-select v-model="form.imap_tls" :items="tlsItems" :label="t('加密')" variant="filled" density="comfortable" hide-details />
               </v-col>
               <v-col cols="12" sm="6">
-                <v-text-field v-model="form.smtp_host" :label="t('SMTP 服务器')" variant="outlined" density="comfortable" placeholder="smtp.example.com" required hide-details />
+                <v-text-field v-model="form.smtp_host" :label="t('SMTP 服务器')" variant="filled" density="comfortable" placeholder="smtp.example.com" required hide-details />
               </v-col>
               <v-col cols="6" sm="3">
-                <v-text-field v-model.number="form.smtp_port" :label="t('端口')" type="number" variant="outlined" density="comfortable" required hide-details />
+                <v-text-field v-model.number="form.smtp_port" :label="t('端口')" type="number" variant="filled" density="comfortable" required hide-details />
               </v-col>
               <v-col cols="6" sm="3">
-                <v-select v-model="form.smtp_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="comfortable" hide-details />
+                <v-select v-model="form.smtp_tls" :items="tlsItems" :label="t('加密')" variant="filled" density="comfortable" hide-details />
               </v-col>
             </v-row>
             <v-switch v-model="form.tls_skip_verify" :label="t('跳过证书校验')" color="primary" hide-details class="mb-2" />
@@ -1166,7 +1166,7 @@ onMounted(() => {
           v-model="rcForm.password"
           :label="t('登录密码')"
           type="password"
-          variant="outlined"
+          variant="filled"
           density="comfortable"
           class="mb-2"
         />
@@ -1174,7 +1174,7 @@ onMounted(() => {
           v-model="rcForm.mailbox_password"
           :label="t('邮箱密码（可选）')"
           type="password"
-          variant="outlined"
+          variant="filled"
           density="comfortable"
           :placeholder="t('留空 = 与登录密码相同')"
           class="mb-2"
@@ -1183,7 +1183,7 @@ onMounted(() => {
           v-if="rcNeedsTotp"
           v-model="rcForm.totp"
           :label="t('两步验证码')"
-          variant="outlined"
+          variant="filled"
           density="comfortable"
           class="mb-2"
         />

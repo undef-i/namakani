@@ -65,6 +65,45 @@ const settingsOpen = ref(location.hash === '#/settings')
 const scope = ref('inbox')
 const selected = ref(null)
 const detail = ref(null)
+const barTitleShow = ref(false)
+const barTitleText = computed(() => {
+  if (selected.value) return selected.value.subject || t('(无主题)')
+  if (convo.value) return convo.value.subject || t('(无主题)')
+  return ''
+})
+let subjObserver = null
+let subjEl = null
+function observeSubject(el, root) {
+  subjObserver = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) barTitleShow.value = !e.isIntersecting
+    },
+    { root, threshold: 0 },
+  )
+  subjObserver.observe(el)
+}
+function setSubjectEl(el) {
+  if (el === subjEl) return
+  if (subjObserver) {
+    subjObserver.disconnect()
+    subjObserver = null
+  }
+  subjEl = el
+  barTitleShow.value = false
+  if (!el) return
+  const host = el.closest('.reader-scroll')
+  const root = host ? host.querySelector('[data-overlayscrollbars-viewport]') : null
+  if (root) {
+    observeSubject(el, root)
+    return
+  }
+  requestAnimationFrame(() => {
+    if (subjEl !== el || subjObserver) return
+    const h2 = el.closest('.reader-scroll')
+    const r2 = h2 ? h2.querySelector('[data-overlayscrollbars-viewport]') : null
+    observeSubject(el, r2)
+  })
+}
 const detailState = ref('idle')
 const detailError = ref('')
 const actionError = ref('')
@@ -1874,7 +1913,7 @@ onBeforeUnmount(() => {
     </template>
 
     <template v-else>
-      <v-app-bar height="64" flat class="app-topbar">
+      <v-app-bar flat class="app-topbar">
         <div v-if="lgAndUp" class="topbar-desktop">
           <v-btn icon="mdi-menu" variant="text" :aria-label="t('展开菜单')" @click="toggleDrawer" />
           <span v-if="wideDesktop" class="topbar-title">Namakani</span>
@@ -1956,10 +1995,9 @@ onBeforeUnmount(() => {
           <v-list v-if="accounts.length > 1" density="compact" nav>
             <v-list-item :title="rangeId ? (rangeAccount?.label || rangeAccount?.email) : t('全部账号')">
               <template #append>
-                <v-menu>
-                  <template #activator="{ props: mp }">
-                    <v-btn v-bind="mp" icon="mdi-chevron-down" size="x-small" variant="text" :aria-label="t('切换范围')" />
-                  </template>
+                <v-icon icon="mdi-chevron-down" size="x-small" />
+              </template>
+              <v-menu activator="parent">
                   <v-list density="compact">
                     <v-list-item :title="t('全部账号')" :active="rangeId === 0" @click="setRange(0)" />
                     <v-list-item
@@ -1970,8 +2008,7 @@ onBeforeUnmount(() => {
                       @click="setRange(a.id)"
                     />
                   </v-list>
-                </v-menu>
-              </template>
+              </v-menu>
             </v-list-item>
           </v-list>
 
@@ -2410,17 +2447,17 @@ onBeforeUnmount(() => {
               <div v-if="!lgAndUp" class="reader-head">
                 <v-btn
                   icon="mdi-arrow-left"
-                  size="small"
                   variant="text"
                   :aria-label="t('返回')"
                   @click="leaveReader"
                 />
+                <span v-if="barTitleShow" class="reader-bar-title text-truncate">{{ barTitleText }}</span>
                 <v-spacer />
               </div>
               <div class="reader-scroll">
                 <div data-overlayscrollbars-viewport class="reader-vp">
                   <div data-overlayscrollbars-content class="px-3 pb-3 px-sm-4 pb-sm-4">
-                <h2 class="text-h6 font-weight-bold mb-1" style="overflow-wrap: anywhere">
+                <h2 :ref="setSubjectEl" class="text-h6 font-weight-bold mb-1" style="overflow-wrap: anywhere">
                   {{ convo.subject || t('(无主题)') }}
                 </h2>
                 <p class="text-caption text-medium-emphasis mb-3">{{ t('共 {n} 封', { n: convo.msgs.length }) }}</p>
@@ -2555,11 +2592,11 @@ onBeforeUnmount(() => {
               <div v-if="!lgAndUp" class="reader-head">
                 <v-btn
                   icon="mdi-arrow-left"
-                  size="small"
                   variant="text"
                   :aria-label="t('返回')"
                   @click="leaveReader"
                 />
+                <span v-if="barTitleShow" class="reader-bar-title text-truncate">{{ barTitleText }}</span>
                 <v-spacer />
               </div>
               <div v-if="lgAndUp" class="reader-toolbar">
@@ -2595,6 +2632,7 @@ onBeforeUnmount(() => {
                   :aria-label="t('下一封')"
                   @click="openNeighbor(1)"
                 />
+                <span v-if="barTitleShow" class="reader-bar-title text-truncate">{{ barTitleText }}</span>
                 <v-spacer />
                 <v-btn icon="mdi-printer" variant="text" size="small" :disabled="!detail?.html" :aria-label="t('打印')" @click="printSelected" />
               </div>
@@ -2603,7 +2641,7 @@ onBeforeUnmount(() => {
                   <div data-overlayscrollbars-content class="px-3 pb-3 px-sm-4 pb-sm-4">
               <template v-if="lgAndUp">
                 <div class="reader-head-block">
-                  <h2 class="reader-subject">{{ selected.subject || t('(无主题)') }}</h2>
+                  <h2 :ref="setSubjectEl" class="reader-subject">{{ selected.subject || t('(无主题)') }}</h2>
                   <div class="reader-from-row">
                     <v-avatar :color="avatarColor(selected.from_email)" size="40" class="flex-none">
                       <span class="avatar-letter" style="font-size: 16px">{{ avatarLetter(selected) }}</span>
@@ -2632,7 +2670,7 @@ onBeforeUnmount(() => {
                 </div>
               </template>
               <template v-else>
-              <h2 class="text-h6 font-weight-bold mb-2" style="overflow-wrap: anywhere">
+              <h2 :ref="setSubjectEl" class="text-h6 font-weight-bold mb-2" style="overflow-wrap: anywhere">
                 {{ selected.subject || t('(无主题)') }}
               </h2>
               <div class="meta-grid text-body-2 mb-3">
@@ -2782,8 +2820,8 @@ onBeforeUnmount(() => {
 
       <v-dialog v-model="settingsOpen" :z-index="settingsZ" :fullscreen="!lgAndUp" :max-width="lgAndUp ? 1080 : 920" scrollable @update:model-value="(v) => { if (!v) closeSettings() }">
         <v-card class="settings-card" :style="lgAndUp ? { height: 'min(760px, calc(100dvh - 48px))' } : undefined">
-          <v-toolbar density="compact" color="transparent">
-            <v-btn :icon="lgAndUp ? 'mdi-close' : 'mdi-arrow-left'" size="small" variant="text" :aria-label="lgAndUp ? t('关闭') : t('返回')" @click="closeSettings()" />
+          <v-toolbar color="transparent">
+            <v-btn :icon="lgAndUp ? 'mdi-close' : 'mdi-arrow-left'" variant="text" :aria-label="lgAndUp ? t('关闭') : t('返回')" @click="closeSettings()" />
             <v-toolbar-title>{{ t('设置') }}</v-toolbar-title>
           </v-toolbar>
           <v-card-text class="pa-0">
@@ -3323,6 +3361,7 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .reader-overlay,
   .reader-body-block,
+  .reader-bar-title,
   .compose-root,
   .compose-root-mobile {
     animation: none !important;
@@ -3446,6 +3485,25 @@ body {
   align-items: center;
   flex: none;
   padding: 6px 6px 0;
+}
+.reader-bar-title {
+  font-size: 15px;
+  font-weight: 500;
+  min-width: 0;
+  margin-left: 2px;
+  animation: bar-title-in 0.18s ease-out;
+}
+.reader-toolbar .reader-bar-title {
+  margin-left: 8px;
+}
+@keyframes bar-title-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+  }
 }
 .reader-scroll {
   flex: 1 1 auto;

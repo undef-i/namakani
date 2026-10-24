@@ -41,7 +41,7 @@ async function submit() {
             v-model="password"
             :label="t('密码')"
             type="password"
-            variant="outlined"
+            variant="filled"
             :autocomplete="mode === 'setup' ? 'new-password' : 'current-password'"
             required
             class="mb-2"
@@ -51,7 +51,7 @@ async function submit() {
             v-model="confirm"
             :label="t('再次输入')"
             type="password"
-            variant="outlined"
+            variant="filled"
             autocomplete="new-password"
             required
             class="mb-2"

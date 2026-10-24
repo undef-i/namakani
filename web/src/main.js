@@ -12,6 +12,13 @@ import { initScrollbars } from './scrollbars.js'
 import { lang } from './i18n'
 
 const vuetify = createVuetify({
+  defaults: {
+    VTextField: { variant: 'filled' },
+    VTextarea: { variant: 'filled' },
+    VSelect: { variant: 'filled' },
+    VAutocomplete: { variant: 'filled' },
+    VCombobox: { variant: 'filled' },
+  },
   locale: {
     locale: lang.value === 'zh' ? 'zhHans' : 'en',
     fallback: 'en',
