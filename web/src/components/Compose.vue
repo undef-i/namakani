@@ -35,13 +35,15 @@ const open = computed({
 const vvStyle = ref({})
 let vvAttached = false
 let vvRaf = 0
+let vvTop = 0
 function syncVV() {
   if (vvRaf) return
   vvRaf = requestAnimationFrame(() => {
     vvRaf = 0
     const vv = window.visualViewport
     if (!vv) return
-    vvStyle.value = { top: vv.offsetTop + 'px', height: vv.height + 'px' }
+    if (Math.abs(vv.offsetTop - vvTop) >= 8) vvTop = vv.offsetTop
+    vvStyle.value = { top: vvTop + 'px', height: vv.height + 'px' }
   })
 }
 function attachVV() {
@@ -61,6 +63,7 @@ function detachVV() {
     vvRaf = 0
   }
   vvStyle.value = {}
+  vvTop = 0
 }
 const shown = ref(false)
 const draftLoading = ref(false)
@@ -1222,6 +1225,7 @@ function onKeydown(e) {
 }
 .compose-root-mobile {
   inset: 0;
+  height: 100dvh;
   width: auto;
   max-width: none;
   animation: compose-in-m 0.28s cubic-bezier(0.32, 0.72, 0, 1);

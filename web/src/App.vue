@@ -421,7 +421,8 @@ async function loadMessages(soft = false) {
     clearSelectionIds()
     newMailPending.value = 0
   }
-  const keepReady = soft && listStatus.value === 'ready'
+  const keepReady =
+    (soft || target.kind === 'search') && listStatus.value === 'ready' && messages.value.length > 0
   if (!keepReady) listStatus.value = 'loading'
   listError.value = ''
   listOffset = 0
@@ -2035,7 +2036,7 @@ onBeforeUnmount(() => {
               <div class="list-head">
                 <h1 class="list-head-title text-truncate">
                   {{ listHeadTitle }}
-                  <span v-if="listStatus === 'loading'" class="head-skel" />
+                  <span v-if="listBusy" class="head-skel" />
                 </h1>
                 <v-btn
                   v-if="listSnap.kind === 'search'"
