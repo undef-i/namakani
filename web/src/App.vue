@@ -2745,9 +2745,9 @@ onBeforeUnmount(() => {
       <v-dialog v-model="settingsOpen" :z-index="settingsZ" :fullscreen="!lgAndUp" :max-width="lgAndUp ? 1080 : 920" scrollable @update:model-value="(v) => { if (!v) closeSettings() }">
         <v-card class="settings-card" :style="lgAndUp ? { height: 'min(760px, calc(100dvh - 48px))' } : undefined">
           <v-card-title class="d-flex align-center">
+            <v-btn :icon="lgAndUp ? 'mdi-close' : 'mdi-arrow-left'" size="small" variant="text" :aria-label="lgAndUp ? t('关闭') : t('返回')" @click="closeSettings()" />
             {{ t('设置') }}
             <v-spacer />
-            <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" @click="closeSettings()" />
           </v-card-title>
           <v-card-text class="pa-0">
             <Accounts

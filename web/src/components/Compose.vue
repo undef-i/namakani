@@ -778,7 +778,8 @@ function onKeydown(e) {
   >
     <v-card class="compose-card">
       <div class="compose-head">
-        <span class="text-body-2 font-weight-medium">{{ title }}</span>
+        <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" :disabled="sending" @click.stop="closeCompose" />
+        <span class="text-body-2 font-weight-medium ml-1">{{ title }}</span>
         <v-spacer />
         <v-btn
           v-if="lgAndUp"
@@ -800,7 +801,37 @@ function onKeydown(e) {
         >
           <v-icon :icon="maximized ? 'mdi-arrow-collapse' : 'mdi-arrow-expand'" />
         </v-btn>
-        <v-btn icon="mdi-close" size="small" variant="text" :aria-label="t('关闭')" :disabled="sending" @click.stop="closeCompose" />
+        <v-btn-group color="primary" variant="elevated" density="comfortable" class="ml-2">
+          <v-btn prepend-icon="mdi-send" :disabled="busy" :loading="sending" @click="doSend">
+            {{ sending ? t('发送中') : t('发送') }}
+          </v-btn>
+          <v-menu v-model="schedMenu" :close-on-content-click="false" location="bottom end" z-index="2600">
+            <template #activator="{ props: mp }">
+              <v-btn v-bind="mp" icon="mdi-chevron-down" :disabled="busy" :aria-label="t('定时发送')" />
+            </template>
+            <v-card width="280" class="pa-2">
+              <v-list density="compact">
+                <v-list-item :title="t('1 小时后')" @click="scheduleOption('h1')" />
+                <v-list-item :title="t('今晚 20:00')" @click="scheduleOption('tonight')" />
+                <v-list-item :title="t('明早 08:00')" @click="scheduleOption('tomorrow')" />
+                <v-list-item :title="t('自定义时间')" @click="schedCustom = true" />
+              </v-list>
+              <template v-if="schedCustom">
+                <v-text-field
+                  v-model="schedWhen"
+                  type="datetime-local"
+                  density="compact"
+                  variant="outlined"
+                  hide-details
+                  class="ma-2"
+                />
+                <v-btn block color="primary" size="small" class="mb-1" @click="scheduleCustomGo">
+                  {{ t('安排发送') }}
+                </v-btn>
+              </template>
+            </v-card>
+          </v-menu>
+        </v-btn-group>
       </div>
 
       <v-card-text v-if="done && !minimized">
@@ -1128,37 +1159,6 @@ function onKeydown(e) {
             <v-icon icon="mdi-trash-can-outline" />
             <v-tooltip activator="parent" location="top">{{ t('删除草稿') }}</v-tooltip>
           </v-btn>
-          <v-btn-group color="primary" variant="elevated" density="comfortable" class="ml-2">
-            <v-btn prepend-icon="mdi-send" :disabled="busy" :loading="sending" @click="doSend">
-              {{ sending ? t('发送中') : t('发送') }}
-            </v-btn>
-            <v-menu v-model="schedMenu" :close-on-content-click="false" location="top end" z-index="2600">
-              <template #activator="{ props: mp }">
-                <v-btn v-bind="mp" icon="mdi-chevron-down" :disabled="busy" :aria-label="t('定时发送')" />
-              </template>
-              <v-card width="280" class="pa-2">
-                <v-list density="compact">
-                  <v-list-item :title="t('1 小时后')" @click="scheduleOption('h1')" />
-                  <v-list-item :title="t('今晚 20:00')" @click="scheduleOption('tonight')" />
-                  <v-list-item :title="t('明早 08:00')" @click="scheduleOption('tomorrow')" />
-                  <v-list-item :title="t('自定义时间')" @click="schedCustom = true" />
-                </v-list>
-                <template v-if="schedCustom">
-                  <v-text-field
-                    v-model="schedWhen"
-                    type="datetime-local"
-                    density="compact"
-                    variant="outlined"
-                    hide-details
-                    class="ma-2"
-                  />
-                  <v-btn block color="primary" size="small" class="mb-1" @click="scheduleCustomGo">
-                    {{ t('安排发送') }}
-                  </v-btn>
-                </template>
-              </v-card>
-            </v-menu>
-          </v-btn-group>
         </v-card-actions>
       </div>
 
@@ -1266,7 +1266,7 @@ function onKeydown(e) {
   display: flex;
   align-items: center;
   flex: none;
-  padding: 6px 8px 6px 16px;
+  padding: 6px 8px;
   background: rgba(var(--v-theme-on-surface), 0.06);
   border-radius: inherit;
 }
