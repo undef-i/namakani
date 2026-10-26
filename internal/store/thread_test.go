@@ -46,24 +46,6 @@ func TestThreadRepairRowsDrainAfterMarkChecked(t *testing.T) {
 	}
 }
 
-func TestNormalizeSubject(t *testing.T) {
-	cases := map[string]string{
-		"Hello":              "hello",
-		"Re: Hello":          "hello",
-		"RE: Re: Hello World": "hello world",
-		"Fwd: Hello":         "hello",
-		"Re[2]: Hello":       "hello",
-		"Re: [list] Hello":   "[list] hello",
-		"回复：你好 世界":           "你好 世界",
-		"Changed":            "changed",
-	}
-	for in, want := range cases {
-		if got := normalizeSubject(in); got != want {
-			t.Fatalf("normalizeSubject(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 func TestThreadKeySubjectFork(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

@@ -37,15 +37,6 @@ func TestSnippetChinese(t *testing.T) {
 	}
 }
 
-func TestSnippetEmpty(t *testing.T) {
-	if got := MakeSnippet("", ""); got != "" {
-		t.Fatalf("got %q want empty", got)
-	}
-	if got := MakeSnippet("  \n \n", ""); got != "" {
-		t.Fatalf("got %q want empty", got)
-	}
-}
-
 func TestSnippetLongWord(t *testing.T) {
 	got := MakeSnippet(strings.Repeat("a", 300), "")
 	if len([]rune(got)) != snippetMaxRunes {

@@ -24,9 +24,9 @@ func e2eCount(t *testing.T, st *store.Store, query string, args ...any) int {
 }
 
 func TestSyncFolderCondStoreDeletionReconcile(t *testing.T) {
-	addr := os.Getenv("WM_E2E_IMAP_ADDR")
+	addr := os.Getenv("NAMAKANI_E2E_IMAP_ADDR")
 	if addr == "" {
-		t.Skip("WM_E2E_IMAP_ADDR not set")
+		t.Skip("NAMAKANI_E2E_IMAP_ADDR not set")
 	}
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -39,11 +39,11 @@ func TestSyncFolderCondStoreDeletionReconcile(t *testing.T) {
 	acct := mail.Account{
 		ID:       1,
 		Kind:     "imap",
-		Email:    os.Getenv("WM_E2E_USER"),
+		Email:    os.Getenv("NAMAKANI_E2E_USER"),
 		ImapHost: host,
 		ImapPort: port,
-		Username: os.Getenv("WM_E2E_USER"),
-		Password: os.Getenv("WM_E2E_PASS"),
+		Username: os.Getenv("NAMAKANI_E2E_USER"),
+		Password: os.Getenv("NAMAKANI_E2E_PASS"),
 	}
 	st, err := store.Open(filepath.Join(t.TempDir(), "namakani.db"))
 	if err != nil {

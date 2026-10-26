@@ -317,7 +317,7 @@ function dropIntent(intent) {
   touchIntents()
 }
 
-const OB_STORE_KEY = 'wm_outbox_v1'
+const OB_STORE_KEY = 'namakani_outbox_v1'
 let obList = []
 const obLive = new Map()
 api.setFlushHook(() => {
@@ -1020,9 +1020,9 @@ function clearSelection() {
 }
 const frameEl = ref(null)
 const drawerOpen = ref(false)
-const navHidden = ref(localStorage.getItem('wm_nav_hidden') === '1')
+const navHidden = ref(localStorage.getItem('namakani_nav_hidden') === '1')
 const wideDesktop = computed(() => display.width.value >= 1440)
-const rangeId = ref(parseInt(localStorage.getItem('wm_range') ?? '0', 10) || 0)
+const rangeId = ref(parseInt(localStorage.getItem('namakani_range') ?? '0', 10) || 0)
 const rangeAccount = computed(() => accounts.value.find((a) => a.id === rangeId.value) ?? null)
 const activeFolder = computed(() => {
   if (!rangeId.value) return null
@@ -1039,7 +1039,7 @@ watch(lgAndUp, (up) => {
 function setRange(id) {
   if (rangeId.value === id) return
   rangeId.value = id
-  localStorage.setItem('wm_range', String(id))
+  localStorage.setItem('namakani_range', String(id))
   clearSelection()
   loadMessages()
 }
@@ -1062,7 +1062,7 @@ const convoTr = ref({})
 const cursorIdx = ref(0)
 const cursorActive = ref(false)
 const helpOpen = ref(false)
-const listWidth = ref(parseInt(localStorage.getItem('wm_list_width') ?? '0', 10) || 0)
+const listWidth = ref(parseInt(localStorage.getItem('namakani_list_width') ?? '0', 10) || 0)
 const listWidthVal = computed(() => {
   if (listWidth.value) return Math.min(520, Math.max(320, listWidth.value))
   return display.width.value >= 1280 && display.width.value < 1440 ? 340 : 400
@@ -1079,13 +1079,13 @@ function onListDragMove(e) {
 }
 function onListDragEnd() {
   window.removeEventListener('pointermove', onListDragMove)
-  if (listWidth.value) localStorage.setItem('wm_list_width', String(Math.round(listWidth.value)))
+  if (listWidth.value) localStorage.setItem('namakani_list_width', String(Math.round(listWidth.value)))
   listDrag = null
 }
-const listDensity = ref(localStorage.getItem('wm_list_density') === 'compact' ? 'compact' : 'standard')
+const listDensity = ref(localStorage.getItem('namakani_list_density') === 'compact' ? 'compact' : 'standard')
 function setDensity(v) {
   listDensity.value = v
-  localStorage.setItem('wm_list_density', v)
+  localStorage.setItem('namakani_list_density', v)
 }
 const selectedIds = ref(new Set())
 const selectionActive = computed(() => selectedIds.value.size > 0)
@@ -1432,11 +1432,6 @@ function closeMobileSearch() {
   mobileSearch.value = false
   clearSearch()
 }
-function accountShort(m) {
-  const s = m.account_label || ''
-  const at = s.indexOf('@')
-  return at >= 0 ? s.slice(at + 1) : s
-}
 const listEl = ref(null)
 const searchEl = ref(null)
 let pendingReply = false
@@ -1579,12 +1574,12 @@ function applyTheme() {
 function setThemeMode(v) {
   if (!['system', 'light', 'dark'].includes(v)) return
   themeMode.value = v
-  localStorage.setItem('wm_theme_mode', v)
+  localStorage.setItem('namakani_theme_mode', v)
   applyTheme()
 }
 
 function initTheme() {
-  const stored = localStorage.getItem('wm_theme_mode')
+  const stored = localStorage.getItem('namakani_theme_mode')
   themeMode.value = ['system', 'light', 'dark'].includes(stored) ? stored : 'system'
   systemDarkMQ = window.matchMedia('(prefers-color-scheme: dark)')
   systemDarkMQ.addEventListener('change', applyTheme)
@@ -2997,11 +2992,11 @@ async function checkVersion() {
   try {
     const st = await api.getState()
     if (!st.version || !appVersion.value || st.version === appVersion.value) return
-    if (sessionStorage.getItem('wm_reloaded_for') === st.version) {
+    if (sessionStorage.getItem('namakani_reloaded_for') === st.version) {
       appVersion.value = st.version
       return
     }
-    sessionStorage.setItem('wm_reloaded_for', st.version)
+    sessionStorage.setItem('namakani_reloaded_for', st.version)
     location.reload()
   } catch {
   }
@@ -3430,7 +3425,7 @@ function onHashChange() {
   }
   if (route.scope !== scope.value && route.account !== rangeId.value) {
     rangeId.value = route.account
-    localStorage.setItem('wm_range', String(route.account))
+    localStorage.setItem('namakani_range', String(route.account))
     selectScope(route.scope)
   } else if (route.scope !== scope.value) {
     selectScope(route.scope)
@@ -4348,7 +4343,7 @@ function menuRipple(e) {
 function toggleDrawer() {
   if (lgAndUp.value) {
     navHidden.value = !navHidden.value
-    localStorage.setItem('wm_nav_hidden', navHidden.value ? '1' : '0')
+    localStorage.setItem('namakani_nav_hidden', navHidden.value ? '1' : '0')
     drawerOpen.value = !navHidden.value
     return
   }
@@ -4387,7 +4382,7 @@ async function enter(st, deepId = 0) {
     scope.value = r0.scope
     if (r0.account !== rangeId.value) {
       rangeId.value = r0.account
-      localStorage.setItem('wm_range', String(r0.account))
+      localStorage.setItem('namakani_range', String(r0.account))
     }
   } else if (r0.type === 'search') {
     searchQuery.value = r0.query
@@ -4396,8 +4391,8 @@ async function enter(st, deepId = 0) {
   const did = deepId || initialDeepId
   if (st && st.app_settings) maxAttachmentMB.value = st.app_settings.max_attachment_mb
   if (st && typeof st.attention === 'number') attentionCount.value = st.attention
-  threaded.value = localStorage.getItem('wm_threaded') === '1'
-  const storedUndo = parseInt(localStorage.getItem('wm_undo_seconds') ?? '', 10)
+  threaded.value = localStorage.getItem('namakani_threaded') === '1'
+  const storedUndo = parseInt(localStorage.getItem('namakani_undo_seconds') ?? '', 10)
   if ([0, 5, 10, 20, 30].includes(storedUndo)) undoSeconds.value = storedUndo
   await refreshAccounts()
   connectEvents()
@@ -4491,7 +4486,7 @@ function onSessionsRevoked() {
 
 function onThreadedChange(v) {
   threaded.value = v
-  localStorage.setItem('wm_threaded', v ? '1' : '0')
+  localStorage.setItem('namakani_threaded', v ? '1' : '0')
   if (!searching.value) loadMessages()
 }
 
@@ -4501,7 +4496,7 @@ function onAppSettings(s) {
 
 function onUndoSecondsChange(v) {
   undoSeconds.value = v
-  localStorage.setItem('wm_undo_seconds', String(v))
+  localStorage.setItem('namakani_undo_seconds', String(v))
 }
 
 const online = ref(navigator.onLine)
@@ -5007,9 +5002,6 @@ onBeforeUnmount(() => {
                         <span class="row-sender" :class="{ w700: !(m.flags & 1) }">
                           {{ m.from_name || m.from_email || t('(未知发件人)') }}
                         </span>
-                        <v-chip v-if="listDensity === 'compact'" class="row-chip" size="x-small" variant="flat" color="primary-container">
-                          {{ accountShort(m) }}
-                        </v-chip>
                         <span
                           v-if="threaded && !searching && (m.thread_count ?? 1) > 1"
                           class="row-thread"
@@ -5026,12 +5018,12 @@ onBeforeUnmount(() => {
                       </div>
                       <div v-if="listDensity === 'standard'" class="row-l3">
                         <span class="row-snippet">{{ m.snippet }}</span>
-                        <v-chip class="row-chip" size="x-small" variant="flat" color="primary-container">
-                          {{ accountShort(m) }}
-                        </v-chip>
                         <v-chip v-if="m.has_attach" class="row-chip" size="x-small" variant="outlined" prepend-icon="mdi-paperclip">
                           {{ t('附件') }}
                         </v-chip>
+                      </div>
+                      <div class="row-acct">
+                        {{ m.account_label }}<template v-if="searching">{{ t('，') }}{{ m.folder_name }}</template>
                       </div>
                     </div>
                   </div>
@@ -5801,6 +5793,9 @@ body {
   display: flex;
   flex-direction: column;
 }
+.v-dialog--scrollable > .v-overlay__content > .settings-card {
+  flex: none;
+}
 .settings-card > .v-card-text {
   flex: 1;
   min-height: 0;
@@ -6002,7 +5997,7 @@ body {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  height: 84px;
+  height: 105px;
   padding: 10px 12px;
   cursor: pointer;
   background: rgb(var(--v-theme-surface-container-low));
@@ -6134,8 +6129,16 @@ body {
 .row-chip {
   flex: none;
 }
+.row-acct {
+  font-size: 12px;
+  line-height: 20px;
+  color: rgb(var(--v-theme-on-surface-variant));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .density-compact .mail-row-d {
-  height: 64px;
+  height: 85px;
   padding: 8px 12px;
   border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
 }

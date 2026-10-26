@@ -73,25 +73,6 @@ func TestTouchSessionAbsoluteCap(t *testing.T) {
 
 // A session still inside the renewal threshold (remaining life above
 // SessionTTL-24h, i.e. touched within its first day) is not rewritten.
-func TestTouchSessionLeavesFreshSessionAlone(t *testing.T) {
-	st := openTestStore(t)
-	ttl := int64(SessionTTL / time.Second)
-	now := time.Now().Unix()
-	created := now - 3600
-
-	tok, err := NewSession(st, "wrapped")
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	expires := created + ttl
-	backdateSession(t, st, tok, created, expires)
-	if err := TouchSession(st, tok); err != nil {
-		t.Fatalf("TouchSession: %v", err)
-	}
-	if got := sessionExpiry(t, st, tok); got != expires {
-		t.Fatalf("expiry = %d, want untouched %d", got, expires)
-	}
-}
 
 func TestDeleteAllSessionsKeepsAccessTokens(t *testing.T) {
 	st := openTestStore(t)

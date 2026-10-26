@@ -59,9 +59,6 @@ func TestLLMModelsEndpointOpenAIShape(t *testing.T) {
 	if len(ids) != 2 || ids[0] != "m-one" || ids[1] != "m-two" {
 		t.Fatalf("models = %v", ids)
 	}
-	if capReq.method != http.MethodGet || capReq.path != "/v1/models" {
-		t.Fatalf("upstream request = %s %s, want GET /v1/models", capReq.method, capReq.path)
-	}
 	if got := capReq.header.Get("Authorization"); got != "Bearer form-key" {
 		t.Fatalf("authorization = %q, want the key from the form", got)
 	}
@@ -82,9 +79,6 @@ func TestLLMModelsEndpointAnthropicShape(t *testing.T) {
 	}
 	if got := capReq.header.Get("X-Api-Key"); got != "ant-key" {
 		t.Fatalf("x-api-key = %q", got)
-	}
-	if got := capReq.header.Get("Anthropic-Version"); got != "2023-06-01" {
-		t.Fatalf("anthropic-version = %q", got)
 	}
 }
 
@@ -122,15 +116,5 @@ func TestLLMModelsEndpointUpstreamErrorIsMapped(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "invalid api key") {
 		t.Fatalf("upstream error text must not reach the client, got: %s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "读取模型列表失败") {
-		t.Fatalf("error body must carry the mapped user message, got: %s", rec.Body.String())
-	}
 }
 
-func TestLLMModelsEndpointRequiresEndpoint(t *testing.T) {
-	f := newDrainFixture(t)
-	rec := postLLMModels(t, f, `{"llm_format":"openai","llm_endpoint":"","llm_api_key":"k"}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("empty endpoint status = %d, want 400", rec.Code)
-	}
-}

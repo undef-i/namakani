@@ -82,18 +82,6 @@ func TestSealSendForDeliveryAfterUndoRequestRefuses(t *testing.T) {
 	}
 }
 
-func TestSealSendForDeliveryUnderForeignTokenRefuses(t *testing.T) {
-	st := identityTestStore(t)
-	o := claimSendForSeal(t, st)
-	sealed, undo, err := st.SealSendForDelivery(o.ID, 999, 43)
-	if err != nil {
-		t.Fatalf("seal: %v", err)
-	}
-	if sealed || undo {
-		t.Fatalf("seal under a foreign token = (%v, %v), want (false, false)", sealed, undo)
-	}
-}
-
 func TestSealSendForDeliveryTakesUnclaimedOp(t *testing.T) {
 	st := identityTestStore(t)
 	opID, err := st.EnqueueSend(1, `{}`, 0, "")

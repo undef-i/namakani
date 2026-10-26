@@ -12,7 +12,7 @@ import (
 
 func sessionReq(token string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
-	req.AddCookie(&http.Cookie{Name: "wm_session", Value: token})
+	req.AddCookie(&http.Cookie{Name: "namakani_session", Value: token})
 	return req
 }
 

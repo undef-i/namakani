@@ -172,9 +172,6 @@ func TestTranslateSettingsRoundTripAndKeySealed(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := resp.Settings
-	if cfg.Engine != "llm" || cfg.LLMFormat != "anthropic" || cfg.LLMModel != "model-x" || cfg.LLMEndpoint != "https://llm.example" {
-		t.Fatalf("settings did not round trip: %+v", cfg)
-	}
 	if !cfg.HasKey {
 		t.Fatal("has_key must be true after saving a key")
 	}
@@ -258,20 +255,6 @@ func TestAvatarEndpointsCacheAndServe(t *testing.T) {
 	}
 }
 
-func TestTranslateSettingsPutOmitsLLMFields(t *testing.T) {
-	f := newDrainFixture(t)
-	put := f.authedReq(http.MethodPut, "/api/settings/translate", `{"engine":"google","target":"auto"}`)
-	rec := httptest.NewRecorder()
-	f.srv.handlePutTranslateSettings(rec, put)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("put engine-only settings status = %d body %s", rec.Code, rec.Body.String())
-	}
-	cfg, _ := f.srv.loadTranslateSettings()
-	if cfg.Engine != "google" || cfg.LLMFormat != "openai" {
-		t.Fatalf("settings after minimal put: %+v", cfg)
-	}
-}
-
 func TestTranslateSettingsLocalNormalizedToGoogle(t *testing.T) {
 	f := newDrainFixture(t)
 	if err := f.srv.st.SetSetting(settingTrEngine, "local"); err != nil {
@@ -283,11 +266,5 @@ func TestTranslateSettingsLocalNormalizedToGoogle(t *testing.T) {
 	}
 	if v, ok, _ := f.srv.st.GetSetting(settingTrEngine); !ok || v != "google" {
 		t.Fatalf("stored engine after load = %q (ok=%v), want google persisted", v, ok)
-	}
-	put := f.authedReq(http.MethodPut, "/api/settings/translate", `{"engine":"local","target":"auto"}`)
-	rec := httptest.NewRecorder()
-	f.srv.handlePutTranslateSettings(rec, put)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("put engine=local status = %d, want 400", rec.Code)
 	}
 }

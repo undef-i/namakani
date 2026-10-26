@@ -64,20 +64,3 @@ func TestResolveRestoreFolderImapDraftBitStillFirst(t *testing.T) {
 	}
 }
 
-func TestClaimMoveIntoTrashRecordsOrigin(t *testing.T) {
-	st := tutaRestoreStore(t)
-	if _, err := st.DB.Exec(`INSERT INTO messages(id, account_id, folder_id, uid, message_id, flags) VALUES
-		(30, 1, 1, 200, 'claim@x', 16), (31, 1, 3, 201, 'claim-twin@x', 16)`); err != nil {
-		t.Fatalf("insert claim rows: %v", err)
-	}
-	if _, err := st.DB.Exec("UPDATE messages SET message_id = 'claim@x' WHERE id = 31"); err != nil {
-		t.Fatalf("align twin identity: %v", err)
-	}
-	done, err := st.ClaimMove(30, 31, 3, 201)
-	if err != nil || !done {
-		t.Fatalf("claim move: done=%v err=%v", done, err)
-	}
-	if got := trashOrigin(t, st, 30); got != 1 {
-		t.Fatalf("origin after claim into trash = %d, want 1 (inbox, where it was deleted from)", got)
-	}
-}

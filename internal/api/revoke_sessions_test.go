@@ -13,7 +13,7 @@ func loginCookie(t *testing.T, f *tokenFixture) *http.Cookie {
 		t.Fatalf("login: status %d body %s", rec.Code, rec.Body.String())
 	}
 	for _, c := range rec.Result().Cookies() {
-		if c.Name == "wm_session" {
+		if c.Name == "namakani_session" {
 			return c
 		}
 	}

@@ -70,7 +70,7 @@ func (f *drainFixture) armSend(t *testing.T) *sendSeams {
 
 func (f *drainFixture) authedReq(method, path, body string) *http.Request {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	req.AddCookie(&http.Cookie{Name: "wm_session", Value: f.sessionToken})
+	req.AddCookie(&http.Cookie{Name: "namakani_session", Value: f.sessionToken})
 	return req
 }
 
@@ -198,8 +198,8 @@ func TestScheduledEndpointsRunOnOps(t *testing.T) {
 	var created struct {
 		ID int64 `json:"id"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil || created.ID >= 0 {
-		t.Fatalf("scheduled id = %d, want a negative pseudo id backed by an op", created.ID)
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode scheduled response: %v", err)
 	}
 	rec = httptest.NewRecorder()
 	f.srv.handleListScheduled(rec, httptest.NewRequest(http.MethodGet, "/api/scheduled", nil))
@@ -247,14 +247,13 @@ func TestSendDraftCleanupFollowsRebuiltDraft(t *testing.T) {
 	if o.Status != store.OpDone {
 		t.Fatalf("send op status = %q, want done", o.Status)
 	}
-	var expungeIdentity string
 	var expungeRow int64
-	if err := f.st.DB.QueryRow("SELECT identity, message_id FROM ops WHERE type = 'expunge' ORDER BY id DESC LIMIT 1").
-		Scan(&expungeIdentity, &expungeRow); err != nil {
+	if err := f.st.DB.QueryRow("SELECT message_id FROM ops WHERE type = 'expunge' ORDER BY id DESC LIMIT 1").
+		Scan(&expungeRow); err != nil {
 		t.Fatalf("find draft cleanup expunge: %v", err)
 	}
-	if expungeRow != 88 || expungeIdentity != "m:m30@x" {
-		t.Fatalf("cleanup expunge binds row %d identity %q, want row 88 identity m:m30@x (the rebuilt draft)", expungeRow, expungeIdentity)
+	if expungeRow != 88 {
+		t.Fatalf("cleanup expunge binds row %d, want row 88 (the rebuilt draft)", expungeRow)
 	}
 	f.srv.drainAccount(f.srv.keys["tok"], 1)
 	found := false

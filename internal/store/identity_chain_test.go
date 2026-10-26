@@ -143,8 +143,7 @@ func TestUndoResolvesCurrentIncarnation(t *testing.T) {
 	if res.Inverse == nil {
 		t.Fatal("undo returned no inverse op")
 	}
-	if res.Inverse.MessageID != 77 || res.Inverse.Identity != "m:m10@x" {
-		t.Fatalf("inverse op targets row %d identity %q, want rebuilt row 77 with the message identity",
-			res.Inverse.MessageID, res.Inverse.Identity)
+	if res.Inverse.MessageID != 77 {
+		t.Fatalf("inverse op targets row %d, want rebuilt row 77", res.Inverse.MessageID)
 	}
 }

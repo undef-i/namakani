@@ -83,7 +83,7 @@ func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
 	s.tgReconcile()
 	go s.drainLoop()
 	go s.claimWatchdog()
-	if key, err := auth.LoadOrCreateServerKey(filepath.Join(st.DataDir(), "server.key")); err == nil {
+	if key, err := auth.LoadOrCreateServerKey(filepath.Join(st.DataDir(), "namakani.key")); err == nil {
 		s.serverKey = key
 	} else {
 		log.Printf("namakani: server key unavailable, sessions will not survive restarts: %v", err)
@@ -215,7 +215,7 @@ func decodeJSON(r *http.Request, v any) error {
 }
 
 func (s *Server) sessionToken(r *http.Request) string {
-	c, err := r.Cookie("wm_session")
+	c, err := r.Cookie("namakani_session")
 	if err != nil {
 		return ""
 	}
@@ -323,7 +323,7 @@ func requestIsHTTPS(r *http.Request) bool {
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     "wm_session",
+		Name:     "namakani_session",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
@@ -496,7 +496,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		s.keys = make(map[string][]byte)
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "wm_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: "namakani_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

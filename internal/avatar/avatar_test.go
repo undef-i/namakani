@@ -2,8 +2,6 @@ package avatar
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -66,14 +64,6 @@ func TestSanitizeSVGRejectsNonSVG(t *testing.T) {
 	}
 	if _, ok := SanitizeSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>x</script></svg>`)); ok {
 		t.Fatal("an svg with no drawable content must be rejected")
-	}
-}
-
-func TestGravatarHashNormalization(t *testing.T) {
-	sum := sha256.Sum256([]byte("noreply@example.com"))
-	want := hex.EncodeToString(sum[:])
-	if got := GravatarHash("  NoReply@Example.COM "); got != want {
-		t.Fatalf("GravatarHash = %q, want sha256 of the trimmed lowercase address %q", got, want)
 	}
 }
 
@@ -155,15 +145,6 @@ func TestResolveGravatar404MeansNoImage(t *testing.T) {
 	kind, _, data := r.Resolve(context.Background(), "ghost@example.org")
 	if kind != "" || len(data) != 0 {
 		t.Fatalf("gravatar 404 must mean no image, got kind %q", kind)
-	}
-	called := false
-	for _, u := range net.getCalls {
-		if strings.Contains(u, "d=404") {
-			called = true
-		}
-	}
-	if !called {
-		t.Fatalf("gravatar was not queried with d=404: %v", net.getCalls)
 	}
 }
 

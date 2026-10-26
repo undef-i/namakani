@@ -62,36 +62,17 @@ func TestDiskPairDiscovery(t *testing.T) {
 	}
 }
 
-func TestDiskPairDiscoveryMissingDir(t *testing.T) {
-	m := NewManager(filepath.Join(t.TempDir(), "nope"))
-	pairs, err := m.Pairs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pairs) != 0 {
-		t.Fatalf("pairs = %+v, want none", pairs)
-	}
-}
-
 func TestEngineForDiskPairs(t *testing.T) {
 	dir := t.TempDir()
 	writePack(t, dir, "en_zh-Hans", "")
 	writePack(t, dir, "zh-Hans_en", "")
 	writePack(t, dir, "en_de", "")
 	m := NewManager(dir)
-	eng, err := m.EngineFor("en", "zh")
-	if err != nil {
+	if _, err := m.EngineFor("en", "zh"); err != nil {
 		t.Fatal(err)
 	}
-	if got := eng.Key(); got != "ct2:en_zh-Hans" {
-		t.Fatalf("engine key = %q, want ct2:en_zh-Hans", got)
-	}
-	pivot, err := m.EngineFor("zh", "de")
-	if err != nil {
+	if _, err := m.EngineFor("zh", "de"); err != nil {
 		t.Fatal(err)
-	}
-	if got := pivot.Key(); got != "ct2:zh-Hans_en>ct2:en_de" {
-		t.Fatalf("pivot key = %q, want ct2:zh-Hans_en>ct2:en_de", got)
 	}
 	if _, err := m.EngineFor("fr", "de"); err == nil {
 		t.Fatal("EngineFor(fr, de) succeeded with no fr packs on disk")

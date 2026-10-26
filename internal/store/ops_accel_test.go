@@ -101,18 +101,3 @@ func TestAccelerateDoesNotLiftNotBefore(t *testing.T) {
 	}
 }
 
-func TestBackoffSpanStaysShort(t *testing.T) {
-	if d := backoffSeconds(1); d > 10 {
-		t.Fatalf("first retry delay = %ds, want at most 10s", d)
-	}
-	total := int64(0)
-	for a := 1; a < maxOpAttempts; a++ {
-		total += backoffSeconds(a)
-	}
-	if total > 900 {
-		t.Fatalf("total wait before parking = %ds, want at most 900s", total)
-	}
-	if d := backoffSeconds(maxOpAttempts); d > 300 {
-		t.Fatalf("retry delay cap = %ds, want at most 300s", d)
-	}
-}

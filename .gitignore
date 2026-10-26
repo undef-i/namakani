@@ -2,7 +2,7 @@ data/
 *.db
 *.db-shm
 *.db-wal
-server.key
+namakani.key
 /namakani
 web/node_modules/
 web/dist/

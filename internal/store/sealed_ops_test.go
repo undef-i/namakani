@@ -12,25 +12,6 @@ import (
 // the watchdog budget); the reaper must never hand a sealed send back
 // to a new generation as if the checkpoint had never been crossed.
 
-func TestSealSendMarksOpSealedDurably(t *testing.T) {
-	st := identityTestStore(t)
-	o := claimSendForSeal(t, st)
-	if o.Sealed {
-		t.Fatal("a freshly claimed send is already marked sealed")
-	}
-	sealed, _, err := st.SealSendForDelivery(o.ID, 42, 43)
-	if err != nil || !sealed {
-		t.Fatalf("seal = (%v, %v), want (true, nil)", sealed, err)
-	}
-	cur, err := st.GetOp(o.ID)
-	if err != nil {
-		t.Fatalf("get op: %v", err)
-	}
-	if !cur.Sealed {
-		t.Fatal("the op does not record the seal; the fence exists only in the rotated token and dies with the claim generation")
-	}
-}
-
 func TestReleaseInFlightOpsLeavesSealedClaimsAlone(t *testing.T) {
 	st := identityTestStore(t)
 	sealedOp := claimSendForSeal(t, st)

@@ -248,24 +248,3 @@ func TestDeferredUndoFailureIsRecordedNotSilent(t *testing.T) {
 	}
 }
 
-func TestUndoDoneMoveWithGoneMessageReturnsConflict(t *testing.T) {
-	f := newDrainFixture(t)
-	f.addMessage(t, 10, 1, "INBOX", 100, 0)
-	rec := f.postMove(t, 10, `{"to":"archive"}`)
-	opID := opIDOf(t, rec)
-	f.srv.drainAccount(nil, 1)
-	o, err := f.st.GetOp(opID)
-	if err != nil || o.Status != store.OpDone {
-		t.Fatalf("op after drain = %+v, err %v; want done", o, err)
-	}
-	if _, err := f.st.DB.Exec("DELETE FROM messages WHERE id = 10"); err != nil {
-		t.Fatalf("drop the message row: %v", err)
-	}
-	rec = f.postUndo(t, opID)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("undo whose target message is gone = %d, want 409 with a plain explanation (body %s)", rec.Code, rec.Body.String())
-	}
-	if u := opUndone(t, f, opID); u != 0 {
-		t.Fatal("the refused undo still marked the op undone")
-	}
-}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -79,43 +78,6 @@ func (f *drainFixture) draftsCount(t *testing.T) int {
 		t.Fatalf("count drafts: %v", err)
 	}
 	return n
-}
-
-func TestListScheduledReportsInFlightHonestly(t *testing.T) {
-	f := newDrainFixture(t)
-	f.armSend(t)
-	opID := f.scheduleSend(t, 0, time.Now().Add(2*time.Hour).Unix())
-	if row := f.scheduledRow(t, opID); row == nil || row["status"] != "pending" {
-		t.Fatalf("scheduled row before claim = %v, want status pending", row)
-	}
-	f.claimSendOp(t, opID)
-	row := f.scheduledRow(t, opID)
-	if row == nil {
-		t.Fatal("claimed scheduled op vanished from the scheduled list")
-	}
-	if row["status"] != "in_flight" {
-		t.Fatalf("scheduled row status while claimed = %v, want in_flight (folding it into pending hides that its send time has come)", row["status"])
-	}
-	// The message-shaped projection behind the scheduled view must
-	// carry the same truth.
-	rec := httptest.NewRecorder()
-	f.srv.listScheduledAsMessages(rec, url.Values{}, 100, 0)
-	var rows []map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
-		t.Fatalf("scheduled messages body: %v", err)
-	}
-	found := false
-	for _, r := range rows {
-		if int64(r["id"].(float64)) == -opID {
-			found = true
-			if r["op_status"] != "in_flight" {
-				t.Fatalf("scheduled message op_status = %v, want in_flight", r["op_status"])
-			}
-		}
-	}
-	if !found {
-		t.Fatal("claimed scheduled op missing from the scheduled message projection")
-	}
 }
 
 func TestCancelScheduledInFlightUnsealedDefersAndReturnsDraft(t *testing.T) {

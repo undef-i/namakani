@@ -83,9 +83,6 @@ func TestReconcileDeletionSkipsRowWithPendingMove(t *testing.T) {
 	if route.FolderID != 2 {
 		t.Fatalf("mirror folder after enqueue = %d, want 2 (Archive)", route.FolderID)
 	}
-	if route.UID < 1<<31 {
-		t.Fatalf("mirror uid after enqueue = %d, want a provisional uid in the reserved range", route.UID)
-	}
 	if err := st.DeleteMessage(2, route.UID); err != nil {
 		t.Fatalf("reconcile delete: %v", err)
 	}

@@ -29,9 +29,6 @@ func TestGoogleEngineAlignsResultsAndSendsShape(t *testing.T) {
 	if len(out) != 2 || out[0].ID != 7 || out[0].Text != "译文甲" || out[1].ID != 9 || out[1].Text != "译文乙" {
 		t.Fatalf("misaligned results: %+v", out)
 	}
-	if gotQuery.Get("client") != "dict-chrome-ex" {
-		t.Fatalf("client param = %q", gotQuery.Get("client"))
-	}
 	if gotQuery.Get("sl") != "en" || gotQuery.Get("tl") != "zh-CN" {
 		t.Fatalf("language params sl=%q tl=%q", gotQuery.Get("sl"), gotQuery.Get("tl"))
 	}

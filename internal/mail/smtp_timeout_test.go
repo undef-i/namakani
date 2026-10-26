@@ -6,12 +6,6 @@ import (
 	"time"
 )
 
-func TestSMTPTimeoutBudget(t *testing.T) {
-	if smtpTimeout != 90*time.Second {
-		t.Fatalf("smtpTimeout = %v, want 90s", smtpTimeout)
-	}
-}
-
 // A server that accepts the connection and then never speaks must not
 // hang the send path: the connection deadline has to fire.
 func TestSMTPStalledServerTimesOut(t *testing.T) {

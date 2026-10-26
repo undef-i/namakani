@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 
-const stored = localStorage.getItem('wm_lang')
+const stored = localStorage.getItem('namakani_lang')
 export const lang = ref(
   stored === 'zh' || stored === 'en'
     ? stored
@@ -11,7 +11,7 @@ export const lang = ref(
 
 export function setLang(v) {
   lang.value = v
-  localStorage.setItem('wm_lang', v)
+  localStorage.setItem('namakani_lang', v)
   document.documentElement.lang = v === 'zh' ? 'zh-CN' : 'en'
 }
 document.documentElement.lang = lang.value === 'zh' ? 'zh-CN' : 'en'

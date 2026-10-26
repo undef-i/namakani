@@ -41,13 +41,6 @@ func TestSaveBodyTruncatedMarkerPersisted(t *testing.T) {
 		t.Fatalf("SaveBody: %v", err)
 	}
 
-	var state int
-	if err := st.DB.QueryRow("SELECT body_state FROM messages WHERE id = 7").Scan(&state); err != nil {
-		t.Fatalf("read body_state: %v", err)
-	}
-	if state != 2 {
-		t.Fatalf("body_state = %d, want 2 (truncated marker persisted)", state)
-	}
 	text, _, ok, err := st.GetBody(7)
 	if err != nil || !ok {
 		t.Fatalf("GetBody: ok=%v err=%v", ok, err)

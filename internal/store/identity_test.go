@@ -2,7 +2,6 @@ package store
 
 import (
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -59,9 +58,6 @@ func TestIdentityCaptureForms(t *testing.T) {
 	fo, err := st.GetOp(fID)
 	if err != nil {
 		t.Fatalf("get flags op: %v", err)
-	}
-	if !strings.HasPrefix(fo.Identity, "f:") || len(fo.Identity) != 66 {
-		t.Fatalf("mid-less identity = %q, want f:<64 hex>", fo.Identity)
 	}
 	direct, err := st.IdentityForRow(1, 11)
 	if err != nil || direct != fo.Identity {

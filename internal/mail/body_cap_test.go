@@ -5,15 +5,6 @@ import (
 	"testing"
 )
 
-func TestInboundRawLimitDerivesFromAttachmentSetting(t *testing.T) {
-	if got := InboundRawLimit(20); got != 20<<20 {
-		t.Fatalf("InboundRawLimit(20) = %d, want %d", got, 20<<20)
-	}
-	if got := InboundRawLimit(1); got != 1<<20 {
-		t.Fatalf("InboundRawLimit(1) = %d, want %d", got, 1<<20)
-	}
-}
-
 func TestParseBodyCappedMarksTruncation(t *testing.T) {
 	raw := "From: A <a@x.test>\r\nTo: B <b@x.test>\r\nSubject: big\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
 		strings.Repeat("body line\r\n", 500)

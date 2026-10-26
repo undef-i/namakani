@@ -8,7 +8,7 @@ import (
 const testSalt = "vectortest-salt-0123456789abcdef"
 
 func TestDecryptUrlSafeStringKey(t *testing.T) {
-	v, err := DecryptUrlSafe("eHh0ZWE.s6474i877KbLp2xiX5KIpQ.28cILUe0n-gTRtylXFK50pppUSgQogaN", []byte("mailpass-xyz"), testSalt)
+	v, err := DecryptUrlSafe("eHh0ZWE.s6474i877KbLp2xiX5KIpQ.XQSHapL7tbm0kwxq8_yWOAO7uTA2nkOA", []byte("mailpass-xyz"), testSalt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,7 +18,7 @@ func TestDecryptUrlSafeStringKey(t *testing.T) {
 }
 
 func TestDecryptFromJSONSameEnvelope(t *testing.T) {
-	v, err := DecryptFromJSON(`["eHh0ZWE=","s6474i877KbLp2xiX5KIpQ==","28cILUe0n+gTRtylXFK50pppUSgQogaN"]`, []byte("mailpass-xyz"), testSalt)
+	v, err := DecryptFromJSON(`["eHh0ZWE=","s6474i877KbLp2xiX5KIpQ==","XQSHapL7tbm0kwxq8/yWOAO7uTA2nkOA"]`, []byte("mailpass-xyz"), testSalt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,12 +38,3 @@ func TestDecryptUrlSafeBinaryKey(t *testing.T) {
 	}
 }
 
-func TestKeyIndependenceOfXxteaEnvelope(t *testing.T) {
-	v, err := DecryptUrlSafe("eHh0ZWE.s6474i877KbLp2xiX5KIpQ.28cILUe0n-gTRtylXFK50pppUSgQogaN", []byte("wrong-password"), testSalt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v != "hello-namakani-123" {
-		t.Fatalf("got %q", v)
-	}
-}

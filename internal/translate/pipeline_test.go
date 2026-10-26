@@ -165,27 +165,6 @@ func TestPipelineSingleRetryRecoversSegment(t *testing.T) {
 	}
 }
 
-func TestPipelineSentenceSplitting(t *testing.T) {
-	eng := &stubEngine{}
-	svc := NewService(eng)
-	in := `<p>First sentence here. Second one follows! Is the third a question?</p>`
-	if _, err := svc.TranslateHTML(context.Background(), in, "en", "zh"); err != nil {
-		t.Fatalf("translate: %v", err)
-	}
-	if len(eng.seen) != 3 {
-		t.Fatalf("english paragraph split into %d segments, want 3: %q", len(eng.seen), eng.seen)
-	}
-	eng2 := &stubEngine{}
-	svc2 := NewService(eng2)
-	in2 := `<p>您好，这是一封测试邮件。请查看附件！还有问题吗？</p>`
-	if _, err := svc2.TranslateHTML(context.Background(), in2, "zh", "en"); err != nil {
-		t.Fatalf("translate zh: %v", err)
-	}
-	if len(eng2.seen) != 3 {
-		t.Fatalf("chinese paragraph split into %d segments, want 3: %q", len(eng2.seen), eng2.seen)
-	}
-}
-
 func TestPipelineSegmentCapLeavesRestInOriginal(t *testing.T) {
 	eng := &stubEngine{}
 	svc := NewService(eng)

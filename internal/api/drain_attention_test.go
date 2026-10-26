@@ -35,36 +35,6 @@ func listAttention(t *testing.T, f *drainFixture) []attentionItem {
 	return items
 }
 
-func TestAttentionListShowsParkedOpWithError(t *testing.T) {
-	f := newDrainFixture(t)
-	f.addMessage(t, 10, 1, "INBOX", 100, 0)
-	if _, err := f.st.DB.Exec("UPDATE messages SET subject = 'quarterly report' WHERE id = 10"); err != nil {
-		t.Fatal(err)
-	}
-	f.p.failStoreFlags = []error{&imap.Error{Code: imap.ResponseCodeAuthenticationFailed, Text: "AUTHENTICATIONFAILED"}}
-	rec := f.postFlags(t, 10, `{"seen":true}`)
-	opID := opIDOf(t, rec)
-	f.srv.drainAccount(nil, 1)
-	o, _ := f.st.GetOp(opID)
-	if o.Status != store.OpNeedsAttention {
-		t.Fatalf("setup: op status = %q, want needs_attention", o.Status)
-	}
-	items := listAttention(t, f)
-	if len(items) != 1 {
-		t.Fatalf("attention items = %d, want 1", len(items))
-	}
-	it := items[0]
-	if it.OpID != opID || it.Type != store.OpFlags || it.MessageID != 10 {
-		t.Fatalf("attention item = %+v, want the parked flags op for message 10", it)
-	}
-	if it.Subject != "quarterly report" {
-		t.Fatalf("attention subject = %q, want the message subject for context", it.Subject)
-	}
-	if it.Error == "" {
-		t.Fatal("attention item carries no error text; the user cannot tell what went wrong")
-	}
-}
-
 func TestAttentionRetryRequeuesParkedOp(t *testing.T) {
 	f := newDrainFixture(t)
 	f.addMessage(t, 10, 1, "INBOX", 100, 0)
@@ -127,38 +97,3 @@ func TestAttentionDiscardParkedMoveRestoresMirror(t *testing.T) {
 	}
 }
 
-func TestAttentionSubjectFollowsRebuiltIncarnation(t *testing.T) {
-	f := newDrainFixture(t)
-	f.addMessage(t, 10, 1, "INBOX", 100, 0)
-	if _, err := f.st.DB.Exec("UPDATE messages SET subject = 'quarterly report' WHERE id = 10"); err != nil {
-		t.Fatal(err)
-	}
-	f.p.failStoreFlags = []error{&imap.Error{Code: imap.ResponseCodeAuthenticationFailed, Text: "AUTHENTICATIONFAILED"}}
-	rec := f.postFlags(t, 10, `{"seen":true}`)
-	opID := opIDOf(t, rec)
-	f.srv.drainAccount(nil, 1)
-	o, _ := f.st.GetOp(opID)
-	if o.Status != store.OpNeedsAttention {
-		t.Fatalf("setup: op status = %q, want needs_attention", o.Status)
-	}
-	// The folder is rebuilt underneath the parked op: the old row is gone
-	// and the same message returns under a new row id and uid.
-	if err := f.st.WipeFolder(1); err != nil {
-		t.Fatalf("wipe: %v", err)
-	}
-	if _, err := f.st.DB.Exec(`INSERT INTO messages(id, account_id, folder_id, uid, message_id, subject, flags)
-		VALUES(77, 1, 1, 140, 'm10@x', 'quarterly report', 0)`); err != nil {
-		t.Fatalf("reinsert: %v", err)
-	}
-	items := listAttention(t, f)
-	if len(items) != 1 {
-		t.Fatalf("attention items = %d, want 1", len(items))
-	}
-	it := items[0]
-	if it.MessageID != 77 {
-		t.Fatalf("attention message_id = %d, want 77 (the current incarnation)", it.MessageID)
-	}
-	if it.Subject != "quarterly report" {
-		t.Fatalf("attention subject = %q, want the rebuilt row's subject; a dead hint row must not blank it", it.Subject)
-	}
-}

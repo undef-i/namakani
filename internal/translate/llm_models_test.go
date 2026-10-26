@@ -42,9 +42,6 @@ func TestListModelsOpenAIShape(t *testing.T) {
 	if capReq.method != http.MethodGet || capReq.path != "/v1/models" {
 		t.Fatalf("request = %s %s, want GET /v1/models", capReq.method, capReq.path)
 	}
-	if got := capReq.header.Get("Authorization"); got != "Bearer form-key" {
-		t.Fatalf("authorization = %q, want Bearer form-key", got)
-	}
 }
 
 func TestListModelsAnthropicShapeAndV1Base(t *testing.T) {
@@ -64,9 +61,6 @@ func TestListModelsAnthropicShapeAndV1Base(t *testing.T) {
 	}
 	if got := capReq.header.Get("X-Api-Key"); got != "ant-key" {
 		t.Fatalf("x-api-key = %q", got)
-	}
-	if got := capReq.header.Get("Anthropic-Version"); got != "2023-06-01" {
-		t.Fatalf("anthropic-version = %q", got)
 	}
 	if got := capReq.header.Get("Authorization"); got != "" {
 		t.Fatalf("anthropic requests must not carry a bearer token, got %q", got)

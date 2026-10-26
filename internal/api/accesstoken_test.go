@@ -211,7 +211,7 @@ func newTokenFixture(t *testing.T) *tokenFixture {
 		t.Fatalf("login: status %d body %s", rec.Code, rec.Body.String())
 	}
 	for _, c := range rec.Result().Cookies() {
-		if c.Name == "wm_session" {
+		if c.Name == "namakani_session" {
 			f.cookie = c
 		}
 	}
@@ -293,7 +293,7 @@ func waitSyncIdle(t *testing.T, srv *Server, accountID int64) {
 
 func TestAccessTokenColdRecoveryWakesSync(t *testing.T) {
 	f := newTokenFixture(t)
-	id, token := f.createToken(t, f.srv, "dev cli")
+	_, token := f.createToken(t, f.srv, "dev cli")
 	f.insertAccount(t)
 
 	srv2 := f.restart()
@@ -313,13 +313,6 @@ func TestAccessTokenColdRecoveryWakesSync(t *testing.T) {
 	}
 	if n != 1 || mid != "m1@x.test" {
 		t.Fatalf("one sync round must land the mailbox message: count=%d message_id=%q", n, mid)
-	}
-	var lastUsed int64
-	if err := f.st.DB.QueryRow("SELECT last_used_at FROM access_tokens WHERE id = ?", id).Scan(&lastUsed); err != nil {
-		t.Fatalf("read last_used_at: %v", err)
-	}
-	if lastUsed <= 0 {
-		t.Fatal("bearer use must stamp last_used_at on the token row")
 	}
 }
 

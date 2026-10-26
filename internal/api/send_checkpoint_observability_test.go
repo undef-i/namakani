@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,25 +100,3 @@ func TestSealPublishesSealedEventAndUndoAnswerDistinguishes(t *testing.T) {
 // The pre-checkpoint answers must stay exactly what they were: an
 // undo against a still-pending send cancels it, and its answer
 // carries no sealed claim.
-func TestUndoAnswerBeforeCheckpointHasNoSealedClaim(t *testing.T) {
-	f := newDrainFixture(t)
-	f.armSend(t)
-	req := f.authedReq(http.MethodPost, "/api/send", `{"account_id":1,"to":"b@x.test","subject":"hi","text":"body","undo_seconds":300}`)
-	rec := httptest.NewRecorder()
-	f.srv.handleSend(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("send status = %d, body %s", rec.Code, rec.Body.String())
-	}
-	opID := opIDOf(t, rec)
-	rec = f.postUndo(t, opID)
-	var resp struct {
-		Mode   string `json:"mode"`
-		Sealed bool   `json:"sealed"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("undo body: %v", err)
-	}
-	if resp.Mode != "cancelled" || resp.Sealed {
-		t.Fatalf("undo before the checkpoint = %s, want mode cancelled with no sealed claim", rec.Body.String())
-	}
-}

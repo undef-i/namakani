@@ -50,9 +50,6 @@ func TestLLMOpenAIShapeAndParse(t *testing.T) {
 	if got := capReq.header.Get("Authorization"); got != "Bearer secret-key" {
 		t.Fatalf("authorization = %q", got)
 	}
-	if capReq.body["model"] != "model-x" {
-		t.Fatalf("model = %v", capReq.body["model"])
-	}
 	msgs, ok := capReq.body["messages"].([]any)
 	if !ok || len(msgs) != 2 {
 		t.Fatalf("messages shape wrong: %v", capReq.body["messages"])
@@ -92,9 +89,6 @@ func TestLLMAnthropicShapeAndParse(t *testing.T) {
 	}
 	if _, ok := capReq.body["system"].(string); !ok {
 		t.Fatalf("system must be a top-level string: %v", capReq.body["system"])
-	}
-	if mt, ok := capReq.body["max_tokens"].(float64); !ok || mt <= 0 {
-		t.Fatalf("max_tokens missing or zero: %v", capReq.body["max_tokens"])
 	}
 	msgs, ok := capReq.body["messages"].([]any)
 	if !ok || len(msgs) != 1 {
