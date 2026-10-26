@@ -69,6 +69,10 @@ type Msg struct {
 type Client struct {
 	c    *imapclient.Client
 	Caps imap.CapSet
+	// RawLimit caps FetchRaw's result in bytes (see InboundRawLimit).
+	// Zero disables the cap. Set by the owning layer, which is the one
+	// holding the app settings.
+	RawLimit int64
 }
 
 func TLSConfigFor(host string, skipVerify bool) *tls.Config {
@@ -224,7 +228,17 @@ func (cl *Client) FetchRaw(uid uint32) ([]byte, error) {
 			return nil, err
 		}
 		for _, sec := range buf.BodySection {
-			raw = append(raw, sec.Bytes...)
+			b := sec.Bytes
+			if cl.RawLimit > 0 {
+				room := cl.RawLimit - int64(len(raw))
+				if room <= 0 {
+					continue
+				}
+				if int64(len(b)) > room {
+					b = b[:room]
+				}
+			}
+			raw = append(raw, b...)
 		}
 	}
 	if err := cmd.Close(); err != nil {

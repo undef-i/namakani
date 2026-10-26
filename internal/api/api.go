@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"namakani/internal/auth"
@@ -44,7 +45,9 @@ type Server struct {
 	keys          map[string][]byte
 	drainWake     chan struct{}
 	drainMu       sync.Mutex
-	drainRunning  map[int64]bool
+	drainWaves    map[int64]*drainWave
+	drainTokenSeq atomic.Int64
+	claimStuckSecs int64
 	connFailMu    sync.Mutex
 	connFail      map[int64]*connFailState
 	drainOpen     func(ctx context.Context, key []byte, accountID int64) (mail.Conn, error)
@@ -72,12 +75,14 @@ type protonAuthEntry struct {
 }
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
-	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry), drainWake: make(chan struct{}, 1), drainRunning: make(map[int64]bool), connFail: make(map[int64]*connFailState), trMgr: translate.NewManager(filepath.Join(st.DataDir(), "models"))}
-	s.drainOpen = s.openBackgroundConn
+	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry), drainWake: make(chan struct{}, 1), drainWaves: make(map[int64]*drainWave), connFail: make(map[int64]*connFailState), trMgr: translate.NewManager(filepath.Join(st.DataDir(), "models"))}
+	s.claimStuckSecs = store.BackoffSeconds(1 << 30)
+	s.drainOpen = s.openDrainConn
 	s.appendOpen = s.openConn
 	go st.WarmBodyBytes()
 	s.tgReconcile()
 	go s.drainLoop()
+	go s.claimWatchdog()
 	if key, err := auth.LoadOrCreateServerKey(filepath.Join(st.DataDir(), "server.key")); err == nil {
 		s.serverKey = key
 	} else {
@@ -123,6 +128,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/events", s.authOnly(s.handleEvents))
 	mux.HandleFunc("GET /api/settings/app", s.authOnly(s.handleGetAppSettings))
 	mux.HandleFunc("PUT /api/settings/app", s.authOnly(s.handlePutAppSettings))
+	mux.HandleFunc("GET /api/settings/access-tokens", s.sessionOnly(s.handleListAccessTokens))
+	mux.HandleFunc("POST /api/settings/access-tokens", s.sessionOnly(s.handleCreateAccessToken))
+	mux.HandleFunc("DELETE /api/settings/access-tokens/{id}", s.sessionOnly(s.handleDeleteAccessToken))
+	mux.HandleFunc("POST /api/settings/sessions/revoke-all", s.sessionOnly(s.handleRevokeAllSessions))
 	mux.HandleFunc("GET /api/settings/telegram", s.authOnly(s.handleGetTelegram))
 	mux.HandleFunc("PUT /api/settings/telegram", s.authOnly(s.handlePutTelegram))
 	mux.HandleFunc("POST /api/settings/telegram/discover", s.authOnly(s.handleTelegramDiscover))
@@ -213,7 +222,26 @@ func (s *Server) sessionToken(r *http.Request) string {
 	return c.Value
 }
 
-func (s *Server) credentialKey(r *http.Request) ([]byte, bool) {
+// recoverKey is the single cold-recovery path shared by session cookies and
+// access tokens: it unwraps a credential key sealed under the server key,
+// caches it under cacheID, and starts every sync worker.
+func (s *Server) recoverKey(cacheID, wrapped string) ([]byte, bool) {
+	if s.serverKey == nil || wrapped == "" {
+		return nil, false
+	}
+	plain, err := auth.Decrypt(s.serverKey, wrapped)
+	if err != nil {
+		return nil, false
+	}
+	key := []byte(plain)
+	s.mu.Lock()
+	s.keys[cacheID] = key
+	s.mu.Unlock()
+	s.startAllWorkers(key)
+	return key, true
+}
+
+func (s *Server) sessionKey(r *http.Request) ([]byte, bool) {
 	token := s.sessionToken(r)
 	if token == "" {
 		return nil, false
@@ -230,26 +258,52 @@ func (s *Server) credentialKey(r *http.Request) ([]byte, bool) {
 		s.mu.Unlock()
 		return nil, false
 	}
-	if s.serverKey == nil {
-		return nil, false
-	}
 	wrapped, expiresAt, exists, err := auth.SessionInfo(s.st, token)
-	if err != nil || !exists || wrapped == "" {
+	if err != nil || !exists || time.Now().Unix() > expiresAt {
 		return nil, false
 	}
-	if time.Now().Unix() > expiresAt {
+	return s.recoverKey(token, wrapped)
+}
+
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if len(h) > len("Bearer ") && strings.EqualFold(h[:len("Bearer ")], "Bearer ") {
+		return strings.TrimSpace(h[len("Bearer "):])
+	}
+	return ""
+}
+
+// bearerKey authenticates a development access token. The token row is the
+// only authority: it is re-read on every request, so revoking (deleting)
+// the row makes the very next request fail, exactly like a deleted session.
+func (s *Server) bearerKey(r *http.Request) ([]byte, bool) {
+	token := bearerToken(r)
+	if token == "" {
 		return nil, false
 	}
-	plain, err := auth.Decrypt(s.serverKey, wrapped)
-	if err != nil {
+	id, wrapped, exists, err := auth.AccessTokenInfo(s.st, token)
+	cacheID := "bearer:" + token
+	if err != nil || !exists {
+		s.mu.Lock()
+		delete(s.keys, cacheID)
+		s.mu.Unlock()
 		return nil, false
 	}
-	key = []byte(plain)
+	_ = auth.TouchAccessToken(s.st, id)
 	s.mu.Lock()
-	s.keys[token] = key
+	key, ok := s.keys[cacheID]
 	s.mu.Unlock()
-	s.startAllWorkers(key)
-	return key, true
+	if ok {
+		return key, true
+	}
+	return s.recoverKey(cacheID, wrapped)
+}
+
+func (s *Server) credentialKey(r *http.Request) ([]byte, bool) {
+	if key, ok := s.sessionKey(r); ok {
+		return key, true
+	}
+	return s.bearerKey(r)
 }
 
 func (s *Server) authOnly(next http.HandlerFunc) http.HandlerFunc {
@@ -426,6 +480,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	token := s.sessionToken(r)
+	if token == "" {
+		// Authenticated by an access token, which has no session to end;
+		// revoking the token is its only off switch.
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
 	_ = auth.DeleteSession(s.st, token)
 	s.mu.Lock()
 	delete(s.keys, token)
@@ -1358,6 +1418,7 @@ type messageOut struct {
 	Snippet       string `json:"snippet"`
 	Size          int64  `json:"size"`
 	TrashOriginFolderID int64 `json:"trash_origin_folder_id"`
+	OpStatus      string `json:"op_status,omitempty"`
 }
 
 type threadOut struct {
@@ -1717,7 +1778,12 @@ func (s *Server) openConn(key []byte, accountID int64) (mail.Conn, error) {
 		}
 		return &turnConn{Conn: sess, end: sess.UserTurn()}, nil
 	}
-	return mail.Connect(acct, nil)
+	cl, err := mail.Connect(acct, nil)
+	if err != nil {
+		return nil, err
+	}
+	cl.RawLimit = mail.InboundRawLimit(s.st.AppSettings().MaxAttachmentMB)
+	return cl, nil
 }
 
 type messageDetail struct {
@@ -1778,7 +1844,7 @@ func (s *Server) ensureBody(key []byte, messageID int64, route store.MessageRout
 	if err != nil {
 		return "", "", nil, false, err
 	}
-	parsed, err := mail.ParseBody(raw)
+	parsed, err := mail.ParseBodyCapped(raw, mail.InboundRawLimit(s.st.AppSettings().MaxAttachmentMB))
 	if err != nil {
 		return "", "", nil, false, err
 	}
@@ -2601,18 +2667,76 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			offset = n
 		}
 	}
-	const pickedWindow = `SELECT mm.id, ROW_NUMBER() OVER (PARTITION BY mm.account_id,
-		CASE WHEN mm.message_id = '' THEN 'id:' || mm.id ELSE mm.message_id END, mm.date_ts
-		ORDER BY CASE WHEN ff.special_use = 'all' THEN 1 ELSE 0 END, mm.id) AS rn FROM `
-	const pickedTail = ` AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = mm.id AND o.type = 'expunge' AND o.status IN ('pending', 'in_flight', 'needs_attention'))) picked
-		JOIN messages m ON m.id = picked.id
-		JOIN accounts a ON a.id = m.account_id
-		JOIN folders f ON f.id = m.folder_id
-		WHERE picked.rn = 1 ORDER BY m.date_ts DESC, m.id DESC LIMIT ? OFFSET ?`
-	const searchCols = `SELECT m.id, m.account_id, a.label, m.folder_id, f.name, f.special_use, m.thread_key, m.subject,
-		m.from_json, m.date_ts, m.flags, m.has_attach, m.snippet, m.size,
-		(SELECT COUNT(*) FROM (SELECT 1 FROM messages t WHERE t.account_id = m.account_id AND t.thread_key = m.thread_key AND m.thread_key <> '' AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = t.id AND o.type = 'expunge' AND o.status IN ('pending', 'in_flight', 'needs_attention')) GROUP BY CASE WHEN t.message_id = '' THEN 'id:' || t.id ELSE t.message_id END, t.date_ts))
-		FROM (`
+	page, err := s.searchPage(q, limit, offset)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "搜索失败")
+		return
+	}
+	out := []threadOut{}
+	if len(page) > 0 {
+		out, err = s.searchDetails(page)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "读取数据失败")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+type searchHit struct {
+	id        int64
+	accountID int64
+	threadKey string
+}
+
+// searchPage finds one page of search results in final display order
+// (date_ts desc, id desc) with the copies of one logical message collapsed to
+// a single representative: the copy in a non-'all' folder wins, then the
+// smallest id. Candidates arrive in that final order (FTS matches stream over
+// idx_messages_date; short terms are collected by a sequential scan and
+// sorted) and copies collapse as each date bucket closes (copies share
+// date_ts), so a window over the whole match set is never materialised and
+// the page is fixed before any display field or thread count is computed.
+// Copies under an active expunge op are excluded before the collapse,
+// exactly as the previous window query did.
+func (s *Server) searchPage(q string, limit, offset int) ([]searchHit, error) {
+	db := s.st.DB
+	special := map[int64]string{}
+	frows, err := db.Query("SELECT id, special_use FROM folders")
+	if err != nil {
+		return nil, err
+	}
+	for frows.Next() {
+		var id int64
+		var su string
+		if err := frows.Scan(&id, &su); err != nil {
+			frows.Close()
+			return nil, err
+		}
+		special[id] = su
+	}
+	frows.Close()
+	if err := frows.Err(); err != nil {
+		return nil, err
+	}
+	expunging := map[int64]bool{}
+	orows, err := db.Query("SELECT message_id FROM ops WHERE type = 'expunge' AND status IN ('pending', 'in_flight', 'needs_attention')")
+	if err != nil {
+		return nil, err
+	}
+	for orows.Next() {
+		var id int64
+		if err := orows.Scan(&id); err != nil {
+			orows.Close()
+			return nil, err
+		}
+		expunging[id] = true
+	}
+	orows.Close()
+	if err := orows.Err(); err != nil {
+		return nil, err
+	}
+
 	terms := strings.Fields(q)
 	short := len(terms) > 0
 	for _, t := range terms {
@@ -2620,52 +2744,258 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			short = false
 		}
 	}
-	var rows *sql.Rows
-	var err error
+	const cols = `SELECT m.id, m.account_id, m.message_id, m.date_ts, m.folder_id, m.thread_key FROM messages m INDEXED BY idx_messages_date WHERE `
+	type scanRow struct {
+		id, accountID, dateTS, folderID int64
+		messageID, threadKey            string
+	}
+	type groupKey struct {
+		account int64
+		key     string
+	}
+	type candidate struct {
+		id        int64
+		account   int64
+		pref      int
+		threadKey string
+	}
+	out := []searchHit{}
+	skipped := 0
+	var bucketDate int64 = -1
+	bucket := map[groupKey]candidate{}
+	flush := func() bool {
+		reps := make([]candidate, 0, len(bucket))
+		for _, c := range bucket {
+			reps = append(reps, c)
+		}
+		sort.Slice(reps, func(i, j int) bool { return reps[i].id > reps[j].id })
+		for _, c := range reps {
+			if skipped < offset {
+				skipped++
+				continue
+			}
+			out = append(out, searchHit{id: c.id, accountID: c.account, threadKey: c.threadKey})
+			if len(out) >= limit {
+				return true
+			}
+		}
+		bucket = map[groupKey]candidate{}
+		return false
+	}
+	// consume folds one row, delivered in (date_ts desc, id desc) order, into
+	// the current date bucket; it reports whether the page is complete.
+	consume := func(r scanRow) bool {
+		if expunging[r.id] {
+			return false
+		}
+		if bucketDate == -1 {
+			bucketDate = r.dateTS
+		}
+		if r.dateTS != bucketDate {
+			if flush() {
+				return true
+			}
+			bucketDate = r.dateTS
+		}
+		key := r.messageID
+		if key == "" {
+			key = "id:" + strconv.FormatInt(r.id, 10)
+		}
+		gk := groupKey{account: r.accountID, key: key}
+		pref := 0
+		if special[r.folderID] == "all" {
+			pref = 1
+		}
+		cur, ok := bucket[gk]
+		if !ok || pref < cur.pref || (pref == cur.pref && r.id < cur.id) {
+			bucket[gk] = candidate{id: r.id, account: r.accountID, pref: pref, threadKey: r.threadKey}
+		}
+		return false
+	}
+
 	if short {
+		// Short terms cannot use the FTS index, so their candidates come from
+		// a sequential scan, the same scan the previous query paid; walking
+		// the date index instead would fetch table rows in random order for a
+		// page that often cannot be filled. Matches are sorted here and folded
+		// through the same bucket collapse as the FTS stream.
 		conds := make([]string, 0, len(terms))
-		args := make([]any, 0, len(terms)*4+1)
+		args := make([]any, 0, len(terms)*4)
 		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 		for _, t := range terms {
 			like := "%" + esc.Replace(t) + "%"
-			conds = append(conds, `(mm.subject LIKE ? ESCAPE '\' OR mm.from_json LIKE ? ESCAPE '\' OR mm.to_json LIKE ? ESCAPE '\' OR mm.cc_json LIKE ? ESCAPE '\')`)
+			conds = append(conds, `(m.subject LIKE ? ESCAPE '\' OR m.from_json LIKE ? ESCAPE '\' OR m.to_json LIKE ? ESCAPE '\' OR m.cc_json LIKE ? ESCAPE '\')`)
 			args = append(args, like, like, like, like)
 		}
-		args = append(args, limit, offset)
-		rows, err = s.st.DB.Query(searchCols+pickedWindow+`messages mm
-			JOIN folders ff ON ff.id = mm.folder_id
-			WHERE `+strings.Join(conds, " AND ")+pickedTail, args...)
-	} else {
-		rows, err = s.st.DB.Query(searchCols+pickedWindow+`messages_fts
-			JOIN messages mm ON mm.id = messages_fts.rowid
-			JOIN folders ff ON ff.id = mm.folder_id
-			WHERE messages_fts MATCH ?`+pickedTail,
-			store.BuildFTSQuery(q), limit, offset)
+		rows, err := db.Query(`SELECT m.id, m.account_id, m.message_id, m.date_ts, m.folder_id, m.thread_key FROM messages m WHERE `+
+			strings.Join(conds, " AND "), args...)
+		if err != nil {
+			return nil, err
+		}
+		var found []scanRow
+		for rows.Next() {
+			var r scanRow
+			if err := rows.Scan(&r.id, &r.accountID, &r.messageID, &r.dateTS, &r.folderID, &r.threadKey); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			found = append(found, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		sort.Slice(found, func(i, j int) bool {
+			if found[i].dateTS != found[j].dateTS {
+				return found[i].dateTS > found[j].dateTS
+			}
+			return found[i].id > found[j].id
+		})
+		for _, r := range found {
+			if consume(r) {
+				return out, nil
+			}
+		}
+		flush()
+		return out, nil
 	}
+
+	rows, err := db.Query(cols+`m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?) ORDER BY m.date_ts DESC, m.id DESC`,
+		store.BuildFTSQuery(q))
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "搜索失败")
-		return
+		return nil, err
 	}
 	defer rows.Close()
-	out := []threadOut{}
+	for rows.Next() {
+		var r scanRow
+		if err := rows.Scan(&r.id, &r.accountID, &r.messageID, &r.dateTS, &r.folderID, &r.threadKey); err != nil {
+			return nil, err
+		}
+		if consume(r) {
+			return out, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	flush()
+	return out, nil
+}
+
+// searchDetails loads the display rows for one page found by searchPage and
+// attaches each row's thread count, preserving the page order.
+func (s *Server) searchDetails(page []searchHit) ([]threadOut, error) {
+	args := make([]any, 0, len(page))
+	marks := make([]string, 0, len(page))
+	for _, h := range page {
+		args = append(args, h.id)
+		marks = append(marks, "?")
+	}
+	rows, err := s.st.DB.Query(`SELECT m.id, m.account_id, a.label, m.folder_id, f.name, f.special_use, m.thread_key, m.subject,
+		m.from_json, m.date_ts, m.flags, m.has_attach, m.snippet, m.size
+		FROM messages m
+		JOIN accounts a ON a.id = m.account_id
+		JOIN folders f ON f.id = m.folder_id
+		WHERE m.id IN (`+strings.Join(marks, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	byID := map[int64]messageOut{}
 	for rows.Next() {
 		var row messageOut
 		var fromJSON string
 		var hasAttach int
-		var cnt int
 		if err := rows.Scan(&row.ID, &row.AccountID, &row.AccountLabel, &row.FolderID, &row.FolderName, &row.FolderSpecial, &row.ThreadKey,
-			&row.Subject, &fromJSON, &row.DateTS, &row.Flags, &hasAttach, &row.Snippet, &row.Size, &cnt); err != nil {
-			writeErr(w, http.StatusInternalServerError, "读取数据失败")
-			return
+			&row.Subject, &fromJSON, &row.DateTS, &row.Flags, &hasAttach, &row.Snippet, &row.Size); err != nil {
+			return nil, err
 		}
 		row.HasAttach = hasAttach != 0
 		if from := parseAddrs(fromJSON); len(from) > 0 {
 			row.FromName = from[0].Name
 			row.FromEmail = from[0].Email
 		}
-		out = append(out, threadOut{messageOut: row, ThreadCount: cnt})
+		byID[row.ID] = row
 	}
-	writeJSON(w, http.StatusOK, out)
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	counts, err := s.searchThreadCounts(page)
+	if err != nil {
+		return nil, err
+	}
+	out := []threadOut{}
+	for _, h := range page {
+		row, ok := byID[h.id]
+		if !ok {
+			continue
+		}
+		out = append(out, threadOut{messageOut: row, ThreadCount: counts[h.id]})
+	}
+	return out, nil
+}
+
+// searchThreadCounts computes the thread count of every row on one page in a
+// single grouped query. The count of a thread is its number of distinct
+// (message_id, date_ts) copies with copies under an active expunge op
+// excluded, the same definition the previous per-row subquery used.
+func (s *Server) searchThreadCounts(page []searchHit) (map[int64]int, error) {
+	counts := map[int64]int{}
+	type pair struct {
+		account int64
+		key     string
+	}
+	seen := map[pair]bool{}
+	var pairs []pair
+	for _, h := range page {
+		counts[h.id] = 0
+		if h.threadKey == "" {
+			continue
+		}
+		p := pair{h.accountID, h.threadKey}
+		if !seen[p] {
+			seen[p] = true
+			pairs = append(pairs, p)
+		}
+	}
+	if len(pairs) == 0 {
+		return counts, nil
+	}
+	conds := make([]string, 0, len(pairs))
+	args := make([]any, 0, len(pairs)*2)
+	for _, p := range pairs {
+		conds = append(conds, "(t.account_id = ? AND t.thread_key = ?)")
+		args = append(args, p.account, p.key)
+	}
+	rows, err := s.st.DB.Query(`SELECT g.account_id, g.thread_key, COUNT(*) FROM (
+		SELECT t.account_id AS account_id, t.thread_key AS thread_key FROM messages t
+		WHERE (`+strings.Join(conds, " OR ")+`)
+		AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = t.id AND o.type = 'expunge' AND o.status IN ('pending', 'in_flight', 'needs_attention'))
+		GROUP BY t.account_id, t.thread_key, CASE WHEN t.message_id = '' THEN 'id:' || t.id ELSE t.message_id END, t.date_ts
+	) g GROUP BY g.account_id, g.thread_key`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	byPair := map[pair]int{}
+	for rows.Next() {
+		var account int64
+		var key string
+		var n int
+		if err := rows.Scan(&account, &key, &n); err != nil {
+			return nil, err
+		}
+		byPair[pair{account, key}] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, h := range page {
+		if h.threadKey != "" {
+			counts[h.id] = byPair[pair{h.accountID, h.threadKey}]
+		}
+	}
+	return counts, nil
 }
 
 type contactOut struct {

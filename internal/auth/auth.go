@@ -43,7 +43,15 @@ func SetupMaster(st *store.Store, password string) error {
 		return err
 	}
 	verifier := verifierOf(hashWithSalt(password, salt))
-	return st.SetSetting("master_verifier", base64.StdEncoding.EncodeToString(verifier))
+	if err := st.SetSetting("master_verifier", base64.StdEncoding.EncodeToString(verifier)); err != nil {
+		return err
+	}
+	// Every existing session wraps the master key of the password it
+	// was minted under; a (re)set of the password makes them all
+	// undecryptable, so they are revoked outright. At first-time setup
+	// there are no sessions and this is a no-op.
+	_, err := DeleteAllSessions(st)
+	return err
 }
 
 func IsSetup(st *store.Store) (bool, error) {
@@ -112,11 +120,20 @@ func SessionInfo(st *store.Store, token string) (wrapped string, expiresAt int64
 	return wrapped, expiresAt, true, nil
 }
 
+// TouchSession applies the sliding renewal, bounded by an absolute
+// cap: a session never lives past created_at + SessionTTL, where
+// created_at is the first-login anchor recorded by NewSession (the
+// column has existed since the sessions table was introduced). The
+// renewal value is min(now+TTL, created_at+TTL); a legacy expiry
+// already beyond the cap is clamped back down to it.
 func TouchSession(st *store.Store, token string) error {
 	now := time.Now()
-	_, err := st.DB.Exec("UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND expires_at < ?",
-		now.Add(SessionTTL).Unix(), tokenHash(token),
-		now.Add(SessionTTL-24*time.Hour).Unix())
+	ttl := int64(SessionTTL / time.Second)
+	_, err := st.DB.Exec(`UPDATE sessions SET expires_at = min(?, created_at + ?)
+		WHERE token_hash = ?
+		AND (expires_at < ? OR expires_at > created_at + ?)`,
+		now.Add(SessionTTL).Unix(), ttl, tokenHash(token),
+		now.Add(SessionTTL-24*time.Hour).Unix(), ttl)
 	return err
 }
 
@@ -139,6 +156,80 @@ func LoadOrCreateServerKey(path string) ([]byte, error) {
 	return key, nil
 }
 
+// AccessToken is one development access-token row as shown to its owner.
+// The plaintext token is never stored; only its sha256 (tokenHash) is kept.
+type AccessToken struct {
+	ID         int64
+	Label      string
+	CreatedAt  int64
+	LastUsedAt int64
+}
+
+func NewAccessToken(st *store.Store, label, wrappedKey string) (int64, string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return 0, "", err
+	}
+	token := hex.EncodeToString(raw)
+	res, err := st.DB.Exec("INSERT INTO access_tokens(label, token_hash, wrapped_key, created_at) VALUES(?, ?, ?, ?)",
+		label, tokenHash(token), wrappedKey, time.Now().Unix())
+	if err != nil {
+		return 0, "", err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, "", err
+	}
+	return id, token, nil
+}
+
+func AccessTokenInfo(st *store.Store, token string) (id int64, wrapped string, exists bool, err error) {
+	err = st.DB.QueryRow("SELECT id, wrapped_key FROM access_tokens WHERE token_hash = ?",
+		tokenHash(token)).Scan(&id, &wrapped)
+	if err == sql.ErrNoRows {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, err
+	}
+	return id, wrapped, true, nil
+}
+
+// TouchAccessToken stamps last_used_at, throttled to one write per 30s per
+// token so a chatty client does not turn every request into a DB write.
+func TouchAccessToken(st *store.Store, id int64) error {
+	now := time.Now()
+	_, err := st.DB.Exec("UPDATE access_tokens SET last_used_at = ? WHERE id = ? AND last_used_at < ?",
+		now.Unix(), id, now.Add(-30*time.Second).Unix())
+	return err
+}
+
+func ListAccessTokens(st *store.Store) ([]AccessToken, error) {
+	rows, err := st.DB.Query("SELECT id, label, created_at, last_used_at FROM access_tokens ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccessToken
+	for rows.Next() {
+		var tk AccessToken
+		if err := rows.Scan(&tk.ID, &tk.Label, &tk.CreatedAt, &tk.LastUsedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, tk)
+	}
+	return out, rows.Err()
+}
+
+func DeleteAccessToken(st *store.Store, id int64) (bool, error) {
+	res, err := st.DB.Exec("DELETE FROM access_tokens WHERE id = ?", id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 func LiveSessionCount(st *store.Store) (int, error) {
 	var n int
 	err := st.DB.QueryRow("SELECT COUNT(*) FROM sessions WHERE expires_at > ?", time.Now().Unix()).Scan(&n)
@@ -148,6 +239,17 @@ func LiveSessionCount(st *store.Store) (int, error) {
 func DeleteSession(st *store.Store, token string) error {
 	_, err := st.DB.Exec("DELETE FROM sessions WHERE token_hash = ?", tokenHash(token))
 	return err
+}
+
+// DeleteAllSessions revokes every session row, including the
+// caller's own. Access tokens live in a separate table and are not
+// affected.
+func DeleteAllSessions(st *store.Store) (int64, error) {
+	res, err := st.DB.Exec("DELETE FROM sessions")
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func Encrypt(key []byte, plaintext string) (string, error) {

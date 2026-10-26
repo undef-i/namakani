@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -58,6 +59,9 @@ type Op struct {
 	UndoRequested bool
 	CreatedAt     int64
 	Identity      string
+	ClaimToken    int64
+	Sealed        bool
+	ReturnToDraft bool
 }
 
 type FlagsPayload struct {
@@ -73,14 +77,14 @@ type MovePayload struct {
 }
 
 const opColumns = `id, account_id, type, message_id, payload, prior_folder_id, prior_uid, prior_flags,
-	to_folder_id, not_before, status, attempts, next_attempt, last_error, client_key, created_at, undo_requested, prior_uidvalidity, identity`
+	to_folder_id, not_before, status, attempts, next_attempt, last_error, client_key, created_at, undo_requested, prior_uidvalidity, identity, claim_token, sealed, return_to_draft`
 
 func scanOp(row interface{ Scan(...any) error }) (*Op, error) {
 	var o Op
-	var priorUID, priorFlags, undoRequested, priorUIDValidity int64
+	var priorUID, priorFlags, undoRequested, priorUIDValidity, sealed, returnToDraft int64
 	err := row.Scan(&o.ID, &o.AccountID, &o.Type, &o.MessageID, &o.Payload,
 		&o.PriorFolderID, &priorUID, &priorFlags, &o.ToFolderID, &o.NotBefore,
-		&o.Status, &o.Attempts, &o.NextAttempt, &o.LastError, &o.ClientKey, &o.CreatedAt, &undoRequested, &priorUIDValidity, &o.Identity)
+		&o.Status, &o.Attempts, &o.NextAttempt, &o.LastError, &o.ClientKey, &o.CreatedAt, &undoRequested, &priorUIDValidity, &o.Identity, &o.ClaimToken, &sealed, &returnToDraft)
 	if err != nil {
 		return nil, err
 	}
@@ -88,6 +92,8 @@ func scanOp(row interface{ Scan(...any) error }) (*Op, error) {
 	o.PriorFlags = uint32(priorFlags)
 	o.UndoRequested = undoRequested != 0
 	o.PriorUIDValidity = uint32(priorUIDValidity)
+	o.Sealed = sealed != 0
+	o.ReturnToDraft = returnToDraft != 0
 	return &o, nil
 }
 
@@ -795,6 +801,55 @@ func (s *Store) EnqueueSend(accountID int64, payload string, notBefore int64, cl
 	return id, nil
 }
 
+// PriorSendDraftIdentity returns the durable identity of the draft a
+// previous scheduled send was taken from, or "" if no scheduled send
+// records that draft. Scheduling a draft consumes the draft row, so a
+// resubmission of the same intent can no longer read the identity off
+// the row; the first submission's op is the durable record of which
+// draft it was taken from, in its payload, or equivalently in the
+// client key it derived from that identity.
+func (s *Store) PriorSendDraftIdentity(accountID, draftID int64) (string, error) {
+	rows, err := s.DB.Query(`SELECT client_key, payload FROM ops
+		WHERE account_id = ? AND type = 'send' AND client_key LIKE 'sched:%' ORDER BY id DESC`, accountID)
+	if err != nil {
+		return "", err
+	}
+	type prior struct {
+		key     string
+		payload string
+	}
+	var priors []prior
+	for rows.Next() {
+		var p prior
+		if err := rows.Scan(&p.key, &p.payload); err != nil {
+			rows.Close()
+			return "", err
+		}
+		priors = append(priors, p)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", err
+	}
+	rows.Close()
+	for _, p := range priors {
+		var sp struct {
+			Req struct {
+				DraftID int64 `json:"draft_id"`
+			} `json:"req"`
+			DraftIdentity string `json:"draft_identity"`
+		}
+		if json.Unmarshal([]byte(p.payload), &sp) != nil || sp.Req.DraftID != draftID {
+			continue
+		}
+		if sp.DraftIdentity != "" {
+			return sp.DraftIdentity, nil
+		}
+		return strings.TrimPrefix(p.key, "sched:"), nil
+	}
+	return "", nil
+}
+
 func (s *Store) ClaimDueOps(accountID, now int64, limit int, types ...string) ([]*Op, error) {
 	tx, err := s.DB.Begin()
 	if err != nil {
@@ -880,11 +935,70 @@ func (s *Store) ReleaseOps(ids []int64) error {
 }
 
 func (s *Store) ReleaseInFlightOps(accountID int64) (int64, error) {
-	res, err := s.DB.Exec("UPDATE ops SET status = 'pending' WHERE account_id = ? AND status = 'in_flight'", accountID)
+	// Sealed sends are never released: the seal is the point of no
+	// return and must survive the death of the claim generation that
+	// crossed it. A sealed op stranded in_flight is settled through
+	// ListSealedInFlightSends and its landing check, never by handing
+	// it to a new generation as if it had never been sealed.
+	res, err := s.DB.Exec("UPDATE ops SET status = 'pending', claim_token = 0 WHERE account_id = ? AND status = 'in_flight' AND sealed = 0", accountID)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// StampClaimToken marks ops a drain wave has just claimed as owned by that
+// wave. Landing paths check the stamp before writing an outcome, so a wave
+// that lost its claims to the reaper can no longer land them.
+func (s *Store) StampClaimToken(ids []int64, token int64) error {
+	if len(ids) == 0 || token == 0 {
+		return nil
+	}
+	ph := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, token)
+	for i, id := range ids {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	_, err := s.DB.Exec("UPDATE ops SET claim_token = ? WHERE status = 'in_flight' AND id IN ("+joinComma(ph)+")", args...)
+	return err
+}
+
+func (s *Store) AccountsWithInFlightOps() ([]int64, error) {
+	rows, err := s.DB.Query("SELECT DISTINCT account_id FROM ops WHERE status = 'in_flight'")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// HasDueOps reports whether any op of the given types is due for the
+// account, without the per-message chain guard ClaimDueOps applies. The
+// drain uses it to decide whether opening a provider connection is
+// worthwhile before it can claim.
+func (s *Store) HasDueOps(accountID, now int64, types ...string) (bool, error) {
+	if len(types) == 0 {
+		return false, nil
+	}
+	ph := make([]string, len(types))
+	args := []any{accountID, now, now}
+	for i, t := range types {
+		ph[i] = "?"
+		args = append(args, t)
+	}
+	var n int
+	err := s.DB.QueryRow("SELECT COUNT(*) FROM ops WHERE account_id = ? AND status = 'pending' AND not_before <= ? AND next_attempt <= ? AND type IN ("+joinComma(ph)+")", args...).Scan(&n)
+	return n > 0, err
 }
 
 func (s *Store) CompleteOp(id int64) error {
@@ -1115,6 +1229,12 @@ func (s *Store) CancelOp(id int64) error {
 }
 
 func (s *Store) RetryOp(id int64) error {
+	if o, gerr := s.GetOp(id); gerr == nil && o.Type == OpSend && o.Sealed && o.LastError == SendOutcomeUnknownError {
+		// Redriving a send whose delivery is unproven is how the same
+		// letter gets delivered twice; the record may be discarded,
+		// never retried.
+		return ErrOpNotActive
+	}
 	res, err := s.DB.Exec(`UPDATE ops SET status = 'pending', attempts = 0, next_attempt = 0, last_error = '', undo_requested = 0
 		WHERE id = ? AND status = 'needs_attention'`, id)
 	if err != nil {
@@ -1260,6 +1380,13 @@ func (s *Store) UndoOp(id int64) (*UndoResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if o.Type == OpSend && o.Sealed && o.Status == OpNeedsAttention && o.LastError == SendOutcomeUnknownError {
+		// The checkpoint was crossed and the delivery outcome is
+		// unproven. Cancelling would write "not sent" over a letter
+		// that may well have been delivered; the only honest answer
+		// is the terminal one.
+		return &UndoResult{Mode: "sealed"}, nil
+	}
 	switch o.Status {
 	case OpInFlight:
 		res, err := s.DB.Exec("UPDATE ops SET undo_requested = 1 WHERE id = ? AND status = 'in_flight'", id)
@@ -1274,6 +1401,14 @@ func (s *Store) UndoOp(id int64) (*UndoResult, error) {
 		return &UndoResult{Mode: "cancelled"}, nil
 	case OpPending, OpNeedsAttention:
 		if err := s.CancelOp(id); err != nil {
+			if errors.Is(err, ErrOpNotActive) {
+				// The op left the pending state between the read above
+				// and the cancel (a drain claim won the race). Re-dispatch
+				// on the fresh state so the caller still gets the
+				// state machine's definitive answer for the new state
+				// instead of a spurious failure.
+				return s.UndoOp(id)
+			}
 			return nil, err
 		}
 		return &UndoResult{Mode: "cancelled"}, nil
@@ -1352,6 +1487,117 @@ func (s *Store) CancelInFlightSend(id int64) error {
 	return nil
 }
 
+// SealSendForDelivery is the send executor's point of no return, decided
+// in a single statement: it succeeds only while no undo is requested
+// and the executor holds the op's claim, rotating the claim token to
+// the executor's fresh token in the same write. An op still pending has
+// no claim holder, so the executor takes the claim through the same
+// statement (the drain claims before executing; this branch covers
+// direct execution of an unclaimed op). An undo that reached the store
+// before this statement therefore always wins; one that arrives after
+// it can never be honored by mistake. The second result reports whether
+// the refusal was an undo under the caller's own claim (the executor
+// must then cancel the op) as opposed to a lost claim (the op belongs
+// to someone else now).
+func (s *Store) SealSendForDelivery(id, claimToken, newToken int64) (bool, bool, error) {
+	res, err := s.DB.Exec(`UPDATE ops SET claim_token = ?, status = 'in_flight', sealed = 1 WHERE id = ? AND type = 'send'
+		AND undo_requested = 0
+		AND ((status = 'in_flight' AND claim_token = ?) OR status = 'pending')`, newToken, id, claimToken)
+	if err != nil {
+		return false, false, err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		return true, false, nil
+	}
+	o, err := s.GetOp(id)
+	if err != nil {
+		return false, false, err
+	}
+	return false, o.UndoRequested && o.ClaimToken == claimToken, nil
+}
+
+// SendOutcomeUnknownError marks a sealed send whose executor died
+// after the checkpoint without landing an outcome: the provider may
+// or may not have accepted the letter, and the books must say exactly
+// that. Undo and retry both refuse to touch such an op, because
+// either one would assert a delivery fact nobody knows.
+const SendOutcomeUnknownError = "发送结果未知：发送执行中断，无法确认服务商是否已接受这封邮件"
+
+// ListSealedInFlightSends returns the account's sealed sends still
+// sitting in_flight: their claim generation is gone (a live wave
+// would be executing or landing them), so they are waiting for the
+// landing check, not for a fresh claim.
+func (s *Store) ListSealedInFlightSends(accountID int64) ([]*Op, error) {
+	rows, err := s.DB.Query("SELECT "+opColumns+" FROM ops WHERE account_id = ? AND type = 'send' AND status = 'in_flight' AND sealed = 1 ORDER BY id", accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Op
+	for rows.Next() {
+		o, err := scanOp(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// AdoptSealedSend transfers a sealed in_flight send to a settler by
+// rotating its claim token under the token the seal left behind.
+// Exactly one settler can win the rotation; the dead executor's own
+// token stops matching at the same moment, which is what fences its
+// late landing.
+func (s *Store) AdoptSealedSend(id, expectToken, newToken int64) (bool, error) {
+	res, err := s.DB.Exec("UPDATE ops SET claim_token = ? WHERE id = ? AND type = 'send' AND status = 'in_flight' AND sealed = 1 AND claim_token = ?",
+		newToken, id, expectToken)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ParkSealedSendUnknown lands a sealed send whose delivery outcome
+// cannot be proven: it leaves in_flight for needs_attention carrying
+// the outcome-unknown marker, claim released, any undo flag cleared
+// (the checkpoint is past; the flag could only pretend a verdict is
+// still open). It never asserts the letter was or was not sent.
+func (s *Store) ParkSealedSendUnknown(id int64) (bool, error) {
+	res, err := s.DB.Exec(`UPDATE ops SET status = 'needs_attention', claim_token = 0, undo_requested = 0, last_error = ?
+		WHERE id = ? AND type = 'send' AND status = 'in_flight' AND sealed = 1`, SendOutcomeUnknownError, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// SetSendReturnToDraft records, on the op itself, that a deferred
+// undo of this in_flight send must file the letter back as a draft
+// when it wins at the checkpoint (as opposed to destroying it). It
+// lives in its own column, not in the payload, because the executor
+// rewrites the payload during prep and must never be able to
+// overwrite the intent.
+func (s *Store) SetSendReturnToDraft(id int64) (bool, error) {
+	res, err := s.DB.Exec("UPDATE ops SET return_to_draft = 1 WHERE id = ? AND type = 'send' AND status = 'in_flight'", id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
 func (s *Store) ClearUndoRequest(id int64) error {
 	_, err := s.DB.Exec("UPDATE ops SET undo_requested = 0 WHERE id = ?", id)
 	return err
@@ -1424,11 +1670,6 @@ func (s *Store) deleteRow(messageID, folderID int64, fixCounters bool) error {
 		return s.RefreshUnread(folderID)
 	}
 	return nil
-}
-
-func (s *Store) ResetInFlightOps() error {
-	_, err := s.DB.Exec("UPDATE ops SET status = 'pending' WHERE status = 'in_flight'")
-	return err
 }
 
 const (

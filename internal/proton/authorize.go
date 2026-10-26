@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/emersion/hydroxide/auth"
 	"github.com/emersion/hydroxide/protonmail"
@@ -106,18 +107,30 @@ func Init(dataDir string) {
 	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(dataDir, "hydroxide"))
 }
 
+// clientTimeout caps a single Proton API call end to end, so a
+// half-open connection cannot hold a sync worker (and the session lock
+// it sits under) forever. The budget is the server-wide one: it matches
+// net/http's DefaultTransport IdleConnTimeout (90s) and stays below
+// the 100s Cloudflare origin timeout, so on the public path the app,
+// not Cloudflare, owns the error.
+const clientTimeout = 90 * time.Second
+
+func newHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{Transport: transport, Timeout: clientTimeout}
+}
+
 func newClient() *protonmail.Client {
 	return &protonmail.Client{
 		RootURL:    "https://mail.proton.me/api",
 		AppVersion: "Other",
-		HTTPClient: &http.Client{Transport: rateLimitTransport{base: http.DefaultTransport}},
+		HTTPClient: newHTTPClient(rateLimitTransport{base: http.DefaultTransport}),
 	}
 }
 
 func Authorize(username, loginPassword, mailboxPassword, totp, hvToken string) (string, error) {
 	state := &hvState{armedToken: hvToken}
 	c := newClient()
-	c.HTTPClient = &http.Client{Transport: &hvTransport{base: rateLimitTransport{base: http.DefaultTransport}, state: state}}
+	c.HTTPClient = newHTTPClient(&hvTransport{base: rateLimitTransport{base: http.DefaultTransport}, state: state})
 	bridgePassword, err := authorize(c, username, loginPassword, mailboxPassword, totp)
 	if err != nil && state.challenge != nil {
 		if u, ok := verifyURL(c.RootURL, state.challenge); ok {

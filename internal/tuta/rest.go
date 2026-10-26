@@ -149,6 +149,12 @@ const (
 	dialTimeout           = 10 * time.Second
 	tlsHandshakeTimeout   = 10 * time.Second
 	responseHeaderTimeout = 20 * time.Second
+	// clientTimeout caps a single REST call end to end; the phase
+	// timeouts above alone leave the response body unbounded. It is
+	// the same budget the Proton client uses: net/http's
+	// DefaultTransport IdleConnTimeout (90s), below the 100s
+	// Cloudflare origin timeout.
+	clientTimeout = 90 * time.Second
 )
 
 type restClient struct {
@@ -169,7 +175,7 @@ func newRestClient() *restClient {
 		ExpectContinueTimeout: time.Second,
 		MaxIdleConnsPerHost:   4,
 	}
-	return &restClient{http: &http.Client{Transport: transport}}
+	return &restClient{http: &http.Client{Transport: transport, Timeout: clientTimeout}}
 }
 
 type restRequest struct {

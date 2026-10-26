@@ -104,24 +104,39 @@ func candidateRows(q idQuerier, accountID int64, identity string) ([]int64, erro
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
-		var out []int64
+		// The mapping rows must be fully read and closed before the
+		// per-mapping message lookups run: while a Rows is open it holds
+		// the querier's connection, and a nested query on the same pool
+		// would wait for that connection forever.
+		type mapping struct {
+			fname string
+			uid   int64
+		}
+		var maps []mapping
 		for rows.Next() {
-			var fname string
-			var uid int64
-			if err := rows.Scan(&fname, &uid); err != nil {
+			var mp mapping
+			if err := rows.Scan(&mp.fname, &mp.uid); err != nil {
+				rows.Close()
 				return nil, err
 			}
+			maps = append(maps, mp)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		var out []int64
+		for _, mp := range maps {
 			var rowID int64
 			err := q.QueryRow(`SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id
-				WHERE m.account_id = ? AND f.name = ? AND m.uid = ?`, accountID, fname, uid).Scan(&rowID)
+				WHERE m.account_id = ? AND f.name = ? AND m.uid = ?`, accountID, mp.fname, mp.uid).Scan(&rowID)
 			if err == nil {
 				out = append(out, rowID)
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
 		}
-		return out, rows.Err()
+		return out, nil
 	case 'm':
 		rows, err := q.Query("SELECT id FROM messages WHERE account_id = ? AND message_id = ?", accountID, val)
 		if err != nil {

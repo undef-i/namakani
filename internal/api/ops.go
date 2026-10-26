@@ -26,6 +26,14 @@ func (s *Server) broadcastSendState(opID int64, status string, sent bool, undoIg
 	})
 }
 
+// broadcastScheduled publishes a change to the scheduled-send state: a
+// pending send op was created, rescheduled, cancelled or landed. The
+// scheduled view is a projection of local state only, so this event is
+// what keeps it current without a full reload.
+func (s *Server) broadcastScheduled() {
+	s.hub.broadcast(map[string]any{"type": "scheduled"})
+}
+
 func (s *Server) broadcastOpApplied(o *store.Op) {
 	switch o.Type {
 	case store.OpFlags:
@@ -128,7 +136,17 @@ func (s *Server) handleUndoOp(w http.ResponseWriter, r *http.Request) {
 	}
 	s.broadcastOps()
 	s.kickDrain()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": res.Mode})
+	resp := map[string]any{"ok": true, "mode": res.Mode}
+	if res.Mode == "deferred" && before.Type == store.OpSend {
+		// A deferred answer means the checkpoint will decide. Whether
+		// it has already been crossed is part of the answer: the
+		// client retires its undo button on the sealed fact instead
+		// of presenting the click as a fully open verdict.
+		if cur, gerr := s.st.GetOp(opID); gerr == nil {
+			resp["sealed"] = cur.Sealed
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type attentionOut struct {
@@ -224,12 +242,14 @@ type pendingOut struct {
 	Attempts      int    `json:"attempts"`
 	NextAttempt   int64  `json:"next_attempt"`
 	CreatedAt     int64  `json:"created_at"`
+	Sealed        bool   `json:"sealed"`
+	Sent          bool   `json:"sent"`
 }
 
 func (s *Server) handleListPending(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.st.DB.Query(`SELECT o.id, o.client_key, o.account_id, a.label, a.email, o.type, o.status, o.message_id,
 		COALESCE(m.subject, ''), o.payload, o.prior_folder_id, COALESCE(pf.special_use, ''),
-		o.to_folder_id, COALESCE(tf.special_use, ''), o.not_before, o.attempts, o.next_attempt, o.created_at, o.identity
+		o.to_folder_id, COALESCE(tf.special_use, ''), o.not_before, o.attempts, o.next_attempt, o.created_at, o.identity, o.sealed
 		FROM ops o
 		JOIN accounts a ON a.id = o.account_id
 		LEFT JOIN messages m ON m.id = o.message_id
@@ -245,14 +265,16 @@ func (s *Server) handleListPending(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var it pendingOut
 		var email, payload string
+		var sealed int64
 		var o store.Op
 		if err := rows.Scan(&it.OpID, &it.ClientKey, &it.AccountID, &it.AccountLabel, &email, &it.Type, &it.Status, &it.MessageID,
 			&it.Subject, &payload, &it.PriorFolderID, &it.PriorSpecial,
-			&it.ToFolderID, &it.ToSpecial, &it.NotBefore, &it.Attempts, &it.NextAttempt, &it.CreatedAt, &o.Identity); err != nil {
+			&it.ToFolderID, &it.ToSpecial, &it.NotBefore, &it.Attempts, &it.NextAttempt, &it.CreatedAt, &o.Identity, &sealed); err != nil {
 			rows.Close()
 			writeErr(w, http.StatusInternalServerError, "列表加载失败")
 			return
 		}
+		it.Sealed = sealed != 0
 		if it.AccountLabel == "" {
 			it.AccountLabel = email
 		}
@@ -261,6 +283,7 @@ func (s *Server) handleListPending(w http.ResponseWriter, r *http.Request) {
 			if err := json.Unmarshal([]byte(payload), &sp); err == nil {
 				it.Subject = sp.Req.Subject
 				it.To = sp.Req.To
+				it.Sent = sp.Sent
 			}
 		}
 		o.ID, o.AccountID, o.MessageID, o.PriorFolderID = it.OpID, it.AccountID, it.MessageID, it.PriorFolderID

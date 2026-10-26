@@ -380,6 +380,7 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 		return err
 	}
 	defer cl.Close()
+	cl.RawLimit = mail.InboundRawLimit(m.st.AppSettings().MaxAttachmentMB)
 
 	listRefs := func() ([]folderRef, *folderRef, error) {
 		folders, err := cl.ListFolders()
@@ -576,6 +577,7 @@ func (m *Manager) watchSession(ctx context.Context, acct mail.Account, r folderR
 		return err
 	}
 	defer cl.Close()
+	cl.RawLimit = mail.InboundRawLimit(m.st.AppSettings().MaxAttachmentMB)
 
 	syncMine := func() {
 		change, _ := m.syncFolderLocked(ctx, cl, acct, r)

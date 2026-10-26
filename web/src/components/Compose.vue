@@ -241,6 +241,7 @@ let initializing = false
 let restoring = false
 let undoTimer = null
 let sentTimer = null
+let schedClientKey = ''
 let pendingOpId = 0
 let pendingNotBefore = 0
 
@@ -285,7 +286,16 @@ watch(
       showFailedBar()
       return
     }
-    if (ev.status === 'done' && ev.sent) {
+    if (ev.status === 'sealed') {
+      // The server has crossed the checkpoint: from this event on
+      // the send can no longer be undone, so the button retires.
+      // The bar itself stays as a pure status display until the
+      // terminal event lands; an in_flight event before this point
+      // changes nothing, because an unsealed in_flight send is
+      // still undoable and its entry must stay.
+      stopUndoTimer()
+      sendBar.value = 'sealed'
+    } else if (ev.status === 'done' && ev.sent) {
       pendingOpId = 0
       hideSendBar()
     } else if (ev.status === 'cancelled') {
@@ -507,6 +517,7 @@ function applyInit(init) {
     existing: a.file,
   }))
   draftId.value = init.draft_id ?? 0
+  schedClientKey = ''
   schedId.value = init.sched_id ?? 0
   schedAt.value = init.sched_send_at ? new Date(init.sched_send_at * 1000) : null
   error.value = init.load_error || ''
@@ -802,11 +813,20 @@ watch(
   () => props.resumeSend,
   (v) => {
     if (!v || !v.op_id || v.op_id === pendingOpId) return
-    if (Math.floor(Date.now() / 1000) >= v.not_before) return
     pendingOpId = v.op_id
     pendingNotBefore = v.not_before
-    sendBar.value = 'countdown'
     undoShow.value = true
+    if (Math.floor(Date.now() / 1000) >= v.not_before) {
+      // The send's time has come but it is still unsealed on the
+      // server (unclaimed, or claimed and waiting behind a bulk
+      // wave): its undo entry restores in the sending state, and
+      // the sealed event retires the button when the checkpoint
+      // is crossed.
+      stopUndoTimer()
+      sendBar.value = 'sending'
+      return
+    }
+    sendBar.value = 'countdown'
     startUndoTick()
   },
 )
@@ -832,6 +852,10 @@ async function undoSend() {
     return
   }
   if (res && res.mode === 'deferred') {
+    // The verdict waits for the checkpoint, but if the answer says
+    // the checkpoint is already crossed, the button retires now;
+    // the terminal event will close the bar either way.
+    if (res.sealed) sendBar.value = 'sealed'
     return
   }
   pendingOpId = 0
@@ -861,7 +885,11 @@ async function scheduleAt(date) {
   clearTimeout(saveTimer)
   await drainSaves()
   try {
-    await api.scheduleSend({ ...payload(), send_at: Math.floor(date.getTime() / 1000) })
+    // One key per compose session, reused by every schedule attempt
+    // from it, so a retried submission converges on the first op
+    // instead of enqueueing a twin chain for the same letter.
+    if (!schedClientKey) schedClientKey = api.newClientKey()
+    await api.scheduleSend({ ...payload(), send_at: Math.floor(date.getTime() / 1000), client_key: schedClientKey })
     open.value = false
     schedInfo.value = t('已安排在 {time} 发送', { time: fmtDateTime(date) })
     schedInfoShow.value = true

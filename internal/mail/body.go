@@ -158,6 +158,63 @@ func fallbackName(mime string) string {
 	}
 }
 
+// InboundRawLimit derives the inbound raw-message cap in bytes from
+// the max_attachment_mb app setting, with the same expression the
+// send path uses to bound a message's total attachment size
+// (MaxAttachmentMB << 20 in internal/api). One configured budget
+// bounds one message, in either direction.
+func InboundRawLimit(maxAttachmentMB int64) int64 {
+	return maxAttachmentMB << 20
+}
+
+// CapBuffer is an io.Writer that keeps at most Limit bytes and
+// discards the rest, so a raw message can be assembled (headers,
+// decrypted parts) without ever holding more than the cap in memory.
+// Write always reports the full input consumed; Overflow records
+// whether anything was discarded.
+type CapBuffer struct {
+	Limit int64
+	buf   bytes.Buffer
+	over  bool
+}
+
+func (c *CapBuffer) Write(p []byte) (int, error) {
+	if c.Limit > 0 {
+		room := c.Limit - int64(c.buf.Len())
+		if int64(len(p)) > room {
+			if room > 0 {
+				c.buf.Write(p[:room])
+			}
+			c.over = true
+			return len(p), nil
+		}
+	}
+	return c.buf.Write(p)
+}
+
+func (c *CapBuffer) Bytes() []byte { return c.buf.Bytes() }
+
+func (c *CapBuffer) Overflow() bool { return c.over }
+
+// ParseBodyCapped is ParseBody with the inbound size cap applied: raw
+// at or beyond limit is cut to limit bytes and the result is marked
+// Truncated, so the caller stores the kept prefix plus the truncation
+// marker instead of the whole message. A limit of 0 disables the cap.
+// The cut alone is not a reliable truncation signal (a single-part
+// text body cut mid-way still parses cleanly), which is why the mark
+// is applied here, by the layer that knows the cap.
+func ParseBodyCapped(raw []byte, limit int64) (*ParsedBody, error) {
+	if limit > 0 && int64(len(raw)) >= limit {
+		out, err := ParseBody(raw[:limit])
+		if err != nil {
+			return nil, err
+		}
+		out.Truncated = true
+		return out, nil
+	}
+	return ParseBody(raw)
+}
+
 func ParseBody(raw []byte) (*ParsedBody, error) {
 	parts, text, html, truncated, err := parseAll(raw)
 	if err != nil {

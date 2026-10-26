@@ -21,6 +21,8 @@ const SECTIONS = computed(() => [
   { key: 'translate', label: t('翻译'), icon: 'mdi-translate' },
   { key: 'push', label: t('推送'), icon: 'mdi-bell' },
   { key: 'advanced', label: t('高级'), icon: 'mdi-cog' },
+  { key: 'tokens', label: t('访问令牌'), icon: 'mdi-key' },
+  { key: 'sessions', label: t('会话'), icon: 'mdi-lock-outline' },
 ])
 
 const props = defineProps({
@@ -32,7 +34,7 @@ const props = defineProps({
   undoSeconds: { type: Number, default: 5 },
   version: { type: String, default: '' },
 })
-const emit = defineEmits(['changed', 'update:themeMode', 'update:threaded', 'update:undoSeconds', 'appSettings'])
+const emit = defineEmits(['changed', 'update:themeMode', 'update:threaded', 'update:undoSeconds', 'appSettings', 'revoked'])
 
 function kindText(a) {
   if (a.kind === 'proton') return 'Proton Mail'
@@ -821,11 +823,93 @@ async function saveAppSet() {
   }
 }
 
+const tokensState = ref('loading')
+const tokensError = ref('')
+const tokens = ref([])
+const tokenLabel = ref('')
+const tokenBusy = ref(false)
+const freshToken = ref('')
+const revokeTarget = ref(null)
+const revokeBusy = ref(false)
+
+async function loadTokens() {
+  tokensState.value = 'loading'
+  try {
+    const res = await api.listAccessTokens()
+    tokens.value = res.tokens || []
+    tokensState.value = 'ready'
+  } catch (err) {
+    tokensError.value = err.message
+    tokensState.value = 'error'
+  }
+}
+
+async function createToken() {
+  tokenBusy.value = true
+  try {
+    const res = await api.createAccessToken(tokenLabel.value.trim())
+    freshToken.value = res.token
+    tokenLabel.value = ''
+    loadTokens()
+  } catch (err) {
+    showSnack(t('创建失败：{error}', { error: err.message }))
+  } finally {
+    tokenBusy.value = false
+  }
+}
+
+async function copyFreshToken() {
+  try {
+    await navigator.clipboard.writeText(freshToken.value)
+  } catch {
+    showSnack(t('复制失败，请手动复制'))
+  }
+}
+
+async function confirmRevokeToken() {
+  if (!revokeTarget.value) return
+  revokeBusy.value = true
+  try {
+    await api.deleteAccessToken(revokeTarget.value.id)
+    revokeTarget.value = null
+    loadTokens()
+  } catch (err) {
+    showSnack(t('吊销失败：{error}', { error: err.message }))
+  } finally {
+    revokeBusy.value = false
+  }
+}
+
+const revokeAllOpen = ref(false)
+const revokeAllBusy = ref(false)
+const revokeAllError = ref('')
+
+function askRevokeAllSessions() {
+  revokeAllError.value = ''
+  revokeAllOpen.value = true
+}
+
+async function confirmRevokeAllSessions() {
+  if (revokeAllBusy.value) return
+  revokeAllBusy.value = true
+  revokeAllError.value = ''
+  try {
+    await api.revokeAllSessions()
+    revokeAllOpen.value = false
+    emit('revoked')
+  } catch (err) {
+    revokeAllError.value = err.message
+  } finally {
+    revokeAllBusy.value = false
+  }
+}
+
 onMounted(() => {
   loadAppSet()
   loadTG()
   loadWP()
   loadTranslate()
+  loadTokens()
 })
 </script>
 
@@ -843,7 +927,7 @@ onMounted(() => {
         </v-tab>
       </v-tabs>
     </nav>
-    <v-tabs v-if="!lgAndUp" v-model="activeSection" class="mt-2">
+    <v-tabs v-if="!lgAndUp" v-model="activeSection">
       <v-tab
         v-for="s in SECTIONS"
         :key="s.key"
@@ -1222,6 +1306,63 @@ onMounted(() => {
 
     </section>
 
+    <section v-if="showSection('tokens')">
+    <h2 class="text-h6 mb-3">{{ t('访问令牌') }}</h2>
+    <template v-if="tokensState === 'loading'">
+      <v-skeleton-loader type="article" max-width="640" class="skel-clip" />
+    </template>
+    <template v-else-if="tokensState === 'error'">
+      <v-alert type="error" variant="tonal" density="compact" max-width="640">
+        {{ t('令牌加载失败：{error}', { error: tokensError }) }}
+        <v-btn variant="text" size="small" @click="loadTokens">{{ t('重试') }}</v-btn>
+      </v-alert>
+    </template>
+    <div v-else style="max-width: 640px">
+      <div class="mb-4">
+        <v-text-field
+          v-model="tokenLabel"
+          :label="t('令牌名称')"
+          variant="filled"
+          density="comfortable"
+          hide-details
+          style="max-width: 320px"
+          class="mb-3"
+          @keyup.enter="createToken"
+        />
+        <v-btn color="primary" :loading="tokenBusy" :disabled="!tokenLabel.trim()" @click="createToken">{{ t('创建令牌') }}</v-btn>
+      </div>
+      <v-alert v-if="freshToken" type="success" variant="tonal" class="mb-4">
+        <div class="text-body-2 mb-2">{{ t('令牌已创建。明文只显示这一次，关闭后无法再查看，请立即复制保存。') }}</div>
+        <v-text-field
+          :model-value="freshToken"
+          readonly
+          variant="outlined"
+          density="compact"
+          hide-details
+          append-inner-icon="mdi-content-copy"
+          @click:append-inner="copyFreshToken"
+        />
+      </v-alert>
+      <v-card v-for="tk in tokens" :key="tk.id" variant="outlined" rounded="lg" class="mb-3">
+        <v-card-text class="d-flex align-center ga-3">
+          <div class="flex-grow-1" style="min-width: 0">
+            <div class="text-body-1 font-weight-medium text-truncate">{{ tk.label }}</div>
+            <div class="text-body-2 text-medium-emphasis">{{ t('创建时间') }} {{ fmtDateTime(tk.created_at) }}</div>
+            <div class="text-body-2 text-medium-emphasis">{{ t('最近使用') }} {{ tk.last_used_at ? fmtDateTime(tk.last_used_at) : t('从未使用') }}</div>
+          </div>
+          <v-btn color="error" variant="text" @click="revokeTarget = tk">{{ t('吊销') }}</v-btn>
+        </v-card-text>
+      </v-card>
+    </div>
+    </section>
+
+    <section v-if="showSection('sessions')">
+    <h2 class="text-h6 mb-3">{{ t('会话') }}</h2>
+    <div style="max-width: 640px">
+      <v-btn color="error" @click="askRevokeAllSessions">{{ t('吊销全部会话') }}</v-btn>
+    </div>
+    </section>
+
     <div class="text-center text-caption text-medium-emphasis pb-10 mt-8">
       <div>Namakani</div>
       <div v-if="version" class="mt-1">{{ t('版本 {version}', { version }) }}</div>
@@ -1427,6 +1568,35 @@ onMounted(() => {
         <v-spacer />
         <v-btn variant="text" @click="deleteOpen = false">{{ t('取消') }}</v-btn>
         <v-btn color="error" @click="confirmDelete">{{ t('删除') }}</v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <v-dialog :model-value="revokeTarget !== null" max-width="440" @update:model-value="(v) => { if (!v) revokeTarget = null }">
+    <v-card>
+      <v-card-title>{{ t('吊销令牌') }}</v-card-title>
+      <v-card-text>
+        {{ t('吊销令牌「{label}」？吊销后使用这个令牌的请求会立即被拒绝。', { label: revokeTarget?.label }) }}
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="revokeTarget = null">{{ t('取消') }}</v-btn>
+        <v-btn color="error" :loading="revokeBusy" @click="confirmRevokeToken">{{ t('吊销') }}</v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <v-dialog v-model="revokeAllOpen" max-width="440">
+    <v-card>
+      <v-card-title>{{ t('吊销全部会话') }}</v-card-title>
+      <v-card-text>
+        <p class="mb-3">{{ t('所有设备上的会话都会失效，包括当前会话，之后需要重新登录。') }}</p>
+        <v-alert v-if="revokeAllError" type="error" variant="tonal" density="compact">{{ revokeAllError }}</v-alert>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" :disabled="revokeAllBusy" @click="revokeAllOpen = false">{{ t('取消') }}</v-btn>
+        <v-btn color="error" :loading="revokeAllBusy" @click="confirmRevokeAllSessions">{{ t('吊销') }}</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>

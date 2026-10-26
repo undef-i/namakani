@@ -79,6 +79,14 @@ CREATE TABLE IF NOT EXISTS sessions (
 	expires_at  INTEGER NOT NULL,
 	wrapped_key TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS access_tokens (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	label        TEXT NOT NULL,
+	token_hash   TEXT NOT NULL UNIQUE,
+	wrapped_key  TEXT NOT NULL DEFAULT '',
+	created_at   INTEGER NOT NULL DEFAULT 0,
+	last_used_at INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS accounts (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
 	label       TEXT NOT NULL,
@@ -300,6 +308,9 @@ func Open(path string) (*Store, error) {
 		{"ops", "prior_uidvalidity", "ALTER TABLE ops ADD COLUMN prior_uidvalidity INTEGER NOT NULL DEFAULT 0"},
 		{"ops", "finished_at", "ALTER TABLE ops ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0"},
 		{"ops", "identity", "ALTER TABLE ops ADD COLUMN identity TEXT NOT NULL DEFAULT ''"},
+		{"ops", "claim_token", "ALTER TABLE ops ADD COLUMN claim_token INTEGER NOT NULL DEFAULT 0"},
+		{"ops", "sealed", "ALTER TABLE ops ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0"},
+		{"ops", "return_to_draft", "ALTER TABLE ops ADD COLUMN return_to_draft INTEGER NOT NULL DEFAULT 0"},
 	} {
 		has, err := columnExists(db, col.table, col.name)
 		if err != nil {

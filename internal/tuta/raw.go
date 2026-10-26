@@ -198,7 +198,7 @@ func (s *Session) buildRaw(m *mailMeta) ([]byte, error) {
 	}
 	h.Set("Message-Id", "<"+messageID+">")
 
-	b := new(bytes.Buffer)
+	b := &namakani.CapBuffer{Limit: namakani.InboundRawLimit(s.st.AppSettings().MaxAttachmentMB)}
 	w, err := message.CreateWriter(b, h.Header)
 	if err != nil {
 		return nil, err

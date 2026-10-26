@@ -25,7 +25,6 @@ package proton
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -158,7 +157,7 @@ func (s *Session) buildRawLocked(id string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := new(bytes.Buffer)
+	b := &namakani.CapBuffer{Limit: namakani.InboundRawLimit(s.st.AppSettings().MaxAttachmentMB)}
 	w, err := message.CreateWriter(b, rawMessageHeader(msg))
 	if err != nil {
 		return nil, err

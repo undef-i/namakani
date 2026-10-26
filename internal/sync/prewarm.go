@@ -149,7 +149,7 @@ func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandida
 		log.Printf("prewarm account %d: fetch %s/%d: %v", acct.ID, c.FolderName, c.UID, err)
 		return false
 	}
-	parsed, err := mail.ParseBody(raw)
+	parsed, err := mail.ParseBodyCapped(raw, mail.InboundRawLimit(m.st.AppSettings().MaxAttachmentMB))
 	if err != nil {
 		log.Printf("prewarm account %d: parse %s/%d: %v", acct.ID, c.FolderName, c.UID, err)
 		return false

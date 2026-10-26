@@ -333,9 +333,14 @@ func (s *Store) PendingUIDs(folderID int64) (map[uint32]bool, error) {
 
 func (s *Store) TwinRow(accountID int64, messageID string, excludeID int64) (ClaimRow, bool, error) {
 	var r ClaimRow
-	err := s.DB.QueryRow(`SELECT id, folder_id, uid, message_id, body_state FROM messages
-		WHERE account_id = ? AND message_id = ? AND id <> ? AND pending_delete = 0
-		ORDER BY (body_state <> 0) DESC, id ASC LIMIT 1`,
+	// The 'all' folder is a mirror, not a location: its row holds every
+	// message in every location, so it is never evidence of a move and
+	// must never be a claim twin.
+	err := s.DB.QueryRow(`SELECT m.id, m.folder_id, m.uid, m.message_id, m.body_state FROM messages m
+		JOIN folders f ON f.id = m.folder_id
+		WHERE m.account_id = ? AND m.message_id = ? AND m.id <> ? AND m.pending_delete = 0
+		AND f.special_use <> 'all'
+		ORDER BY (m.body_state <> 0) DESC, m.id ASC LIMIT 1`,
 		accountID, messageID, excludeID).Scan(&r.ID, &r.FolderID, &r.UID, &r.MessageID, &r.BodyState)
 	if err != nil {
 		return r, false, nil
@@ -363,9 +368,11 @@ func (s *Store) PendingRows(accountID int64) ([]ClaimRow, error) {
 
 func (s *Store) TwinInFolder(accountID, folderID int64, messageID string, excludeID int64) (ClaimRow, bool, error) {
 	var r ClaimRow
-	err := s.DB.QueryRow(`SELECT id, folder_id, uid, message_id, body_state FROM messages
-		WHERE account_id = ? AND folder_id = ? AND message_id = ? AND id <> ? AND pending_delete = 0
-		ORDER BY (body_state <> 0) DESC, id ASC LIMIT 1`,
+	err := s.DB.QueryRow(`SELECT m.id, m.folder_id, m.uid, m.message_id, m.body_state FROM messages m
+		JOIN folders f ON f.id = m.folder_id
+		WHERE m.account_id = ? AND m.folder_id = ? AND m.message_id = ? AND m.id <> ? AND m.pending_delete = 0
+		AND f.special_use <> 'all'
+		ORDER BY (m.body_state <> 0) DESC, m.id ASC LIMIT 1`,
 		accountID, folderID, messageID, excludeID).Scan(&r.ID, &r.FolderID, &r.UID, &r.MessageID, &r.BodyState)
 	if err != nil {
 		return r, false, nil

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"log"
 	"net/textproto"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"namakani/internal/auth"
@@ -21,36 +23,15 @@ type deleteBatcher interface {
 	DeleteMessages(uids []uint32) error
 }
 
-func (s *Server) openBackgroundConn(ctx context.Context, key []byte, accountID int64) (mail.Conn, error) {
-	acct, err := s.loadMailAccount(accountID, key)
-	if err != nil {
-		return nil, err
-	}
-	if acct.Kind == "proton" {
-		sess, err := proton.Connect(s.st, acct)
-		if err != nil {
-			return nil, err
-		}
-		end, ok := sess.BackgroundTurn(ctx)
-		if !ok {
-			sess.Close()
-			return nil, errors.New("background turn unavailable")
-		}
-		return &turnConn{Conn: sess, end: end}, nil
-	}
-	if acct.Kind == "tuta" {
-		sess, err := tuta.Connect(s.st, acct)
-		if err != nil {
-			return nil, err
-		}
-		end, ok := sess.BackgroundTurn(ctx)
-		if !ok {
-			sess.Close()
-			return nil, errors.New("background turn unavailable")
-		}
-		return &turnConn{Conn: sess, end: end}, nil
-	}
-	return mail.Connect(acct, nil)
+// openDrainConn opens the connection a drain wave executes on. A drain
+// carries out the user's own queued intent, so for session providers it
+// takes the user turn like every other user-initiated path: registering as
+// a waiting user is also what bounds the wait, because background turns
+// (folder sync) only run while no user is waiting, so the drain's turn
+// comes at the end of the folder turn currently in progress instead of
+// behind an unbounded queue of background turns.
+func (s *Server) openDrainConn(ctx context.Context, key []byte, accountID int64) (mail.Conn, error) {
+	return s.openConn(key, accountID)
 }
 
 func (s *Server) anyCredentialKey() ([]byte, bool) {
@@ -148,78 +129,286 @@ func (s *Server) noteConnSuccess(accountID int64) {
 	delete(s.connFail, accountID)
 }
 
-func (s *Server) drainAccount(key []byte, accountID int64) {
+// A drainWave is the live owner of every op one drainAccount invocation
+// claims. Claims are stamped with the wave's token; the watchdog declares a
+// wave dead when it stops making progress, tears its connection down, and
+// the reaper returns its claims to pending. A dead wave that later wakes up
+// cannot land over a new owner: every landing first checks the op has not
+// been re-claimed under a different token.
+type drainWave struct {
+	token    int64
+	progress atomic.Int64
+	dead     atomic.Bool
+	connMu   sync.Mutex
+	conn     mail.Conn
+}
+
+func (w *drainWave) bump() {
+	w.progress.Store(time.Now().Unix())
+}
+
+func (w *drainWave) setConn(c mail.Conn) {
+	w.connMu.Lock()
+	w.conn = c
+	w.connMu.Unlock()
+}
+
+func (w *drainWave) takeConn() mail.Conn {
+	w.connMu.Lock()
+	defer w.connMu.Unlock()
+	c := w.conn
+	w.conn = nil
+	return c
+}
+
+func (s *Server) registerWave(accountID int64) (*drainWave, bool) {
 	s.drainMu.Lock()
-	if s.drainRunning[accountID] {
-		s.drainMu.Unlock()
+	defer s.drainMu.Unlock()
+	if _, ok := s.drainWaves[accountID]; ok {
+		return nil, false
+	}
+	w := &drainWave{token: s.drainTokenSeq.Add(1)}
+	w.bump()
+	s.drainWaves[accountID] = w
+	return w, true
+}
+
+func (s *Server) unregisterWave(accountID int64, w *drainWave) {
+	s.drainMu.Lock()
+	if s.drainWaves[accountID] == w {
+		delete(s.drainWaves, accountID)
+	}
+	s.drainMu.Unlock()
+}
+
+// stampClaims records the wave as owner of the ops it just claimed and
+// mirrors the token onto the in-memory copies the executors land with.
+func (s *Server) stampClaims(w *drainWave, ops []*store.Op) {
+	ids := make([]int64, len(ops))
+	for i, o := range ops {
+		ids[i] = o.ID
+		o.ClaimToken = w.token
+	}
+	if err := s.st.StampClaimToken(ids, w.token); err != nil {
+		log.Printf("namakani: drain: stamp claim token %d: %v", w.token, err)
+	}
+	w.bump()
+}
+
+// opStillOurs reports whether landing an outcome for the op is safe for
+// the wave that computed it. The one unsafe state is in_flight under a
+// different claim token: the op was reclaimed and re-claimed by another
+// wave, and this wave's outcome must be discarded rather than overwrite the
+// new owner's bookkeeping. Every other state is safe to attempt because
+// the store landing functions only ever write to in_flight ops, so an
+// attempt against a pending or already-landed op is a no-op.
+func (s *Server) opStillOurs(o *store.Op) bool {
+	cur, err := s.st.GetOp(o.ID)
+	if err != nil {
+		return false
+	}
+	return cur.Status != store.OpInFlight || cur.ClaimToken == o.ClaimToken
+}
+
+// claimWatchdog is the liveness loop for drain claims. It runs on its own
+// goroutine precisely because the waves it supervises execute on the drain
+// goroutine: a watchdog sharing that goroutine could never fire while a
+// wave is stuck.
+func (s *Server) claimWatchdog() {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		now := time.Now().Unix()
+		s.killStuckWaves(now)
+		s.reclaimOrphanedClaims()
+	}
+}
+
+// killStuckWaves retires every wave that has made no progress for
+// claimStuckSecs: it unregisters the wave, marks it dead so its loop exits
+// at the next wave boundary, and closes its connection, which is what
+// unblocks an executor hung inside a provider call and releases the
+// session turn it holds.
+func (s *Server) killStuckWaves(now int64) {
+	type stuck struct {
+		accountID int64
+		wave      *drainWave
+	}
+	var dead []stuck
+	s.drainMu.Lock()
+	for accountID, w := range s.drainWaves {
+		if now-w.progress.Load() > s.claimStuckSecs {
+			delete(s.drainWaves, accountID)
+			dead = append(dead, stuck{accountID, w})
+		}
+	}
+	s.drainMu.Unlock()
+	for _, d := range dead {
+		d.wave.dead.Store(true)
+		if c := d.wave.takeConn(); c != nil {
+			c.Close()
+		}
+		log.Printf("namakani: drain account %d: wave %d made no progress for over %d seconds, retired; its claims return to pending", d.accountID, d.wave.token, s.claimStuckSecs)
+	}
+}
+
+// reclaimOrphanedClaims returns in_flight ops to pending for every account
+// that has in_flight ops but no registered live wave. An in_flight op is
+// only ever legitimate while its owning wave is registered, so the absence
+// of a registration is the definition of an orphaned claim; no age
+// threshold is involved. Sealed sends are the one exception: the reaper
+// never hands them back to pending (the store refuses), and they are
+// settled by their landing check instead.
+func (s *Server) reclaimOrphanedClaims() {
+	accounts, err := s.st.AccountsWithInFlightOps()
+	if err != nil {
 		return
 	}
-	s.drainRunning[accountID] = true
-	s.drainMu.Unlock()
+	for _, accountID := range accounts {
+		s.drainMu.Lock()
+		_, owned := s.drainWaves[accountID]
+		s.drainMu.Unlock()
+		if owned {
+			continue
+		}
+		if n, err := s.st.ReleaseInFlightOps(accountID); err != nil {
+			log.Printf("namakani: drain account %d: reclaim orphaned in-flight ops: %v", accountID, err)
+		} else if n > 0 {
+			log.Printf("namakani: drain account %d: reclaimed %d orphaned in-flight ops", accountID, n)
+			s.kickDrain()
+		}
+		if sealed, err := s.st.ListSealedInFlightSends(accountID); err == nil && len(sealed) > 0 {
+			if key, ok := s.anyCredentialKey(); ok {
+				s.settleSealedSends(key, accountID)
+			}
+		}
+	}
+}
+
+// settleSealedSends resolves the account's sealed sends whose claim
+// generation died after the checkpoint. The landing check is the only
+// thing a new generation may do with them: a send whose payload
+// already carries the Sent marker provably reached the provider, so
+// the settler finishes its books (sent copy, completion) without ever
+// calling the provider again; a send without the marker has an
+// unproven outcome and is parked as outcome-unknown, because treating
+// it as unsent is exactly how the same letter gets delivered twice.
+// Adoption rotates the claim token first, so the dead executor waking
+// up later is fenced out of every landing path.
+func (s *Server) settleSealedSends(key []byte, accountID int64) {
+	orphans, err := s.st.ListSealedInFlightSends(accountID)
+	if err != nil {
+		log.Printf("namakani: drain account %d: list sealed in-flight sends: %v", accountID, err)
+		return
+	}
+	for _, o := range orphans {
+		newToken := s.drainTokenSeq.Add(1)
+		adopted, err := s.st.AdoptSealedSend(o.ID, o.ClaimToken, newToken)
+		if err != nil || !adopted {
+			continue
+		}
+		o.ClaimToken = newToken
+		var sp sendOpPayload
+		_ = json.Unmarshal([]byte(o.Payload), &sp)
+		if sp.Sent {
+			s.executeSend(key, o)
+			continue
+		}
+		parked, err := s.st.ParkSealedSendUnknown(o.ID)
+		if err != nil || !parked {
+			continue
+		}
+		log.Printf("namakani: drain account %d: send op %d was sealed by a dead wave and its delivery outcome is unknown; parked for attention", accountID, o.ID)
+		s.broadcastSendState(o.ID, store.OpNeedsAttention, false, false)
+		s.broadcastOps()
+		s.broadcastScheduled()
+	}
+}
+
+func (s *Server) drainAccount(key []byte, accountID int64) {
+	wave, ok := s.registerWave(accountID)
+	if !ok {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("namakani: drain account %d: wave %d panicked, its claims are left for the reaper: %v", accountID, wave.token, r)
+		}
+		s.unregisterWave(accountID, wave)
+	}()
 	if n, err := s.st.ReleaseInFlightOps(accountID); err != nil {
 		log.Printf("namakani: drain account %d: release stranded in-flight ops: %v", accountID, err)
 	} else if n > 0 {
 		log.Printf("namakani: drain account %d: released %d stranded in-flight ops", accountID, n)
 	}
-	defer func() {
-		s.drainMu.Lock()
-		delete(s.drainRunning, accountID)
-		s.drainMu.Unlock()
-	}()
+	s.settleSealedSends(key, accountID)
 	var runFailed []int64
 	for {
-		ops, err := s.st.ClaimDueOps(accountID, time.Now().Unix(), 500)
-		if err != nil || len(ops) == 0 {
+		if wave.dead.Load() {
 			return
 		}
-		var sends, rest []*store.Op
-		for _, o := range ops {
-			if o.Type == store.OpSend {
-				sends = append(sends, o)
-			} else {
-				rest = append(rest, o)
-			}
+		progressed := false
+		sends, err := s.st.ClaimDueOps(accountID, time.Now().Unix(), 500, store.OpSend)
+		if err != nil {
+			return
 		}
-		waveDone := 0
 		if len(sends) > 0 {
-			done, failed := s.executeSendWave(key, sends)
-			waveDone += done
+			s.stampClaims(wave, sends)
+			for _, o := range sends {
+				// The op has left pending: publish it on the send-state
+				// channel at claim time so clients retire the undo
+				// affordance from server state, not from a local timer.
+				s.broadcastSendState(o.ID, store.OpInFlight, false, false)
+			}
+			done, failed := s.executeSendWave(key, wave, sends)
+			progressed = done > 0 || len(failed) > 0
 			runFailed = append(runFailed, failed...)
 		}
-		if len(rest) == 0 {
-			if waveDone > 0 {
-				_ = s.st.AccelerateAccountOps(accountID, time.Now().Unix(), runFailed)
-			}
-			continue
-		}
-		ops = rest
 		if s.connBackedOff(accountID, time.Now().Unix()) {
-			ids := make([]int64, len(ops))
-			for i, o := range ops {
-				ids[i] = o.ID
+			if progressed {
+				_ = s.st.AccelerateAccountOps(accountID, time.Now().Unix(), runFailed)
+				continue
 			}
-			_ = s.st.ReleaseOps(ids)
+			return
+		}
+		restDue, err := s.st.HasDueOps(accountID, time.Now().Unix(), store.OpMove, store.OpFlags, store.OpExpunge)
+		if err != nil || !restDue {
+			if progressed {
+				_ = s.st.AccelerateAccountOps(accountID, time.Now().Unix(), runFailed)
+				continue
+			}
 			return
 		}
 		conn, err := s.drainOpen(context.Background(), key, accountID)
 		if err != nil {
-			ids := make([]int64, len(ops))
-			for i, o := range ops {
-				ids[i] = o.ID
-			}
-			_ = s.st.ReleaseOps(ids)
 			s.noteConnFailure(accountID, time.Now().Unix())
 			log.Printf("namakani: drain account %d: connect: %v", accountID, err)
 			return
 		}
+		wave.setConn(conn)
 		s.noteConnSuccess(accountID)
-		done, failed := s.executeWave(conn, accountID, ops)
-		waveDone += done
-		runFailed = append(runFailed, failed...)
-		conn.Close()
-		if waveDone > 0 {
-			_ = s.st.AccelerateAccountOps(accountID, time.Now().Unix(), runFailed)
+		wave.bump()
+		rest, err := s.st.ClaimDueOps(accountID, time.Now().Unix(), 500, store.OpMove, store.OpFlags, store.OpExpunge)
+		if err != nil || len(rest) == 0 {
+			conn.Close()
+			wave.setConn(nil)
+			if progressed {
+				_ = s.st.AccelerateAccountOps(accountID, time.Now().Unix(), runFailed)
+				continue
+			}
+			return
 		}
+		s.stampClaims(wave, rest)
+		done, failed := s.executeWave(conn, wave, accountID, rest)
+		progressed = progressed || done > 0 || len(failed) > 0
+		runFailed = append(runFailed, failed...)
+		wave.takeConn()
+		conn.Close()
+		wave.bump()
+		if !progressed {
+			return
+		}
+		_ = s.st.AccelerateAccountOps(accountID, time.Now().Unix(), runFailed)
 	}
 }
 
@@ -270,7 +459,7 @@ func classifyOpError(err error) (permanent, gone bool) {
 	return false, false
 }
 
-func (s *Server) executeWave(conn mail.Conn, accountID int64, ops []*store.Op) (int, []int64) {
+func (s *Server) executeWave(conn mail.Conn, wave *drainWave, accountID int64, ops []*store.Op) (int, []int64) {
 	outcomes := make([]*opOutcome, len(ops))
 	byID := make(map[int64]*opOutcome, len(ops))
 	for i, o := range ops {
@@ -310,9 +499,13 @@ func (s *Server) executeWave(conn mail.Conn, accountID int64, ops []*store.Op) (
 		o.MessageID = target.RowID
 		execOps = append(execOps, o)
 	}
-	s.execFlags(conn, execOps, byID)
-	s.execMoves(conn, execOps, byID)
-	s.execExpunges(conn, execOps, byID)
+	wave.bump()
+	s.execFlags(conn, wave, execOps, byID)
+	wave.bump()
+	s.execMoves(conn, wave, execOps, byID)
+	wave.bump()
+	s.execExpunges(conn, wave, execOps, byID)
+	wave.bump()
 	now := time.Now().Unix()
 	parked := false
 	var voidedUndo []int64
@@ -339,6 +532,13 @@ func (s *Server) executeWave(conn mail.Conn, accountID int64, ops []*store.Op) (
 	done := 0
 	lostLanded := false
 	for _, oc := range outcomes {
+		wave.bump()
+		if !s.opStillOurs(oc.op) {
+			// The wave lost this claim while executing (watchdog retire plus
+			// reaper). The computed outcome is discarded: landing it could
+			// overwrite the state of the op's current owner.
+			continue
+		}
 		counted := false
 		if oc.failed == nil || oc.gone {
 			done++
@@ -445,7 +645,7 @@ func (s *Server) executeWave(conn mail.Conn, accountID int64, ops []*store.Op) (
 			continue
 		}
 		cur, err := s.st.GetOp(oc.op.ID)
-		if err != nil || !cur.UndoRequested || cur.Status != store.OpDone {
+		if err != nil || !cur.UndoRequested || cur.Status != store.OpDone || cur.ClaimToken != oc.op.ClaimToken {
 			continue
 		}
 		res, err := s.st.UndoOp(cur.ID)
@@ -480,7 +680,7 @@ type flagPart struct {
 	opRef *opOutcome
 }
 
-func (s *Server) execFlags(conn mail.Conn, ops []*store.Op, byID map[int64]*opOutcome) {
+func (s *Server) execFlags(conn mail.Conn, wave *drainWave, ops []*store.Op, byID map[int64]*opOutcome) {
 	type groupKey struct {
 		folder string
 		flag   imap.Flag
@@ -524,6 +724,7 @@ func (s *Server) execFlags(conn mail.Conn, ops []*store.Op, byID map[int64]*opOu
 	}
 	for _, k := range order {
 		parts := groups[k]
+		wave.bump()
 		if selected != k.folder {
 			if _, err := conn.SelectRW(k.folder); err != nil {
 				selectFailed[k.folder] = err
@@ -594,12 +795,13 @@ func (s *Server) isolateGoneFlags(conn mail.Conn, parts []*flagPart, partsLeft m
 	}
 }
 
-func (s *Server) execMoves(conn mail.Conn, ops []*store.Op, byID map[int64]*opOutcome) {
+func (s *Server) execMoves(conn mail.Conn, wave *drainWave, ops []*store.Op, byID map[int64]*opOutcome) {
 	for _, o := range ops {
 		if o.Type != store.OpMove {
 			continue
 		}
 		s.execMoveOne(conn, o, byID[o.ID])
+		wave.bump()
 	}
 }
 
@@ -715,7 +917,7 @@ func (s *Server) resolveMovedUID(conn mail.Conn, o *store.Op, payload store.Move
 	return 0, false
 }
 
-func (s *Server) execExpunges(conn mail.Conn, ops []*store.Op, byID map[int64]*opOutcome) {
+func (s *Server) execExpunges(conn mail.Conn, wave *drainWave, ops []*store.Op, byID map[int64]*opOutcome) {
 	type group struct {
 		folder string
 		parts  []*opOutcome
@@ -743,6 +945,7 @@ func (s *Server) execExpunges(conn mail.Conn, ops []*store.Op, byID map[int64]*o
 	}
 	for _, name := range order {
 		g := groups[name]
+		wave.bump()
 		if selected != name {
 			if _, err := conn.SelectRW(name); err != nil {
 				for _, oc := range g.parts {

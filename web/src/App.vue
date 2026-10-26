@@ -52,6 +52,95 @@ let appendReplay = false
 const memberThread = new Map()
 const intents = ref(new Map())
 const restoreIntentByOp = new Map()
+const undoKeyWaiters = new Set()
+
+function finishUndoRestore(restore) {
+  if ((restore.undoWaiters ?? 0) > 0) return
+  loadFolders()
+  const failures = restore.undoFailures ?? []
+  if (failures.length) {
+    failRestoreItems(
+      restore,
+      failures.map((f) => f.it),
+    )
+    actionError.value = failures[0].err.message
+  }
+  settleRestoreIntent(restore)
+}
+
+async function lookupUndoOp(w) {
+  const res = await api.opsByKeys(w.keys).catch(() => null)
+  if (!res) return 0
+  const exact = res.find((r) => r.client_key.endsWith(':' + w.it.id))
+  const bare = w.bareOk ? res.find((r) => w.entryKeys.includes(r.client_key)) : undefined
+  const r = exact ?? bare
+  if (!r) return 0
+  if (r.status === 'undone' || r.status === 'failed') return 'closed'
+  return r.op_id
+}
+
+async function undoWaiterViaOp(w, opId) {
+  restoreIntentByOp.set(opId, w.restore.id)
+  try {
+    await api.undoOp(opId)
+  } catch (err) {
+    ;(w.restore.undoFailures ??= []).push({ it: w.it, err })
+  }
+}
+
+async function parkUndoItems(restore, items, u, bareOk) {
+  for (const it of items) {
+    const w = {
+      restore,
+      it,
+      keys: (u.obKeys ?? []).flatMap((k) => [k + ':' + it.id, k]),
+      entryKeys: [...(u.obKeys ?? [])],
+      bareOk,
+    }
+    const found = await lookupUndoOp(w)
+    if (found === 'closed') continue
+    if (found) {
+      await undoWaiterViaOp(w, found)
+      continue
+    }
+    if (!w.entryKeys.some((k) => obLive.has(k) || obList.value.some((e) => e.key === k))) continue
+    undoKeyWaiters.add(w)
+    restore.undoWaiters = (restore.undoWaiters ?? 0) + 1
+  }
+}
+
+let undoKeyFlushRunning = false
+async function flushUndoKeyWaiters() {
+  if (undoKeyFlushRunning || !undoKeyWaiters.size) return
+  undoKeyFlushRunning = true
+  try {
+    for (const w of [...undoKeyWaiters]) {
+      if (!intents.value.has(w.restore.id)) {
+        undoKeyWaiters.delete(w)
+        w.restore.undoWaiters--
+        finishUndoRestore(w.restore)
+        continue
+      }
+      const found = await lookupUndoOp(w)
+      if (found === 'closed') {
+        undoKeyWaiters.delete(w)
+        w.restore.undoWaiters--
+        finishUndoRestore(w.restore)
+      } else if (found) {
+        undoKeyWaiters.delete(w)
+        w.restore.undoWaiters--
+        await undoWaiterViaOp(w, found)
+        finishUndoRestore(w.restore)
+      } else if (!w.entryKeys.some((k) => obLive.has(k) || obList.value.some((e) => e.key === k))) {
+        undoKeyWaiters.delete(w)
+        w.restore.undoWaiters--
+        finishUndoRestore(w.restore)
+      }
+    }
+  } catch {
+  }
+  undoKeyFlushRunning = false
+}
 let intentSeq = 0
 
 function snapCtxKey(snap) {
@@ -113,6 +202,7 @@ function confirmIntent(intent) {
 
 function noteIntentOps(intent, items) {
   for (const it of items ?? []) if (it && it.op_id) intent.opIds.add(it.op_id)
+  void flushUndoKeyWaiters()
 }
 
 function exitDoneIntent(intent, id) {
@@ -434,9 +524,17 @@ async function resumeSendCountdowns() {
   } catch {
     return
   }
-  const now = Math.floor(Date.now() / 1000)
+  // Restore by server state, not by the clock: every send that is
+  // still undoable gets its entry back — pending ones whose time
+  // has come without a claim and claimed ones waiting unsealed
+  // behind a bulk wave included. not_before only decides whether
+  // the bar shows a countdown or "sending", never whether the entry
+  // exists; sealed or already-sent sends are the server's terminal
+  // side and stay out. The creation-window bound is what separates
+  // an immediate send's undo window from a scheduled send, whose
+  // entry lives in the scheduled view.
   const cands = (pend || []).filter(
-    (p) => p.type === 'send' && p.not_before > now && p.not_before - p.created_at <= 60,
+    (p) => p.type === 'send' && !p.sent && !p.sealed && p.not_before - p.created_at <= 120,
   )
   if (!cands.length) return
   const p = cands[cands.length - 1]
@@ -533,6 +631,12 @@ const messages = computed(() => {
   }
   let out = rows
   if (hide.size) out = out.filter((r) => !hide.has(r.id))
+  if (threaded.value && !searching.value) {
+    out = out.filter((r) => {
+      const cov = threadHideIntent(r)
+      return !cov || cov.exiting.has(r.id)
+    })
+  }
   if (overlay.size) out = out.map((r) => (overlay.has(r.id) ? withFlags(r, overlay.get(r.id)) : r))
   if (exitingExtra.length) {
     out = [...out]
@@ -635,6 +739,7 @@ function applySnapshot(batch, snap, startSeq, append = false, wm = null) {
   journal.length = 0
   journalRows(rows)
   baseRows.value = rows
+  snapEpoch = listEpoch
   const have = new Set(rows.map((r) => r.id))
   const batchById = new Map(batch.map((r) => [r.id, r]))
   const belongs = snapBelongs(snap)
@@ -656,6 +761,12 @@ function applySnapshot(batch, snap, startSeq, append = false, wm = null) {
 
 const scopeCache = new Map()
 let listEpoch = 0
+// snapEpoch is the listEpoch at which the currently displayed rows were
+// produced (snapshot applied, incremental event merged, or cache entry
+// adopted). stashList stamps entries with it, never with the live
+// listEpoch: an event bumps listEpoch before its reload lands, and the
+// rows visible in between still belong to the older epoch.
+let snapEpoch = 0
 function listCacheKey(snap) {
   return snapCtxKey(snap) + '|t' + (threaded.value ? '1' : '0')
 }
@@ -667,7 +778,7 @@ function stashList() {
     offset: listOffset,
     hasMore: listHasMore.value,
     scroll: scrollEl(listEl.value)?.scrollTop ?? 0,
-    epoch: listEpoch,
+    epoch: snapEpoch,
   })
   if (scopeCache.size > 12) scopeCache.delete(scopeCache.keys().next().value)
 }
@@ -1007,8 +1118,10 @@ async function bulkAct(kind) {
     removable && threaded.value && !searching.value && rows.some((x) => x.thread_count > 1)
   const bulkDest = !removable
     ? null
-    : kind === 'delete' && listSnap.value.scope === 'scheduled'
-      ? cancelDest
+    : listSnap.value.scope === 'scheduled'
+      ? kind === 'delete'
+        ? schedDeleteDest
+        : cancelDest
       : kind === 'delete'
         ? specialDest('delete', rows[0]?.account_id ?? selected.value?.account_id ?? 0, 'trash')
         : bulkArchiveDest(rows)
@@ -1078,10 +1191,11 @@ async function bulkAct(kind) {
           )
         }
       }
-      if (kind === 'delete' && listSnap.value.scope === 'scheduled') {
+      if (listSnap.value.scope === 'scheduled' && (kind === 'delete' || kind === 'archive')) {
         for (const id of opIds) {
           try {
-            await api.cancelScheduled(id)
+            if (kind === 'delete') await api.deleteScheduled(id)
+            else await api.cancelScheduled(id)
             const ui = itemById.get(id)
             if (ui) movedItems.push(ui)
           } catch (e) {
@@ -1717,6 +1831,7 @@ async function loadMessages(soft = false) {
     }
     hit.messages = rows
     baseRows.value = rows
+    snapEpoch = hit.epoch
     for (const it of [...intents.value.values()]) {
       if (it.kind === 'restore') settleRestoreIntent(it)
     }
@@ -1953,6 +2068,39 @@ watch(listEl, (el) => {
   if (vp && vp !== el) bindListVp(vp)
 })
 
+const dividerState = new WeakMap()
+function setBarDivider(bar, scrolled) {
+  if (!bar || dividerState.get(bar) === scrolled) return
+  dividerState.set(bar, scrolled)
+  bar.classList.toggle('bar-scrolled', scrolled)
+}
+let topbarElCache = null
+function listTopbarEl() {
+  if (!topbarElCache || !topbarElCache.isConnected) {
+    topbarElCache = document.querySelector('.app-topbar')
+  }
+  return topbarElCache
+}
+function onScrollDivider(e) {
+  const t = e.target
+  if (!t || t.nodeType !== 1) return
+  const list = t.closest('.list-scroll')
+  if (list && (t === list || t === scrollEl(list))) {
+    setBarDivider(listTopbarEl(), t.scrollTop > 0)
+    return
+  }
+  const reader = t.closest('.reader-scroll')
+  if (reader && (t === reader || t === scrollEl(reader))) {
+    const main = reader.closest('.reader-main')
+    setBarDivider(main?.querySelector('.reader-toolbar, .reader-head'), t.scrollTop > 0)
+    return
+  }
+  const settings = t.closest('.settings-content')
+  if (settings && (t === settings || t === scrollEl(settings))) {
+    setBarDivider(document.querySelector('.settings-topbar'), t.scrollTop > 0)
+  }
+}
+
 
 const SWIPE_COMMIT = 96
 const swipeId = ref(0)
@@ -1971,6 +2119,7 @@ const toastText = ref('')
 const toastShow = ref(false)
 let toastTimer = 0
 const cancelDest = { verb: 'cancel', folder_id: 0, special: '', name: '', mixed: false, key: 'cancel' }
+const schedDeleteDest = { verb: 'delete', folder_id: 0, special: 'trash', name: '', mixed: false, key: 'sched-delete' }
 function folderDest(verb, folder) {
   return {
     verb,
@@ -2190,29 +2339,23 @@ function undoRemoval() {
       for (const it of moved) {
         if (it.op_id) restoreIntentByOp.set(it.op_id, restore.id)
       }
-      const failures = (
+      restore.undoFailures = (
         await Promise.all(
-          moved.map(async (it) => {
-            try {
-              if (it.op_id) await api.undoOp(it.op_id)
-              else if (it.folder_id) await api.moveMessageToFolder(it.id, it.folder_id)
-              else await api.moveMessage(it.id, it.special)
-              return null
-            } catch (err) {
-              return { it, err }
-            }
-          }),
+          moved
+            .filter((it) => it.op_id)
+            .map(async (it) => {
+              try {
+                await api.undoOp(it.op_id)
+                return null
+              } catch (err) {
+                return { it, err }
+              }
+            }),
         )
       ).filter(Boolean)
-      loadFolders()
-      if (failures.length) {
-        failRestoreItems(
-          restore,
-          failures.map((f) => f.it),
-        )
-        actionError.value = failures[0].err.message
-      }
-      settleRestoreIntent(restore)
+      const withoutOp = moved.filter((it) => !it.op_id)
+      if (withoutOp.length) await parkUndoItems(restore, withoutOp, u, moved.length === 1)
+      finishUndoRestore(restore)
     })()
   })
 }
@@ -2536,6 +2679,7 @@ function rowsInsertFlat(rows, item, belongs) {
 }
 
 function rowsInsertThreaded(rows, item, belongs) {
+  if (intentCoversThread(item)) return rows
   const self = rows.findIndex((r) => r.id === item.id)
   if (self >= 0) {
     const cur = rows[self]
@@ -2575,19 +2719,24 @@ function rowsInsertThreaded(rows, item, belongs) {
   return next.sort(byDateDesc)
 }
 
-function intentCoversThread(rep) {
+function threadHideIntent(rep) {
   for (const it of intents.value.values()) {
     if (
       it.kind === 'hide' &&
       !it.superseded &&
       it.thread &&
       it.thread.accountId === rep.account_id &&
-      it.thread.threadKey === (rep.thread_key || 'id:' + rep.id)
+      it.thread.threadKey === (rep.thread_key || 'id:' + rep.id) &&
+      it.ids.has(it.thread.repId)
     ) {
-      return true
+      return it
     }
   }
-  return false
+  return null
+}
+
+function intentCoversThread(rep) {
+  return threadHideIntent(rep) !== null
 }
 
 function rowsApplyRemoved(rows, ev) {
@@ -2666,6 +2815,7 @@ function applyFlagsInput(items) {
   journalDelta({ type: 'flags', items })
   for (const it of items) latestFlags.set(it.id, it.flags)
   baseRows.value = rowsApplyFlags(baseRows.value, items)
+  snapEpoch = listEpoch
   for (const it of items) memberFlags.set(it.id, it.flags)
   patchAuxFlags(items)
 }
@@ -2693,6 +2843,7 @@ function applyMessagesInput(items) {
     }
   }
   baseRows.value = rows
+  snapEpoch = listEpoch
   let retiredAny = false
   for (const it of [...intents.value.values()]) {
     if (it.kind === 'restore') settleRestoreIntent(it)
@@ -2715,6 +2866,7 @@ function applyRemovedInput(ev) {
   const ids = new Set(ev.ids ?? [])
   const { rows, gap } = rowsApplyRemoved(baseRows.value, ev)
   baseRows.value = rows
+  snapEpoch = listEpoch
   if (convo.value && ids.size) {
     convo.value = { ...convo.value, msgs: convo.value.msgs.filter((m) => !ids.has(m.id)) }
   }
@@ -2744,7 +2896,7 @@ function onServerEvent(ev) {
     }
     lastEventSeq = ev.seq
   }
-  if (ev.type === 'messages' || ev.type === 'removed') listEpoch++
+  if (ev.type === 'messages' || ev.type === 'removed' || ev.type === 'scheduled') listEpoch++
   if (ev.type === 'messages') {
     const beforeCount = messages.value.length
     applyMessagesInput(ev.items ?? [])
@@ -2797,6 +2949,13 @@ function onServerEvent(ev) {
       }
     }
     refreshSyncSources()
+    void flushUndoKeyWaiters()
+  } else if (ev.type === 'scheduled') {
+    for (const k of [...scopeCache.keys()]) {
+      if (k.startsWith('folder|scheduled|')) scopeCache.delete(k)
+    }
+    refreshScheduledCount()
+    if (scope.value === 'scheduled' && !searching.value) loadMessages(true)
   }
 }
 
@@ -2817,6 +2976,7 @@ function connectEvents() {
       rebuildList()
       loadStatuses()
       obFlush()
+      void flushUndoKeyWaiters()
     }
   }
   es.onmessage = (e) => {
@@ -3707,7 +3867,7 @@ async function actOnThread(m, kind, animate = false) {
     ids: [m.id],
     rows: [m],
     exiting: animate ? [m.id] : [],
-    thread: { accountId: m.account_id, threadKey: m.thread_key || 'id:' + m.id },
+    thread: { accountId: m.account_id, threadKey: m.thread_key || 'id:' + m.id, repId: m.id },
   })
   let dest = threadDestFor(kind, m, null)
   showCountToast(
@@ -3832,7 +3992,7 @@ async function archiveFor(m, animate = false) {
   if (!m) return
   if (m.folder_special === 'trash' || m.folder_special === 'junk') return inboxFor(m, animate)
   if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'archive', animate)
-  if (m.folder_special === 'scheduled') return deleteFor(m, animate)
+  if (m.folder_special === 'scheduled') return toDraftsFor(m, animate)
   return moveSingle(m, 'archive', animate)
 }
 
@@ -3916,44 +4076,55 @@ async function moveSingle(m, dest, animate = false) {
   }
 }
 
+// The two actions on a scheduled row: return it to Drafts (cancel the
+// pending send, the letter is filed back as a draft) or delete it for
+// real (cancel the pending send and destroy the letter). Both remove
+// the row from the scheduled projection immediately.
+async function scheduledRowAction(m, animate, purge) {
+  const intent = registerHideIntent({
+    ids: [m.id],
+    rows: [m],
+    exiting: animate ? [m.id] : [],
+  })
+  const dest = purge ? schedDeleteDest : cancelDest
+  const p = purge ? api.deleteScheduled(m.id) : api.cancelScheduled(m.id)
+  let outcome = null
+  const settled = p.then(
+    (res) => {
+      outcome = { ok: true }
+      return [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, op_id: res?.op_id }]
+    },
+    () => {
+      outcome = { ok: false }
+      return []
+    },
+  )
+  showCountToast(dest, 1, null)
+  if (animate) {
+    await animateRowRemoval(m, intent)
+  } else {
+    afterRemovalLocal(m.id)
+  }
+  const settledItems = await settled
+  if (outcome?.ok) {
+    noteIntentOps(intent, settledItems)
+    confirmIntent(intent)
+  } else {
+    failIntent(intent, [m.id])
+    showRemovalFailure(dest, 1)
+    animateRollback([m.id])
+  }
+}
+
+function toDraftsFor(m, animate = false) {
+  if (!m) return
+  return scheduledRowAction(m, animate, false)
+}
+
 async function deleteFor(m, animate = false) {
   if (!m) return
   if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'delete', animate)
-  if (m.folder_special === 'scheduled') {
-    const intent = registerHideIntent({
-      ids: [m.id],
-      rows: [m],
-      exiting: animate ? [m.id] : [],
-    })
-    const p = api.cancelScheduled(m.id)
-    let outcome = null
-    const settled = p.then(
-      (res) => {
-        outcome = { ok: true }
-        return [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, op_id: res?.op_id }]
-      },
-      () => {
-        outcome = { ok: false }
-        return []
-      },
-    )
-    showCountToast(cancelDest, 1, null)
-    if (animate) {
-      await animateRowRemoval(m, intent)
-    } else {
-      afterRemovalLocal(m.id)
-    }
-    const settledItems = await settled
-    if (outcome?.ok) {
-      noteIntentOps(intent, settledItems)
-      confirmIntent(intent)
-    } else {
-      failIntent(intent, [m.id])
-      showRemovalFailure(cancelDest, 1)
-      animateRollback([m.id])
-    }
-    return
-  }
+  if (m.folder_special === 'scheduled') return scheduledRowAction(m, animate, true)
   const intent = registerHideIntent({
     ids: [m.id],
     rows: [m],
@@ -4292,10 +4463,7 @@ async function boot() {
   }
 }
 
-async function doLogout() {
-  booted = false
-  disconnectEvents()
-  await api.logout().catch(() => {})
+function resetToAuth() {
   accounts.value = []
   folders.value = []
   baseRows.value = []
@@ -4306,6 +4474,19 @@ async function doLogout() {
   settingsOpen.value = false
   authMode.value = 'login'
   view.value = 'auth'
+}
+
+async function doLogout() {
+  booted = false
+  disconnectEvents()
+  await api.logout().catch(() => {})
+  resetToAuth()
+}
+
+function onSessionsRevoked() {
+  booted = false
+  disconnectEvents()
+  resetToAuth()
 }
 
 function onThreadedChange(v) {
@@ -4342,6 +4523,7 @@ onMounted(() => {
   document.addEventListener('pointerup', onDrawerPressUp, true)
   document.addEventListener('pointercancel', onDrawerPressCancel, true)
   document.addEventListener('click', onDrawerPressClick, true)
+  window.addEventListener('scroll', onScrollDivider, { capture: true, passive: true })
   initTheme()
   boot()
 })
@@ -4356,6 +4538,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerup', onDrawerPressUp, true)
   document.removeEventListener('pointercancel', onDrawerPressCancel, true)
   document.removeEventListener('click', onDrawerPressClick, true)
+  window.removeEventListener('scroll', onScrollDivider, { capture: true })
   systemDarkMQ?.removeEventListener('change', applyTheme)
   disconnectEvents()
 })
@@ -4431,7 +4614,7 @@ onBeforeUnmount(() => {
           <div v-if="selectionActive" class="d-flex align-center ga-1 mx-n2">
             <v-btn icon="mdi-close" variant="text" :aria-label="t('取消选择')" @click="clearSelectionIds" />
             <v-toolbar-title class="ml-4">{{ selectedIds.size }}</v-toolbar-title>
-            <v-btn v-if="scope !== 'scheduled'" :icon="(scope === 'trash' || scope === 'junk') ? 'mdi-inbox' : 'mdi-archive'" variant="text" :disabled="scope === 'archive'" :aria-label="(scope === 'trash' || scope === 'junk') ? t('移回收件箱') : t('归档')" @click="bulkAct('archive')" />
+            <v-btn :icon="scope === 'scheduled' ? 'mdi-file-document-edit-outline' : (scope === 'trash' || scope === 'junk') ? 'mdi-inbox' : 'mdi-archive'" variant="text" :disabled="scope === 'archive'" :aria-label="scope === 'scheduled' ? t('退回草稿箱') : (scope === 'trash' || scope === 'junk') ? t('移回收件箱') : t('归档')" @click="bulkAct('archive')" />
             <v-btn icon="mdi-delete" variant="text" :aria-label="t('删除')" @click="bulkAct('delete')" />
             <v-btn v-if="scope !== 'scheduled'" :icon="selectionHasUnread ? 'mdi-email-open' : 'mdi-email'" variant="text" :aria-label="selectionHasUnread ? t('标为已读') : t('标为未读')" @click="bulkAct(selectionHasUnread ? 'seen' : 'unseen')" />
           </div>
@@ -4660,9 +4843,9 @@ onBeforeUnmount(() => {
                 />
                 <template v-if="selectionActive">
                   <span class="text-body-2 ml-1">{{ t('已选 {n} 封', { n: selectedIds.size }) }}</span>
-                  <v-btn v-if="scope !== 'scheduled'" icon variant="text" size="small" :disabled="scope === 'archive'" @click="bulkAct('archive')">
-                    <v-icon :icon="(scope === 'trash' || scope === 'junk') ? 'mdi-inbox' : 'mdi-archive'" />
-                    <v-tooltip activator="parent" location="bottom">{{ (scope === 'trash' || scope === 'junk') ? t('移回收件箱') : t('归档') }}</v-tooltip>
+                  <v-btn icon variant="text" size="small" :disabled="scope === 'archive'" @click="bulkAct('archive')">
+                    <v-icon :icon="scope === 'scheduled' ? 'mdi-file-document-edit-outline' : (scope === 'trash' || scope === 'junk') ? 'mdi-inbox' : 'mdi-archive'" />
+                    <v-tooltip activator="parent" location="bottom">{{ scope === 'scheduled' ? t('退回草稿箱') : (scope === 'trash' || scope === 'junk') ? t('移回收件箱') : t('归档') }}</v-tooltip>
                   </v-btn>
                   <v-btn icon variant="text" size="small" @click="bulkAct('delete')">
                     <v-icon icon="mdi-delete" />
@@ -4791,11 +4974,10 @@ onBeforeUnmount(() => {
                       <v-icon icon="mdi-delete" size="20" />
                     </div>
                     <div
-                      class="swipe-bg swipe-bg-right"
-                      :class="scope === 'scheduled' ? 'swipe-bg-delete' : 'swipe-bg-archive'"
+                      class="swipe-bg swipe-bg-right swipe-bg-archive"
                       :style="{ opacity: swipeId === m.id && swipeDx < 0 ? 1 : 0 }"
                     >
-                      <v-icon :icon="scope === 'scheduled' ? 'mdi-delete' : (scope === 'archive' || m.folder_special === 'trash' || m.folder_special === 'junk') ? 'mdi-inbox' : 'mdi-archive'" size="20" />
+                      <v-icon :icon="scope === 'scheduled' ? 'mdi-file-document-edit-outline' : (scope === 'archive' || m.folder_special === 'trash' || m.folder_special === 'junk') ? 'mdi-inbox' : 'mdi-archive'" size="20" />
                     </div>
                   <div
                     v-if="lgAndUp"
@@ -4835,7 +5017,7 @@ onBeforeUnmount(() => {
                           {{ t('共 {n} 封', { n: m.thread_count }) }}<template v-if="m.thread_unread">{{ t('，{n} 未读', { n: m.thread_unread }) }}</template>
                         </span>
                         <v-icon v-if="m.folder_special === 'scheduled'" icon="mdi-clock-outline" size="14" class="row-time-icon" />
-                        <span class="row-time">{{ fmtListTime(m.date_ts) }}</span>
+                        <span class="row-time">{{ m.op_status === 'in_flight' ? t('正在发送') : fmtListTime(m.date_ts) }}</span>
                       </div>
                       <div class="row-l2" :class="{ w600: !(m.flags & 1) }">
                         <span class="row-subject">{{ m.subject || t('(无主题)') }}</span>
@@ -4891,7 +5073,7 @@ onBeforeUnmount(() => {
                         </span>
                         <v-icon v-if="m.has_attach" icon="mdi-paperclip" size="14" class="text-medium-emphasis" />
                         <v-icon v-if="m.folder_special === 'scheduled'" icon="mdi-clock-outline" size="13" class="text-medium-emphasis" />
-                          <span class="text-caption text-medium-emphasis text-no-wrap">{{ fmtListTime(m.date_ts) }}</span>
+                          <span class="text-caption text-medium-emphasis text-no-wrap">{{ m.op_status === 'in_flight' ? t('正在发送') : fmtListTime(m.date_ts) }}</span>
                       </div>
                       <div class="text-body-2 text-truncate" :class="{ 'font-weight-bold': !(m.flags & 1) }">
                         {{ m.subject || t('(无主题)') }}
@@ -5438,7 +5620,7 @@ onBeforeUnmount(() => {
 
       <v-dialog v-model="settingsOpen" :z-index="settingsZ" :fullscreen="!lgAndUp" :max-width="lgAndUp ? 1080 : 920" scrollable @update:model-value="(v) => { if (!v) closeSettings() }">
         <v-card class="settings-card" :style="lgAndUp ? { height: 'min(760px, calc(100dvh - 48px))' } : undefined">
-          <v-toolbar color="transparent">
+          <v-toolbar color="transparent" class="settings-topbar">
             <v-btn :icon="lgAndUp ? 'mdi-close' : 'mdi-arrow-left'" variant="text" :aria-label="lgAndUp ? t('关闭') : t('返回')" @click="closeSettings()" />
             <v-toolbar-title>{{ t('设置') }}</v-toolbar-title>
           </v-toolbar>
@@ -5456,6 +5638,7 @@ onBeforeUnmount(() => {
               @update:threaded="onThreadedChange"
               @update:undo-seconds="onUndoSecondsChange"
               @app-settings="onAppSettings"
+              @revoked="onSessionsRevoked"
             />
           </v-card-text>
         </v-card>
@@ -5603,7 +5786,16 @@ body {
 }
 .app-topbar {
   background: rgb(var(--v-theme-surface));
-  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+  border-bottom: 1px solid transparent;
+}
+.app-topbar.bar-scrolled {
+  border-bottom-color: rgb(var(--v-theme-outline-variant));
+}
+.settings-topbar {
+  border-bottom: 1px solid transparent;
+}
+.settings-topbar.bar-scrolled {
+  border-bottom-color: rgb(var(--v-theme-outline-variant));
 }
 .settings-card {
   display: flex;
@@ -6047,8 +6239,11 @@ body {
   align-items: center;
   gap: 2px;
   padding: 0 8px;
-  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+  border-bottom: 1px solid transparent;
   background: rgb(var(--v-theme-surface));
+}
+.reader-toolbar.bar-scrolled {
+  border-bottom-color: rgb(var(--v-theme-outline-variant));
 }
 .reader-subject {
   font-size: 22px;
@@ -6121,7 +6316,10 @@ body {
   height: 64px;
   box-sizing: border-box;
   padding: 0 6px;
-  border-bottom: 1px solid rgb(var(--v-theme-outline-variant));
+  border-bottom: 1px solid transparent;
+}
+.reader-head.bar-scrolled {
+  border-bottom-color: rgb(var(--v-theme-outline-variant));
 }
 .reader-bar-title {
   font-size: 15px;

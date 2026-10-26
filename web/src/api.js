@@ -106,6 +106,10 @@ export const saveTelegram = (b) =>
 export const discoverTelegram = (bot_token) => post('/api/settings/telegram/discover', { bot_token })
 export const testTelegram = (b) => post('/api/settings/telegram/test', b)
 export const telegramWebAppAuth = (initData) => post('/api/telegram/webapp-auth', { init_data: initData })
+export const listAccessTokens = () => req('/api/settings/access-tokens')
+export const createAccessToken = (label) => post('/api/settings/access-tokens', { label })
+export const deleteAccessToken = (id) => req('/api/settings/access-tokens/' + id, { method: 'DELETE' })
+export const revokeAllSessions = () => post('/api/settings/sessions/revoke-all')
 export const getWebPush = () => req('/api/settings/webpush')
 export const testWebPush = () => post('/api/settings/webpush/test')
 export const subscribePush = (sub) => post('/api/push/subscribe', sub)
@@ -139,8 +143,10 @@ export const getThreadMessagesAll = (accountId, threadKey) =>
       '&thread_key=' +
       encodeURIComponent(threadKey),
   )
-export const moveMessageToFolder = (id, folderId, clientKey) =>
-  post('/api/messages/' + id + '/move', { to_folder_id: folderId, client_key: clientKey || undefined })
+export const moveMessageToFolder = (id, folderId, clientKey) => {
+  if (!folderId) throw new Error('移动缺少目标文件夹')
+  return post('/api/messages/' + id + '/move', { to_folder_id: folderId, client_key: clientKey || undefined })
+}
 let keySeq = 0
 export const newClientKey = () =>
   'g' + Date.now().toString(36) + (keySeq++).toString(36) + Math.random().toString(36).slice(2, 8)
@@ -157,8 +163,10 @@ export const markAllRead = (special) => post('/api/messages/mark-all-read', { sp
 export const getMessage = (id) => req('/api/messages/' + id)
 export const setFlags = (id, body) => post('/api/messages/' + id + '/flags', body)
 export const batchSetFlags = (ids, body) => post('/api/messages/flags', { ids, ...body })
-export const moveMessage = (id, to, clientKey) =>
-  post('/api/messages/' + id + '/move', { to, client_key: clientKey || undefined })
+export const moveMessage = (id, to, clientKey) => {
+  if (!to) throw new Error('移动缺少目标文件夹')
+  return post('/api/messages/' + id + '/move', { to, client_key: clientKey || undefined })
+}
 
 export const restoreMessage = (id, clientKey) =>
   post('/api/messages/' + id + '/restore', { client_key: clientKey || undefined })
@@ -178,6 +186,7 @@ export const sendMail = (body) => post('/api/send', body)
 export const scheduleSend = (body) => post('/api/send/schedule', body)
 export const listScheduled = () => req('/api/scheduled')
 export const cancelScheduled = (id) => req('/api/scheduled/' + id, { method: 'DELETE' })
+export const deleteScheduled = (id) => req('/api/scheduled/' + id + '?purge=1', { method: 'DELETE' })
 export const getScheduled = (id) => req('/api/scheduled/' + id)
 export const updateScheduled = (id, body) =>
   req('/api/scheduled/' + id, { method: 'PUT', body: JSON.stringify(body) })

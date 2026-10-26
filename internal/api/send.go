@@ -48,7 +48,26 @@ type sendReq struct {
 
 type scheduleReq struct {
 	composeReq
-	SendAt int64 `json:"send_at"`
+	SendAt    int64  `json:"send_at"`
+	ClientKey string `json:"client_key"`
+}
+
+// draftIdentity resolves the durable identity of the draft a send is
+// taken from. The row is the primary source. Once an earlier
+// submission of the same intent has been scheduled, the draft is
+// consumed and the row is gone; the identity then survives only in
+// that submission's op, which recorded it at enqueue time. Both the
+// schedule key derivation and the payload capture resolve through
+// here, so a resubmission reconstructs the identical key and payload
+// and converges on the first op instead of enqueueing a twin.
+func (s *Server) draftIdentity(accountID, draftID int64) string {
+	if identity, err := s.st.IdentityForRow(accountID, draftID); err == nil && identity != "" {
+		return identity
+	}
+	if identity, err := s.st.PriorSendDraftIdentity(accountID, draftID); err == nil {
+		return identity
+	}
+	return ""
 }
 
 func (s *Server) enqueueSendOp(key []byte, req composeReq, notBefore int64, clientKey string) (int64, error) {
@@ -58,9 +77,7 @@ func (s *Server) enqueueSendOp(key []byte, req composeReq, notBefore int64, clie
 	sp := sendOpPayload{Req: req}
 	sp.Req.Attachments = nil
 	if req.DraftID > 0 {
-		if identity, err := s.st.IdentityForRow(req.AccountID, req.DraftID); err == nil {
-			sp.DraftIdentity = identity
-		}
+		sp.DraftIdentity = s.draftIdentity(req.AccountID, req.DraftID)
 	}
 	type decoded struct {
 		att  sendOpAttachment
@@ -182,17 +199,19 @@ func (s *Server) fileOutgoingCopy(key []byte, out *outgoing, sentID string) (int
 	return s.appendCopy(key, out.acct.ID, "sent", []imap.Flag{imap.FlagSeen}, mail.FlagSeen, out)
 }
 
-func (s *Server) executeSendWave(key []byte, ops []*store.Op) (int, []int64) {
+func (s *Server) executeSendWave(key []byte, wave *drainWave, ops []*store.Op) (int, []int64) {
 	done := 0
 	var failed []int64
 	for _, o := range ops {
 		if s.executeSend(key, o) {
 			done++
+			wave.bump()
 			continue
 		}
 		if cur, err := s.st.GetOp(o.ID); err == nil && cur.Status == store.OpPending {
 			failed = append(failed, o.ID)
 		}
+		wave.bump()
 	}
 	return done, failed
 }
@@ -201,10 +220,14 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 	now := time.Now().Unix()
 	sentSoFar := false
 	fail := func(err error, perm bool) {
+		if !s.opStillOurs(o) {
+			return
+		}
 		status, ferr := s.st.FailOp(o.ID, err.Error(), perm, now)
 		if ferr == nil && status == store.OpNeedsAttention {
 			s.broadcastOps()
 			s.broadcastSendState(o.ID, store.OpNeedsAttention, sentSoFar, false)
+			s.broadcastScheduled()
 		}
 	}
 	var sp sendOpPayload
@@ -238,8 +261,15 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 			fail(merr, false)
 			return false
 		}
-		if _, err := s.st.UpdateOpPayload(o.ID, string(raw)); err != nil {
+		applied, err := s.st.UpdateOpPayload(o.ID, string(raw))
+		if err != nil {
 			fail(err, false)
+			return false
+		}
+		if !applied {
+			// The op left the states this executor may write to
+			// (a settler parked or adopted it); its landing belongs
+			// to whoever owns it now.
 			return false
 		}
 	} else {
@@ -252,13 +282,42 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 		out.messageID = sp.MessageID
 	}
 	if !sp.Sent {
-		if cur, gerr := s.st.GetOp(o.ID); gerr == nil && cur.UndoRequested {
-			if cerr := s.st.CancelInFlightSend(o.ID); cerr == nil {
-				_ = os.RemoveAll(outgoingDir(s.st.DataDir(), o.ID))
-				s.broadcastSendState(o.ID, store.OpCancelled, false, false)
-				return true
-			}
+		newToken := s.drainTokenSeq.Add(1)
+		sealed, undoWon, serr := s.st.SealSendForDelivery(o.ID, o.ClaimToken, newToken)
+		if serr != nil {
+			fail(serr, false)
+			return false
 		}
+		if !sealed {
+			if undoWon {
+				cerr := s.st.CancelInFlightSend(o.ID)
+				if cerr != nil {
+					cerr = s.st.CancelOp(o.ID)
+				}
+				if cerr == nil {
+					// A return-to-drafts that was accepted against
+					// this claimed send materializes here, at the
+					// checkpoint where its undo won: the letter goes
+					// back to Drafts before its payload is destroyed.
+					if cur, gerr := s.st.GetOp(o.ID); gerr == nil && cur.ReturnToDraft {
+						if _, merr := s.materializeScheduledDraft(key, o, &sp); merr != nil {
+							log.Printf("namakani: send op %d: return cancelled letter to drafts: %v", o.ID, merr)
+						}
+					}
+					_ = os.RemoveAll(outgoingDir(s.st.DataDir(), o.ID))
+					s.broadcastSendState(o.ID, store.OpCancelled, false, false)
+					s.broadcastScheduled()
+					return true
+				}
+			}
+			return false
+		}
+		o.ClaimToken = newToken
+		// The checkpoint is crossed: publish it the moment it
+		// happens. This event is what retires the undo affordance
+		// on every client; without it the interface keeps offering
+		// a click whose verdict is already decided.
+		s.broadcastSendState(o.ID, "sealed", false, false)
 	}
 	if !sp.Sent {
 		sentID, err := s.deliverOutgoing(key, out)
@@ -275,8 +334,17 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 			fail(merr, false)
 			return false
 		}
-		if _, err := s.st.UpdateOpPayload(o.ID, string(raw)); err != nil {
+		applied, err := s.st.UpdateOpPayload(o.ID, string(raw))
+		if err != nil {
 			fail(err, false)
+			return false
+		}
+		if !applied {
+			// The provider accepted the letter, but the op was
+			// parked as outcome-unknown while this executor was
+			// inside the call. The parked record stands: landing a
+			// completion now would overwrite the one honest account
+			// of what happened.
 			return false
 		}
 	}
@@ -285,19 +353,14 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 		fail(err, false)
 		return false
 	}
-	if sp.DraftIdentity != "" {
-		if t, ok, rerr := s.st.ResolveIdentityRow(o.AccountID, sp.DraftIdentity, 0, sp.Req.DraftID); rerr == nil && ok {
-			if draftOpID, err := s.st.EnqueueExpunge(o.AccountID, t.RowID, ""); err == nil {
-				if dop, gerr := s.st.GetOp(draftOpID); gerr == nil {
-					s.broadcastOpApplied(dop)
-				}
-			}
-		}
-	}
+	s.consumeSendDraft(o.AccountID, sp.DraftIdentity, sp.Req.DraftID)
 	undoIgnored := false
 	if cur, gerr := s.st.GetOp(o.ID); gerr == nil && cur.UndoRequested {
 		undoIgnored = true
 		_ = s.st.ClearUndoRequest(o.ID)
+	}
+	if !s.opStillOurs(o) {
+		return false
 	}
 	if err := s.st.CompleteOp(o.ID); err != nil {
 		log.Printf("namakani: send op %d: complete: %v", o.ID, err)
@@ -311,7 +374,31 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 		}
 	}
 	s.broadcastSendState(o.ID, store.OpDone, true, undoIgnored)
+	s.broadcastScheduled()
 	return true
+}
+
+// consumeSendDraft expunges the draft a send op was created from. The
+// letter's content lives in the send op from the moment it is enqueued,
+// so the draft incarnation is consumed at scheduling time already; a
+// completed send runs the same cleanup for sends that never went
+// through scheduling with a draft (the identity is gone by then and
+// this is a no-op).
+func (s *Server) consumeSendDraft(accountID int64, draftIdentity string, draftIDHint int64) {
+	if draftIdentity == "" {
+		return
+	}
+	t, ok, rerr := s.st.ResolveIdentityRow(accountID, draftIdentity, 0, draftIDHint)
+	if rerr != nil || !ok {
+		return
+	}
+	draftOpID, err := s.st.EnqueueExpunge(accountID, t.RowID, "")
+	if err != nil {
+		return
+	}
+	if dop, gerr := s.st.GetOp(draftOpID); gerr == nil {
+		s.broadcastOpApplied(dop)
+	}
 }
 
 var errAttachmentMissing = &attachmentMissingError{}
@@ -331,11 +418,31 @@ func (s *Server) handleScheduleSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请填写发送时间")
 		return
 	}
-	opID, err := s.enqueueSendOp(key, req.composeReq, req.SendAt, "")
+	// A schedule submission converges on one op per intent, exactly
+	// like an immediate send: the client key dedupes retries, and a
+	// schedule taken from a draft derives its key from the draft's
+	// durable identity instead, so resubmitting the same draft from
+	// any session or device lands on the same op.
+	clientKey := req.ClientKey
+	if req.DraftID > 0 {
+		if identity := s.draftIdentity(req.AccountID, req.DraftID); identity != "" {
+			clientKey = "sched:" + identity
+		}
+	}
+	opID, err := s.enqueueSendOp(key, req.composeReq, req.SendAt, clientKey)
 	if err != nil {
 		writeUserErr(w, http.StatusBadRequest, "发送失败，请稍后重试", err)
 		return
 	}
+	if req.DraftID > 0 {
+		if o, gerr := s.st.GetOp(opID); gerr == nil {
+			var sp sendOpPayload
+			if json.Unmarshal([]byte(o.Payload), &sp) == nil {
+				s.consumeSendDraft(o.AccountID, sp.DraftIdentity, sp.Req.DraftID)
+			}
+		}
+	}
+	s.broadcastScheduled()
 	s.kickDrain()
 	writeJSON(w, http.StatusCreated, map[string]int64{"id": -opID})
 }
@@ -370,9 +477,15 @@ func (s *Server) handleListScheduled(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		o.ID = -o.ID
-		if status == "needs_attention" {
+		switch status {
+		case "needs_attention":
 			o.Status = "failed"
-		} else {
+		case "in_flight":
+			// Report the state as it is: folding a claimed send into
+			// "pending" hides that its send time has come and that
+			// its cancel now resolves at the checkpoint.
+			o.Status = "in_flight"
+		default:
 			o.Status = "pending"
 			o.Error = ""
 		}
@@ -393,6 +506,43 @@ func (s *Server) scheduledOpID(w http.ResponseWriter, r *http.Request) (int64, b
 		return 0, false
 	}
 	return -id, true
+}
+
+// materializeScheduledDraft files the letter a send op holds back
+// into Drafts: the op's compose request plus its spilled attachment
+// files, appended as a draft copy. It serves the checkpoint path,
+// where a deferred return-to-drafts wins inside executeSend and the
+// handler that accepted it is long gone.
+func (s *Server) materializeScheduledDraft(key []byte, o *store.Op, sp *sendOpPayload) (int64, error) {
+	req := sp.Req
+	req.DraftID = 0
+	req.Attachments = nil
+	dir := outgoingDir(s.st.DataDir(), o.ID)
+	for _, a := range sp.Attachments {
+		data, err := os.ReadFile(filepath.Join(dir, a.File))
+		if err != nil {
+			return 0, err
+		}
+		req.Attachments = append(req.Attachments, attachmentIn{
+			Filename:    a.Filename,
+			ContentType: a.ContentType,
+			DataB64:     base64.StdEncoding.EncodeToString(data),
+		})
+	}
+	out, err := s.prepareOutgoing(key, req, false)
+	if err != nil {
+		return 0, err
+	}
+	draftID, err := s.appendCopy(key, o.AccountID, "drafts",
+		[]imap.Flag{imap.FlagDraft}, mail.FlagSeen|mail.FlagDraft, out)
+	if err != nil {
+		return 0, err
+	}
+	s.broadcastMessages([]int64{draftID})
+	if fid, _, ok, _ := s.st.FolderBySpecial(o.AccountID, "drafts"); ok {
+		s.broadcastFolder(fid)
+	}
+	return draftID, nil
 }
 
 func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
@@ -416,6 +566,80 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 	var sp sendOpPayload
 	if err := json.Unmarshal([]byte(o.Payload), &sp); err != nil {
 		writeErr(w, http.StatusInternalServerError, "定时邮件内容读取失败")
+		return
+	}
+	if o.Status == store.OpInFlight {
+		// A claimed send is cancelled through the undo state machine,
+		// never through CancelOp (which refuses in_flight outright):
+		// before the checkpoint the undo is accepted as deferred and
+		// wins there; past it, the refusal must say the send is
+		// already decided instead of pretending it was never
+		// cancellable.
+		purge := r.URL.Query().Get("purge") == "1"
+		verb := "取消"
+		if purge {
+			verb = "删除"
+		}
+		if sp.Sent {
+			writeErr(w, http.StatusConflict, "这封定时邮件已经发出，无法"+verb)
+			return
+		}
+		if o.Sealed {
+			writeErr(w, http.StatusConflict, "这封定时邮件已经在发送，无法"+verb)
+			return
+		}
+		if !purge {
+			if _, err := s.st.SetSendReturnToDraft(opID); err != nil {
+				writeErr(w, http.StatusInternalServerError, "取消失败，请稍后重试")
+				return
+			}
+		}
+		res, err := s.st.UndoOp(opID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "取消失败，请稍后重试")
+			return
+		}
+		switch res.Mode {
+		case "deferred":
+			s.broadcastScheduled()
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "op_id": opID, "deferred": true})
+		case "cancelled":
+			// The op fell back to pending and the undo cancelled it
+			// outright in the race; land the outcome here.
+			if purge {
+				_ = os.RemoveAll(outgoingDir(s.st.DataDir(), opID))
+				s.broadcastScheduled()
+				s.broadcastOps()
+				writeJSON(w, http.StatusOK, map[string]any{"ok": true, "op_id": opID})
+				return
+			}
+			draftID, merr := s.materializeScheduledDraft(key, o, &sp)
+			if merr != nil {
+				writeUserErr(w, http.StatusBadGateway, "保存草稿失败", merr)
+				return
+			}
+			_ = os.RemoveAll(outgoingDir(s.st.DataDir(), opID))
+			s.broadcastScheduled()
+			s.broadcastOps()
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "draft_id": draftID})
+		case "already_sent":
+			writeErr(w, http.StatusConflict, "这封定时邮件已经发出，无法"+verb)
+		default:
+			writeErr(w, http.StatusConflict, "这封定时邮件已经在发送，无法"+verb)
+		}
+		return
+	}
+	if r.URL.Query().Get("purge") == "1" {
+		// True delete: cancel the pending send and destroy the letter.
+		// No draft copy is made, so the letter exists nowhere afterwards.
+		if err := s.st.CancelOp(opID); err != nil {
+			writeErr(w, http.StatusConflict, "这封定时邮件已经不能删除了")
+			return
+		}
+		_ = os.RemoveAll(outgoingDir(s.st.DataDir(), opID))
+		s.broadcastScheduled()
+		s.broadcastOps()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
 	req := sp.Req
@@ -455,6 +679,7 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 	if fid, _, ok, _ := s.st.FolderBySpecial(o.AccountID, "drafts"); ok {
 		s.broadcastFolder(fid)
 	}
+	s.broadcastScheduled()
 	s.broadcastOps()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "draft_id": draftID})
 }
@@ -608,6 +833,7 @@ func (s *Server) handleUpdateScheduled(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "更新失败")
 		return
 	}
+	s.broadcastScheduled()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -627,6 +853,7 @@ func (s *Server) handleSendNowOp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.broadcastOps()
+	s.broadcastScheduled()
 	s.kickDrain()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -667,7 +894,7 @@ func (s *Server) listScheduledAsMessages(w http.ResponseWriter, q url.Values, li
 			}
 		}
 	}
-	rows, err := s.st.DB.Query(`SELECT id, account_id, payload, not_before FROM ops
+	rows, err := s.st.DB.Query(`SELECT id, account_id, payload, not_before, status FROM ops
 		WHERE type = 'send' AND status IN ('pending', 'in_flight') ORDER BY not_before ASC`)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "列表加载失败")
@@ -677,8 +904,8 @@ func (s *Server) listScheduledAsMessages(w http.ResponseWriter, q url.Values, li
 	all := []messageOut{}
 	for rows.Next() {
 		var id, accountID, sendAt int64
-		var payload string
-		if err := rows.Scan(&id, &accountID, &payload, &sendAt); err != nil {
+		var payload, status string
+		if err := rows.Scan(&id, &accountID, &payload, &sendAt, &status); err != nil {
 			writeErr(w, http.StatusInternalServerError, "列表加载失败")
 			return
 		}
@@ -689,6 +916,7 @@ func (s *Server) listScheduledAsMessages(w http.ResponseWriter, q url.Values, li
 			FolderSpecial: "scheduled",
 			DateTS:        sendAt,
 			Flags:         1,
+			OpStatus:      status,
 		}
 		var sp sendOpPayload
 		if err := json.Unmarshal([]byte(payload), &sp); err == nil {
