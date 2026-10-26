@@ -5793,8 +5793,10 @@ body {
   display: flex;
   flex-direction: column;
 }
-.v-dialog--scrollable > .v-overlay__content > .settings-card {
-  flex: none;
+@media (min-width: 1280px) {
+  .v-dialog--scrollable > .v-overlay__content > .settings-card {
+    flex: none;
+  }
 }
 .settings-card > .v-card-text {
   flex: 1;
