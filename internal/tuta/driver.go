@@ -254,6 +254,25 @@ func (s *Session) currentLocked() (*folderCache, error) {
 	return s.cur, nil
 }
 
+// drop removes one message from the cached listing, updating every index
+// together so the selection stays valid for the next operation.
+func (fc *folderCache) drop(id string) {
+	uid, ok := fc.uidByID[id]
+	if !ok {
+		return
+	}
+	delete(fc.meta, id)
+	delete(fc.uidByID, id)
+	delete(fc.idByUID, uid)
+	for i, x := range fc.ids {
+		if x == id {
+			fc.ids = append(fc.ids[:i], fc.ids[i+1:]...)
+			break
+		}
+	}
+	fc.total = len(fc.ids)
+}
+
 func (s *Session) FetchEnvelopes(uids []uint32) ([]mail.Msg, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -536,7 +555,7 @@ func (s *Session) MoveMessage(uid uint32, dest string) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	s.cur = nil
+	fc.drop(id)
 	return destUID, nil
 }
 
@@ -560,7 +579,7 @@ func (s *Session) DeleteMessage(uid uint32) error {
 	if _, err := s.rest.callService(http.MethodDelete, "tutanota", "mailservice", modelVersionTutanota, data); err != nil {
 		return err
 	}
-	s.cur = nil
+	fc.drop(id)
 	return nil
 }
 

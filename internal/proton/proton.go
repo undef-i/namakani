@@ -97,7 +97,7 @@ func (e *AuthTerminalError) Unwrap() error { return e.Err }
 var apiCodePattern = regexp.MustCompile(`\[(\d+)\]`)
 
 func humanVerificationReason(err error) string {
-	return "Proton 要求完成人机验证。请点「重新连接」，在打开的窗口里输入密码并完成验证。（" + err.Error() + "）"
+	return "Proton 要求完成人机验证。请点「重新连接」，在打开的窗口里输入密码并完成验证。"
 }
 
 func ClassifyError(err error) (bool, string) {
@@ -114,23 +114,23 @@ func ClassifyError(err error) (bool, string) {
 		case 9001:
 			return true, humanVerificationReason(err)
 		case 10013:
-			return true, "保存的登录凭据已被拒绝（登录令牌已吊销），请点「重新连接」重新登录。（" + err.Error() + "）"
+			return true, "保存的登录凭据已被拒绝（登录令牌已吊销），请点「重新连接」重新登录。"
 		}
 		return false, ""
 	}
 	if errors.Is(err, auth.ErrUnauthorized) {
-		return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。（" + err.Error() + "）"
+		return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。"
 	}
 	msg := err.Error()
 	if strings.Contains(msg, "two factor authentication enabled") {
-		return true, "登录需要两步验证码。请点「重新连接」，在打开的窗口里输入验证码。（" + msg + "）"
+		return true, "登录需要两步验证码。请点「重新连接」，在打开的窗口里输入验证码。"
 	}
 	if strings.Contains(msg, "cannot re-authenticate") {
 		if strings.Contains(msg, "[9001]") {
 			return true, humanVerificationReason(err)
 		}
 		if apiCodePattern.MatchString(msg) {
-			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。（" + msg + "）"
+			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。"
 		}
 	}
 	return false, ""

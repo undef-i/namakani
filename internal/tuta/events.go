@@ -4,16 +4,72 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 )
 
 type eventState struct {
-	lastBatchByGroup map[string]string
+	mu        sync.Mutex
+	committed map[string]string
+	pending   map[string]string
+}
+
+func (s *eventState) noteBatch(group, batch string) {
+	s.mu.Lock()
+	s.pending[group] = batch
+	s.mu.Unlock()
+}
+
+func (s *eventState) mark() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]string, len(s.pending))
+	for g, b := range s.pending {
+		out[g] = b
+	}
+	return out
+}
+
+func (s *eventState) ack(mark map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for g, b := range mark {
+		if s.pending[g] == b {
+			s.committed[g] = b
+		}
+	}
+}
+
+func (s *eventState) connectParams() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.committed) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(s.committed))
+	for group, batch := range s.committed {
+		parts = append(parts, group+"="+batch)
+	}
+	return strings.Join(parts, ";")
+}
+
+func (s *Session) EventMark() map[string]string {
+	if s.evState == nil {
+		return nil
+	}
+	return s.evState.mark()
+}
+
+func (s *Session) AckEvents(mark map[string]string) {
+	if s.evState != nil && mark != nil {
+		s.evState.ack(mark)
+	}
 }
 
 func (s *Session) eventURL(state *eventState) string {
@@ -22,12 +78,8 @@ func (s *Session) eventURL(state *eventState) string {
 	q.Set("clientVersion", clientVersion)
 	q.Set("userId", s.userID)
 	q.Set("accessToken", s.accessToken)
-	if len(state.lastBatchByGroup) > 0 {
-		parts := make([]string, 0, len(state.lastBatchByGroup))
-		for group, batch := range state.lastBatchByGroup {
-			parts = append(parts, group+"="+batch)
-		}
-		q.Set("groupsToLastEventBatchIds", strings.Join(parts, ";"))
+	if cp := state.connectParams(); cp != "" {
+		q.Set("groupsToLastEventBatchIds", cp)
 	}
 	return "wss://app.tuta.com/event?" + q.Encode()
 }
@@ -51,26 +103,51 @@ func reconnectDelay(failures int) time.Duration {
 	}
 }
 
-func (s *Session) WatchEvents(stop <-chan struct{}, notify func()) {
-	state := &eventState{lastBatchByGroup: make(map[string]string)}
-	failures := 0
+const healthyUptime = 120 * time.Second
+
+type reconnectStreak struct {
+	failures int
+}
+
+func (s *reconnectStreak) record(uptime time.Duration) time.Duration {
+	if uptime >= healthyUptime {
+		s.failures = 0
+	}
+	s.failures++
+	return reconnectDelay(s.failures)
+}
+
+func terminalCloseCode(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	code := websocket.CloseStatus(err)
+	return int(code), code == 4401 || code == 4470 || code == 4472
+}
+
+func (s *Session) WatchEvents(stop <-chan struct{}, notify func(), onTerminal func(error)) {
+	state := &eventState{committed: make(map[string]string), pending: make(map[string]string)}
+	s.evState = state
+	var streak reconnectStreak
 	for {
 		select {
 		case <-stop:
 			return
 		default:
 		}
+		started := time.Now()
 		err := s.eventLoop(stop, state, notify)
-		if err != nil {
-			if code := websocket.CloseStatus(err); code == 4401 || code == 4470 || code == 4472 {
-				return
+		if code, terminal := terminalCloseCode(err); terminal {
+			if onTerminal != nil {
+				onTerminal(&RestError{StatusCode: 401, Name: "WebSocketAuthClosed", Message: fmt.Sprintf("event stream closed with code %d", code)})
 			}
+			return
 		}
-		failures++
+		delay := streak.record(time.Since(started))
 		select {
 		case <-stop:
 			return
-		case <-time.After(reconnectDelay(failures)):
+		case <-time.After(delay):
 		}
 	}
 }
@@ -107,7 +184,7 @@ func (s *Session) eventLoop(stop <-chan struct{}, state *eventState, notify func
 		}
 		if owner := raw.str("1486"); owner != "" {
 			if bid := raw.str("1485"); bid != "" {
-				state.lastBatchByGroup[owner] = bid
+				state.noteBatch(owner, bid)
 			}
 		}
 		relevant := false

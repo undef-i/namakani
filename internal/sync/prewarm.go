@@ -134,11 +134,15 @@ func (m *Manager) prewarm(ctx context.Context, cl mail.Conn, acct mail.Account) 
 
 func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandidate, sel *string, room *store.CacheRoom) bool {
 	if *sel != c.FolderName {
-		if _, err := cl.Select(c.FolderName); err != nil {
+		selData, err := cl.Select(c.FolderName)
+		if err != nil {
 			log.Printf("prewarm account %d: select %s: %v", acct.ID, c.FolderName, err)
 			return false
 		}
 		*sel = c.FolderName
+		if state, serr := m.st.FolderState(c.FolderID); serr == nil && state.UIDValidity != 0 && selData.UIDValidity != 0 && selData.UIDValidity != state.UIDValidity {
+			return false
+		}
 	}
 	raw, err := cl.FetchRaw(c.UID)
 	if err != nil {
@@ -159,7 +163,7 @@ func (m *Manager) cacheBody(cl mail.Conn, acct mail.Account, c store.BodyCandida
 	if !fits {
 		return false
 	}
-	if err := m.st.SaveBody(c.MessageID, parsed.Text, parsed.HTML, mail.MakeSnippet(parsed.Text, parsed.HTML)); err != nil {
+	if err := m.st.SaveBody(c.MessageID, parsed.Text, parsed.HTML, mail.MakeSnippet(parsed.Text, parsed.HTML), parsed.Truncated); err != nil {
 		log.Printf("prewarm account %d: save body %d: %v", acct.ID, c.MessageID, err)
 		return false
 	}

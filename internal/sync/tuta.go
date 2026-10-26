@@ -84,11 +84,11 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account, releaseIni
 	m.mu.Lock()
 	m.live[acct.ID] = true
 	m.mu.Unlock()
+	releaseInit()
 	m.prewarm(ctx, sess, acct)
 	m.repairThreads(ctx, sess, acct)
-	releaseInit()
 
-	syncAll := func() {
+	syncAll := func() error {
 		if newRefs, _, err := listRefs(); err == nil {
 			refs = newRefs
 		}
@@ -105,9 +105,18 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account, releaseIni
 			m.setStatus(acct.ID, &Status{State: "idle", LastSyncAt: time.Now().Unix(), Folders: len(refs), Messages: n})
 		}
 		m.prewarm(ctx, sess, acct)
+		return firstErr
+	}
+
+	runSync := func() {
+		mark := sess.EventMark()
+		if err := syncAll(); err == nil {
+			sess.AckEvents(mark)
+		}
 	}
 
 	events := make(chan struct{}, 1)
+	terminal := make(chan error, 1)
 	stop := make(chan struct{})
 	defer close(stop)
 	go sess.WatchEvents(stop, func() {
@@ -115,9 +124,14 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account, releaseIni
 		case events <- struct{}{}:
 		default:
 		}
+	}, func(err error) {
+		select {
+		case terminal <- err:
+		default:
+		}
 	})
 
-	sweep := time.NewTicker(10 * time.Minute)
+	sweep := time.NewTicker(5 * time.Minute)
 	defer sweep.Stop()
 	var debounce *time.Timer
 	var debounceC <-chan time.Time
@@ -125,8 +139,10 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account, releaseIni
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-terminal:
+			return err
 		case <-sweep.C:
-			syncAll()
+			runSync()
 		case <-events:
 			if debounce != nil {
 				debounce.Stop()
@@ -136,7 +152,7 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account, releaseIni
 		case <-debounceC:
 			debounce = nil
 			debounceC = nil
-			syncAll()
+			runSync()
 		}
 	}
 }

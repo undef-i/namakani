@@ -47,19 +47,19 @@ func TestCacheUsageCounterMatchesFullSum(t *testing.T) {
 		}
 	}
 	check("empty")
-	if err := st.SaveBody(1, "hello", "<b>hello</b>", ""); err != nil {
+	if err := st.SaveBody(1, "hello", "<b>hello</b>", "", false); err != nil {
 		t.Fatalf("save 1: %v", err)
 	}
 	check("save1")
-	if err := st.SaveBody(2, "中文正文测试", "", ""); err != nil {
+	if err := st.SaveBody(2, "中文正文测试", "", "", false); err != nil {
 		t.Fatalf("save 2: %v", err)
 	}
 	check("save2")
-	if err := st.SaveBody(1, "hi", "", ""); err != nil {
+	if err := st.SaveBody(1, "hi", "", "", false); err != nil {
 		t.Fatalf("overwrite 1: %v", err)
 	}
 	check("overwrite1")
-	if err := st.SaveBody(3, "third body", "<p>third</p>", ""); err != nil {
+	if err := st.SaveBody(3, "third body", "<p>third</p>", "", false); err != nil {
 		t.Fatalf("save 3: %v", err)
 	}
 	check("save3")
@@ -75,7 +75,7 @@ func TestCacheUsageCounterMatchesFullSum(t *testing.T) {
 		t.Fatalf("local delete 1: %v", err)
 	}
 	check("localdelete1")
-	if err := st.SaveBody(4, "fourth", "", ""); err != nil {
+	if err := st.SaveBody(4, "fourth", "", "", false); err != nil {
 		t.Fatalf("save 4: %v", err)
 	}
 	check("save4")

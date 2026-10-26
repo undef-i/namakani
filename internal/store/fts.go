@@ -33,6 +33,47 @@ func (s *Store) ftsSetBody(messageID int64, body string) error {
 	return s.ftsReplace(messageID, subject, fromJ, toJ+" "+ccJ, body)
 }
 
+func (s *Store) BackfillFTSHTMLBodies() (int, error) {
+	total := 0
+	var after int64
+	for {
+		rows, err := s.DB.Query(`SELECT b.message_id, b.html_body FROM bodies b
+			LEFT JOIN messages_fts f ON f.rowid = b.message_id
+			WHERE b.text_body = '' AND b.html_body <> '' AND (f.body IS NULL OR f.body = '')
+			AND b.message_id > ? ORDER BY b.message_id LIMIT 200`, after)
+		if err != nil {
+			return total, err
+		}
+		type item struct {
+			id   int64
+			html string
+		}
+		var batch []item
+		for rows.Next() {
+			var it item
+			if err := rows.Scan(&it.id, &it.html); err != nil {
+				rows.Close()
+				return total, err
+			}
+			batch = append(batch, it)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return total, err
+		}
+		if len(batch) == 0 {
+			return total, nil
+		}
+		for _, it := range batch {
+			if err := s.ftsSetBody(it.id, HTMLToText(it.html)); err != nil {
+				return total, err
+			}
+			after = it.id
+			total++
+		}
+	}
+}
+
 func (s *Store) ftsDelete(messageID int64) error {
 	_, err := s.DB.Exec("DELETE FROM messages_fts WHERE rowid = ?", messageID)
 	return err

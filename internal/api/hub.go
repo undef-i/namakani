@@ -13,6 +13,7 @@ import (
 type hub struct {
 	mu   sync.Mutex
 	subs map[chan []byte]struct{}
+	seq  int64
 }
 
 func newHub() *hub {
@@ -32,12 +33,16 @@ func (h *hub) subscribe() (chan []byte, func()) {
 }
 
 func (h *hub) broadcast(v any) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if m, ok := v.(map[string]any); ok {
+		h.seq++
+		m["seq"] = h.seq
+	}
 	data, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	for ch := range h.subs {
 		select {
 		case ch <- data:
@@ -49,7 +54,7 @@ func (h *hub) broadcast(v any) {
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		writeErr(w, http.StatusInternalServerError, "服务器不支持流式推送")
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -75,11 +80,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type placedRow struct {
+	messageOut
+	Pv int64 `json:"pv"`
+}
+
 func (s *Server) broadcastMessages(ids []int64) {
 	if len(ids) == 0 {
 		return
 	}
-	if pending := s.st.PendingRemovalSet(ids); len(pending) > 0 {
+	if pending := s.st.PendingExpungeSet(ids); len(pending) > 0 {
 		keep := make([]int64, 0, len(ids))
 		for _, id := range ids {
 			if !pending[id] {
@@ -93,7 +103,12 @@ func (s *Server) broadcastMessages(ids []int64) {
 	}
 	rows := s.messageRowsByIDs(ids)
 	if len(rows) > 0 {
-		s.hub.broadcast(map[string]any{"type": "messages", "items": rows})
+		pvs, _ := s.st.PlacementVersions(ids)
+		items := make([]placedRow, 0, len(rows))
+		for _, r := range rows {
+			items = append(items, placedRow{r, pvs[r.ID]})
+		}
+		s.hub.broadcast(map[string]any{"type": "messages", "items": items})
 	}
 }
 
@@ -118,7 +133,8 @@ func (s *Server) broadcastRemoved(folderID int64, ids []int64) {
 	if len(ids) == 0 {
 		return
 	}
-	s.hub.broadcast(map[string]any{"type": "removed", "folder_id": folderID, "ids": ids})
+	pvs, _ := s.st.PlacementVersions(ids)
+	s.hub.broadcast(map[string]any{"type": "removed", "folder_id": folderID, "ids": ids, "pvs": pvs})
 }
 
 func (s *Server) broadcastFolder(folderID int64) {
@@ -141,7 +157,12 @@ func (s *Server) onSyncChange(c syncmgr.Change) {
 	s.broadcastMessages(c.Inserted)
 	s.broadcastFlags(c.Flagged)
 	s.broadcastRemoved(c.FolderID, c.Removed)
+	for _, cr := range c.CrossRemoved {
+		s.broadcastRemoved(cr.FolderID, cr.IDs)
+		s.broadcastFolder(cr.FolderID)
+	}
 	s.broadcastFolder(c.FolderID)
+	s.broadcastOps()
 	s.tgNotify(c)
 	s.wpNotify(c)
 }

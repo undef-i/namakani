@@ -47,7 +47,9 @@ body,
 }
 
 .avatar-letter {
-  color: rgba(20, 22, 25, 0.82);
+  color: #fff;
+  white-space: nowrap;
+  line-height: 1;
 }
 
 .skel-fixed {

@@ -1,12 +1,6 @@
 // Package tuta is a native Tuta Mail driver implementing the mail.Conn
 // interface on top of Tuta's internal entity REST API and event WebSocket.
-//
-// The protocol implementation is a translation of the official Tuta client
-// (tutao/tutanota, GPL-3.0) and its published compatibility test fixtures:
-// password KDFs (bcrypt and Argon2id branches), the group key chain,
-// per-instance session keys, the symmetric cipher formats (legacy CBC,
-// CBC-then-HMAC and BLAKE3 AEAD) and the TutaCrypt hybrid encapsulation
-// (X25519 + ML-KEM-1024) all follow the official sources named in
+// The protocol implementation follows the official Tuta client; see
 // THIRD-PARTY-NOTICES.TXT at the repository root.
 package tuta
 
@@ -67,6 +61,7 @@ type Session struct {
 	passphraseKey  []byte
 	userGroupKey   []byte
 	userGroupID    string
+	evState        *eventState
 	groupKeys      map[string]map[int][]byte
 	keyPairs       map[string]map[int]*groupKeyPair
 	mailGroups     []string

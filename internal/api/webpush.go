@@ -142,7 +142,7 @@ func (s *Server) wpNotify(c syncmgr.Change) {
 func (s *Server) handleGetWebPush(w http.ResponseWriter, r *http.Request) {
 	pub, _, err := s.vapidKeys()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "VAPID 密钥不可用: "+err.Error())
+		writeUserErr(w, http.StatusInternalServerError, "推送密钥不可用", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -175,7 +175,7 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		 ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`,
 		req.Endpoint, req.Keys.P256dh, req.Keys.Auth, time.Now().Unix())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeUserErr(w, http.StatusInternalServerError, "保存推送订阅失败", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": len(s.wpSubscriptions())})
@@ -201,7 +201,7 @@ func (s *Server) handleWebPushTest(w http.ResponseWriter, r *http.Request) {
 	}
 	pub, priv, err := s.vapidKeys()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "VAPID 密钥不可用: "+err.Error())
+		writeUserErr(w, http.StatusInternalServerError, "推送密钥不可用", err)
 		return
 	}
 	payload, _ := json.Marshal(map[string]any{

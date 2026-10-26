@@ -92,13 +92,6 @@ func (s *Session) probeFolderLocked(fc *folderCache) (bool, error) {
 	return true, nil
 }
 
-func (s *Session) InvalidateFolders() {
-	s.mu.Lock()
-	s.folders = nil
-	s.cur = nil
-	s.mu.Unlock()
-}
-
 func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 	if s.folders == nil {
 		s.folders = make(map[string]*folderCache)
@@ -168,6 +161,25 @@ func (s *Session) currentLocked() (*folderCache, error) {
 		return nil, fmt.Errorf("proton: no folder selected")
 	}
 	return s.cur, nil
+}
+
+// drop removes one message from the cached listing, updating every index
+// together so the selection stays valid for the next operation.
+func (fc *folderCache) drop(id string) {
+	uid, ok := fc.uidByID[id]
+	if !ok {
+		return
+	}
+	delete(fc.meta, id)
+	delete(fc.uidByID, id)
+	delete(fc.idByUID, uid)
+	for i, x := range fc.ids {
+		if x == id {
+			fc.ids = append(fc.ids[:i], fc.ids[i+1:]...)
+			break
+		}
+	}
+	fc.total--
 }
 
 func hasLabel(m *protonmail.Message, label string) bool {
@@ -438,6 +450,7 @@ func (s *Session) MoveMessage(uid uint32, dest string) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
+	left := false
 	if destLabel != fc.label {
 		switch {
 		case destLabel == protonmail.LabelStarred:
@@ -449,6 +462,7 @@ func (s *Session) MoveMessage(uid uint32, dest string) (uint32, error) {
 				if err := s.c.UnlabelMessages(protonmail.LabelStarred, []string{id}); err != nil {
 					return 0, err
 				}
+				left = true
 			}
 			if err := s.c.LabelMessages(destLabel, []string{id}); err != nil {
 				return 0, err
@@ -457,6 +471,7 @@ func (s *Session) MoveMessage(uid uint32, dest string) (uint32, error) {
 				if err := s.c.UnlabelMessages(fc.label, []string{id}); err != nil {
 					return 0, err
 				}
+				left = true
 			}
 		}
 	}
@@ -464,9 +479,16 @@ func (s *Session) MoveMessage(uid uint32, dest string) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	delete(s.folders, fc.name)
-	delete(s.folders, dest)
-	s.cur = nil
+	if left {
+		fc.drop(id)
+	} else if destLabel != fc.label {
+		if m, ok := fc.meta[id]; ok {
+			m.LabelIDs = setLabel(m.LabelIDs, destLabel, true)
+		}
+	}
+	if dest != fc.name {
+		delete(s.folders, dest)
+	}
 	return destUID, nil
 }
 
@@ -484,8 +506,7 @@ func (s *Session) DeleteMessage(uid uint32) error {
 	if err := s.c.DeleteMessages([]string{id}); err != nil {
 		return err
 	}
-	delete(s.folders, fc.name)
-	s.cur = nil
+	fc.drop(id)
 	return nil
 }
 
@@ -509,8 +530,9 @@ func (s *Session) AppendMessage(folder string, raw []byte, flags ...imap.Flag) (
 	if err != nil {
 		return 0, err
 	}
+	// The target listing is stale by the new message; the current selection
+	// is not: appending removed nothing from any view, so s.cur stays.
 	delete(s.folders, folder)
-	s.cur = nil
 	return uid, nil
 }
 

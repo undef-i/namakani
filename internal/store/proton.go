@@ -52,6 +52,24 @@ func (s *Store) AssignProtonUID(accountID int64, folderName, protonID string) (u
 	return uid, nil
 }
 
+func (s *Store) ProtonFoldersForID(accountID int64, protonID string) ([]string, error) {
+	rows, err := s.DB.Query("SELECT DISTINCT folder_name FROM proton_uids WHERE account_id = ? AND proton_id = ?",
+		accountID, protonID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) FolderTotals(accountID int64) (map[string]int, error) {
 	rows, err := s.DB.Query("SELECT name, total FROM folders WHERE account_id = ?", accountID)
 	if err != nil {

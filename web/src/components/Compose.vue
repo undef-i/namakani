@@ -22,6 +22,8 @@ const props = defineProps({
   undoSeconds: { type: Number, default: 5 },
   maxAttachmentMB: { type: Number, default: 20 },
   zIndex: { type: Number, default: 2500 },
+  opEvent: { type: Object, default: null },
+  resumeSend: { type: Object, default: null },
 })
 const emit = defineEmits(['update:modelValue', 'done', 'discarded'])
 
@@ -104,7 +106,7 @@ const toSearch = ref('')
 const ccSearch = ref('')
 const bccSearch = ref('')
 
-function chipEnter(chips, search) {
+function chipEnter(field) {
   return (e) => {
     if (e.ctrlKey || e.metaKey) return
     const input = e.target
@@ -117,16 +119,21 @@ function chipEnter(chips, search) {
     }
     e.preventDefault()
     e.stopPropagation()
+    const { chips, search, box } = fieldRefs[field]
     const s = search.value.trim()
     if (s) {
       if (!chips.value.includes(s)) chips.value = [...chips.value, s]
       search.value = ''
+      boxKeys[field]++
+      nextTick(() => {
+        box.value?.focus()
+      })
     }
   }
 }
-const onToEnter = chipEnter(toChips, toSearch)
-const onCcEnter = chipEnter(ccChips, ccSearch)
-const onBccEnter = chipEnter(bccChips, bccSearch)
+const onToEnter = chipEnter('to')
+const onCcEnter = chipEnter('cc')
+const onBccEnter = chipEnter('bcc')
 
 const toMenu = ref(false)
 const ccMenu = ref(false)
@@ -220,6 +227,7 @@ const schedInfo = ref('')
 const schedInfoShow = ref(false)
 const undoShow = ref(false)
 const undoLeft = ref(0)
+const sendBar = ref('')
 const showCc = ref(false)
 const contacts = ref([])
 const contactsError = ref(false)
@@ -232,7 +240,65 @@ let lastSigHTML = ''
 let initializing = false
 let restoring = false
 let undoTimer = null
-let pendingPayload = null
+let sentTimer = null
+let pendingOpId = 0
+let pendingNotBefore = 0
+
+function stopUndoTimer() {
+  if (undoTimer) {
+    clearInterval(undoTimer)
+    undoTimer = null
+  }
+}
+function stopSentTimer() {
+  if (sentTimer) {
+    clearTimeout(sentTimer)
+    sentTimer = null
+  }
+}
+function hideSendBar() {
+  stopUndoTimer()
+  stopSentTimer()
+  undoShow.value = false
+  sendBar.value = ''
+}
+function showFailedBar() {
+  stopUndoTimer()
+  stopSentTimer()
+  sendBar.value = 'failed'
+  undoShow.value = true
+  sentTimer = setTimeout(() => {
+    sentTimer = null
+    if (sendBar.value === 'failed') {
+      undoShow.value = false
+      sendBar.value = ''
+    }
+  }, 3500)
+}
+
+watch(
+  () => props.opEvent,
+  (ev) => {
+    if (!ev || !pendingOpId || ev.op_id !== pendingOpId) return
+    if (ev.undo_failed) {
+      pendingOpId = 0
+      showFailedBar()
+      return
+    }
+    if (ev.status === 'done' && ev.sent) {
+      pendingOpId = 0
+      hideSendBar()
+    } else if (ev.status === 'cancelled') {
+      pendingOpId = 0
+      hideSendBar()
+      restoreOpen()
+    } else if (ev.status === 'needs_attention') {
+      pendingOpId = 0
+      if (ev.sent) hideSendBar()
+      else showFailedBar()
+    }
+  },
+)
 
 const title = computed(() =>
   props.initial.reply_to_id ? t('回复邮件') : t('写信'),
@@ -265,7 +331,8 @@ const editor = useEditor({
 
 onBeforeUnmount(() => {
   editor.value?.destroy()
-  clearInterval(undoTimer)
+  stopUndoTimer()
+  stopSentTimer()
 })
 
 let layerPushed = false
@@ -410,13 +477,13 @@ watch(open, (isOpen) => {
     restoring = false
     return
   }
-  if (undoTimer) {
-    clearInterval(undoTimer)
-    undoTimer = null
-    undoShow.value = false
-    const p = pendingPayload
-    pendingPayload = null
-    if (p) realSend(p)
+  if (undoTimer || undoShow.value) {
+    hideSendBar()
+  }
+  if (pendingOpId) {
+    const opId = pendingOpId
+    pendingOpId = 0
+    api.sendNowOp(opId).catch(() => {})
   }
   applyInit(props.initial)
 })
@@ -687,61 +754,88 @@ function restoreOpen() {
   open.value = true
 }
 
-async function realSend(p) {
-  sending.value = true
-  busy.value = true
-  try {
-    const res = await api.sendMail(p)
-    if (res.warning) {
-      warning.value = res.warning
-      done.value = true
-      restoreOpen()
-    } else {
-      emit('done')
-    }
-  } catch (e) {
-    error.value = e.message
-    restoreOpen()
-  } finally {
-    busy.value = false
-    sending.value = false
-  }
-}
-
 async function doSend() {
   error.value = ''
   if (!validateRecipients()) return
+  sending.value = true
   clearTimeout(saveTimer)
   await drainSaves()
-  pendingPayload = payload()
-  open.value = false
-  if (!props.undoSeconds || props.undoSeconds <= 0) {
-    const p = pendingPayload
-    pendingPayload = null
-    if (p) realSend(p)
+  const p = payload()
+  p.undo_seconds = props.undoSeconds || 0
+  p.client_key = api.newClientKey()
+  let res
+  try {
+    res = await api.sendMail(p)
+  } catch (e) {
+    error.value = e.message
+    sending.value = false
     return
   }
-  undoLeft.value = props.undoSeconds
+  sending.value = false
+  pendingOpId = res.op_id
+  pendingNotBefore = res.not_before
+  open.value = false
+  emit('done')
+  if (!props.undoSeconds || props.undoSeconds <= 0) {
+    pendingOpId = 0
+    return
+  }
+  sendBar.value = 'countdown'
   undoShow.value = true
-  clearInterval(undoTimer)
-  undoTimer = setInterval(() => {
-    undoLeft.value -= 1
-    if (undoLeft.value <= 0) {
-      clearInterval(undoTimer)
-      undoTimer = null
-      undoShow.value = false
-      const p = pendingPayload
-      pendingPayload = null
-      if (p) realSend(p)
-    }
-  }, 1000)
+  startUndoTick()
 }
 
-function undoSend() {
-  clearInterval(undoTimer)
-  undoTimer = null
-  undoShow.value = false
-  pendingPayload = null
+function startUndoTick() {
+  const tick = () => {
+    undoLeft.value = Math.max(0, pendingNotBefore - Math.floor(Date.now() / 1000))
+    if (undoLeft.value <= 0) {
+      stopUndoTimer()
+      if (sendBar.value === 'countdown') sendBar.value = 'sending'
+    }
+  }
+  tick()
+  stopUndoTimer()
+  undoTimer = setInterval(tick, 250)
+}
+
+watch(
+  () => props.resumeSend,
+  (v) => {
+    if (!v || !v.op_id || v.op_id === pendingOpId) return
+    if (Math.floor(Date.now() / 1000) >= v.not_before) return
+    pendingOpId = v.op_id
+    pendingNotBefore = v.not_before
+    sendBar.value = 'countdown'
+    undoShow.value = true
+    startUndoTick()
+  },
+)
+
+async function undoSend() {
+  const opId = pendingOpId
+  if (!opId) return
+  stopUndoTimer()
+  sendBar.value = 'awaiting'
+  let res
+  try {
+    res = await api.undoOp(opId)
+  } catch (e) {
+    pendingOpId = 0
+    hideSendBar()
+    error.value = e.message
+    restoreOpen()
+    return
+  }
+  if (res && res.mode === 'already_sent') {
+    pendingOpId = 0
+    hideSendBar()
+    return
+  }
+  if (res && res.mode === 'deferred') {
+    return
+  }
+  pendingOpId = 0
+  hideSendBar()
   restoreOpen()
 }
 
@@ -864,7 +958,7 @@ async function discardCompose() {
     }
     busy.value = false
     open.value = false
-    emit('discarded', { row_id: -schedId.value, kind: 'cancel' })
+    emit('discarded', { row_id: schedId.value, kind: 'cancel' })
     emit('done')
     return
   }
@@ -881,7 +975,7 @@ async function discardCompose() {
     }
     busy.value = false
     open.value = false
-    emit('discarded', { row_id: draftId.value, kind: 'draft' })
+    emit('discarded', { row_id: draftId.value, kind: 'draft', op_id: dres?.op_id })
     emit('done')
     return
   }
@@ -1093,6 +1187,10 @@ function onKeydown(e) {
                 </span>
               </button>
               </div>
+            <div v-if="contactsError" class="crow">
+              <span class="clabel"></span>
+              <span class="text-caption text-error">{{ t('联系人加载失败，输入时不会有建议') }}</span>
+            </div>
             <div v-if="showCc" v-show="!(suggActive && focusedField === 'to')" class="crow">
               <span class="clabel">{{ t('抄送') }}</span>
               <v-combobox
@@ -1417,8 +1515,10 @@ function onKeydown(e) {
   </div>
 
   <v-snackbar v-model="undoShow" :timeout="-1" location="bottom">
-    {{ t('正在发送，{n} 秒后发出', { n: undoLeft }) }}
-    <template #actions>
+    <template v-if="sendBar === 'countdown'">{{ t('正在发送，{n} 秒后发出', { n: undoLeft }) }}</template>
+    <template v-else-if="sendBar === 'failed'">{{ t('发送失败') }}</template>
+    <template v-else>{{ t('正在发送') }}</template>
+    <template v-if="sendBar === 'countdown' || sendBar === 'sending'" #actions>
       <v-btn color="warning" variant="text" @click="undoSend">{{ t('撤销') }}</v-btn>
     </template>
   </v-snackbar>
@@ -1594,18 +1694,20 @@ function onKeydown(e) {
 }
 .cfield .v-chip {
   height: 24px;
+  max-width: 100%;
+  min-width: 0;
   font-size: 12.5px;
 }
 .cfield .v-field--variant-plain .v-field__append-inner,
 .cfield .v-field--variant-plain .v-field__clearable {
   padding-top: 4px;
 }
-.cfield .v-chip {
-  height: auto;
-}
 .cfield .v-chip__content {
-  white-space: normal;
-  overflow-wrap: anywhere;
+  display: block;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .chip-bad {
   font-weight: 700;
@@ -1678,6 +1780,7 @@ function onKeydown(e) {
 .compose-root-mobile .compose-body {
   overflow-y: auto;
   overflow-anchor: none;
+  padding-top: 0;
 }
 .compose-root-mobile .compose-editarea {
   flex: none;
@@ -1694,6 +1797,13 @@ function onKeydown(e) {
   align-items: center;
   padding: 4px 10px;
   border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+}
+.compose-root-mobile .compose-toolbar {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+.compose-root-mobile .compose-toolbar > * {
+  flex: none;
 }
 .compose-editarea {
   display: flex;

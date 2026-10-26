@@ -109,36 +109,36 @@ func (s *Server) handleTelegramWebAppAuth(w http.ResponseWriter, r *http.Request
 	}
 	if err := decodeJSON(r, &req); err != nil || req.InitData == "" {
 		log.Printf("tg webapp-auth: bad request from %s: init_data empty or invalid json", r.RemoteAddr)
-		writeErr(w, http.StatusBadRequest, "init_data required")
+		writeErr(w, http.StatusBadRequest, "缺少登录数据")
 		return
 	}
 	log.Printf("tg webapp-auth: request from %s ua=%q init_data_len=%d", r.RemoteAddr, r.UserAgent(), len(req.InitData))
 	cfg := s.tgLoadConfig()
 	if cfg.Token == "" || cfg.ChatID == "" {
 		log.Printf("tg webapp-auth: rejected: telegram not configured (token set=%v chat set=%v)", cfg.Token != "", cfg.ChatID != "")
-		writeErr(w, http.StatusServiceUnavailable, "telegram not configured")
+		writeErr(w, http.StatusServiceUnavailable, "尚未配置 Telegram")
 		return
 	}
 	init, err := verifyTGInitData(cfg.Token, req.InitData, time.Now())
 	if err != nil {
 		log.Printf("tg webapp-auth: verify failed: %v", err)
-		writeErr(w, http.StatusUnauthorized, "telegram sign-in verification failed")
+		writeErr(w, http.StatusUnauthorized, "Telegram 登录校验失败")
 		return
 	}
 	if strconv.FormatInt(init.UserID, 10) != cfg.ChatID {
 		log.Printf("tg webapp-auth: user mismatch: got %d, bound chat is %s", init.UserID, cfg.ChatID)
-		writeErr(w, http.StatusForbidden, "telegram user is not the bound chat")
+		writeErr(w, http.StatusForbidden, "Telegram 账号与绑定的聊天不一致")
 		return
 	}
 	key, ok := s.recoverCredentialKey()
 	if !ok {
 		log.Printf("tg webapp-auth: rejected: credential key not recoverable")
-		writeErr(w, http.StatusConflict, "no live session to recover credentials from; sign in with the master password once first")
+		writeErr(w, http.StatusConflict, "当前没有可用的登录会话，请先用主密码登录一次")
 		return
 	}
 	if err := s.startSession(w, r, key); err != nil {
 		log.Printf("tg webapp-auth: start session failed: %v", err)
-		writeErr(w, http.StatusInternalServerError, "session failed")
+		writeErr(w, http.StatusInternalServerError, "会话处理失败")
 		return
 	}
 	s.startAllWorkers(key)

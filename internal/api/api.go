@@ -28,6 +28,7 @@ import (
 	"namakani/internal/proton"
 	"namakani/internal/store"
 	syncmgr "namakani/internal/sync"
+	"namakani/internal/translate"
 	"namakani/internal/tuta"
 
 	"github.com/emersion/go-imap/v2"
@@ -41,6 +42,15 @@ type Server struct {
 	serverKey     []byte
 	mu            sync.Mutex
 	keys          map[string][]byte
+	drainWake     chan struct{}
+	drainMu       sync.Mutex
+	drainRunning  map[int64]bool
+	connFailMu    sync.Mutex
+	connFail      map[int64]*connFailState
+	drainOpen     func(ctx context.Context, key []byte, accountID int64) (mail.Conn, error)
+	appendOpen    func(key []byte, accountID int64) (mail.Conn, error)
+	sendDeliver   func(key []byte, out *outgoing) (string, error)
+	sendFileCopy  func(key []byte, out *outgoing, sentID string) (int64, error)
 	loginMu       sync.Mutex
 	loginFails    int
 	loginLastFail time.Time
@@ -51,6 +61,9 @@ type Server struct {
 	tgRunning     string
 	protonAuthMu  sync.Mutex
 	protonAuth    map[string]protonAuthEntry
+	trMgr         *translate.Manager
+	translateBuild func(cfg translateSettings) (translate.Engine, error)
+	avatarResolve func(ctx context.Context, email string) (string, string, []byte)
 }
 
 type protonAuthEntry struct {
@@ -59,9 +72,12 @@ type protonAuthEntry struct {
 }
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
-	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry)}
+	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry), drainWake: make(chan struct{}, 1), drainRunning: make(map[int64]bool), connFail: make(map[int64]*connFailState), trMgr: translate.NewManager(filepath.Join(st.DataDir(), "models"))}
+	s.drainOpen = s.openBackgroundConn
+	s.appendOpen = s.openConn
+	go st.WarmBodyBytes()
 	s.tgReconcile()
-	go s.scheduleLoop()
+	go s.drainLoop()
 	if key, err := auth.LoadOrCreateServerKey(filepath.Join(st.DataDir(), "server.key")); err == nil {
 		s.serverKey = key
 	} else {
@@ -91,7 +107,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/messages/{id}", s.authOnly(s.handleGetMessage))
 	mux.HandleFunc("GET /api/messages/{id}/attachments/{attId}", s.authOnly(s.handleDownloadAttachment))
 	mux.HandleFunc("POST /api/messages/{id}/flags", s.authOnly(s.handleSetFlags))
+	mux.HandleFunc("POST /api/messages/flags", s.authOnly(s.handleBatchFlags))
 	mux.HandleFunc("POST /api/messages/{id}/move", s.authOnly(s.handleMoveMessage))
+	mux.HandleFunc("POST /api/messages/{id}/restore", s.authOnly(s.handleRestoreMessage))
 	mux.HandleFunc("POST /api/messages/{id}/delete", s.authOnly(s.handleDeleteMessage))
 	mux.HandleFunc("POST /api/send", s.authOnly(s.handleSend))
 	mux.HandleFunc("POST /api/send/schedule", s.authOnly(s.handleScheduleSend))
@@ -110,11 +128,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/settings/telegram/discover", s.authOnly(s.handleTelegramDiscover))
 	mux.HandleFunc("POST /api/settings/telegram/test", s.authOnly(s.handleTelegramTest))
 	mux.HandleFunc("POST /api/telegram/webapp-auth", s.handleTelegramWebAppAuth)
+	mux.HandleFunc("GET /api/settings/translate", s.authOnly(s.handleGetTranslateSettings))
+	mux.HandleFunc("PUT /api/settings/translate", s.authOnly(s.handlePutTranslateSettings))
+	mux.HandleFunc("POST /api/messages/{id}/translate", s.authOnly(s.handleTranslateMessage))
+	mux.HandleFunc("GET /api/translate/models", s.authOnly(s.handleTranslateModels))
+	mux.HandleFunc("POST /api/translate/llm/models", s.authOnly(s.handleLLMModels))
+	mux.HandleFunc("POST /api/avatars", s.authOnly(s.handleAvatars))
+	mux.HandleFunc("GET /api/avatar/img", s.authOnly(s.handleAvatarImage))
 	mux.HandleFunc("GET /api/settings/webpush", s.authOnly(s.handleGetWebPush))
 	mux.HandleFunc("POST /api/settings/webpush/test", s.authOnly(s.handleWebPushTest))
 	mux.HandleFunc("POST /api/push/subscribe", s.authOnly(s.handlePushSubscribe))
 	mux.HandleFunc("POST /api/push/unsubscribe", s.authOnly(s.handlePushUnsubscribe))
 	mux.HandleFunc("POST /api/messages/mark-all-read", s.authOnly(s.handleMarkAllRead))
+	mux.HandleFunc("POST /api/ops/{id}/undo", s.authOnly(s.handleUndoOp))
+	mux.HandleFunc("POST /api/ops/{id}/retry", s.authOnly(s.handleRetryOp))
+	mux.HandleFunc("DELETE /api/ops/{id}", s.authOnly(s.handleDiscardOp))
+	mux.HandleFunc("POST /api/ops/{id}/send-now", s.authOnly(s.handleSendNowOp))
+	mux.HandleFunc("GET /api/ops/attention", s.authOnly(s.handleListAttention))
+	mux.HandleFunc("GET /api/ops/pending", s.authOnly(s.handleListPending))
+	mux.HandleFunc("POST /api/ops/by-keys", s.authOnly(s.handleOpsByKeys))
 	mux.Handle("/", s.spaHandler())
 	return mux
 }
@@ -127,6 +159,43 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+type userFacingError struct{ s string }
+
+func (e *userFacingError) Error() string { return e.s }
+
+func userFacing(s string) error { return &userFacingError{s: s} }
+
+func describeConnError(err error) string {
+	s := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(s, "authenticationfailed"), strings.Contains(s, "authentication failed"),
+		strings.Contains(s, "invalid credentials"), strings.Contains(s, "login failed"):
+		return "登录被拒绝，请检查用户名和密码"
+	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline exceeded"):
+		return "连接超时，请检查服务器地址和网络"
+	case strings.Contains(s, "certificate"), strings.Contains(s, "tls"):
+		return "TLS 证书校验失败"
+	case strings.Contains(s, "quota"):
+		return "空间或配额不足"
+	default:
+		return "无法连接服务器，请检查地址和端口"
+	}
+}
+
+func writeUserErr(w http.ResponseWriter, code int, fallback string, err error) {
+	var ue *userFacingError
+	if errors.As(err, &ue) {
+		writeErr(w, code, ue.s)
+		return
+	}
+	if errors.Is(err, store.ErrClientKeyConflict) {
+		writeErr(w, http.StatusConflict, "重复提交被拒绝，请刷新后确认当前状态")
+		return
+	}
+	log.Printf("namakani: %s: %v", fallback, err)
+	writeErr(w, code, fallback)
 }
 
 func decodeJSON(r *http.Request, v any) error {
@@ -153,7 +222,13 @@ func (s *Server) credentialKey(r *http.Request) ([]byte, bool) {
 	key, ok := s.keys[token]
 	s.mu.Unlock()
 	if ok {
-		return key, true
+		if _, expiresAt, exists, err := auth.SessionInfo(s.st, token); err == nil && exists && time.Now().Unix() <= expiresAt {
+			return key, true
+		}
+		s.mu.Lock()
+		delete(s.keys, token)
+		s.mu.Unlock()
+		return nil, false
 	}
 	if s.serverKey == nil {
 		return nil, false
@@ -180,7 +255,7 @@ func (s *Server) credentialKey(r *http.Request) ([]byte, bool) {
 func (s *Server) authOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := s.credentialKey(r); !ok {
-			writeErr(w, http.StatusUnauthorized, "not logged in")
+			writeErr(w, http.StatusUnauthorized, "尚未登录")
 			return
 		}
 		s.renewSession(w, r)
@@ -238,7 +313,7 @@ var BuildVersion = "dev"
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	setup, err := auth.IsSetup(s.st)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "state error")
+		writeErr(w, http.StatusInternalServerError, "读取状态失败")
 		return
 	}
 	_, authed := s.credentialKey(r)
@@ -248,6 +323,9 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"setup": setup, "authed": authed, "version": BuildVersion}
 	if authed {
 		out["app_settings"] = s.st.AppSettings()
+		if n, err := s.st.AttentionCount(); err == nil {
+			out["attention"] = n
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -259,29 +337,29 @@ type passwordReq struct {
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	setup, err := auth.IsSetup(s.st)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "state error")
+		writeErr(w, http.StatusInternalServerError, "读取状态失败")
 		return
 	}
 	if setup {
-		writeErr(w, http.StatusConflict, "already set up")
+		writeErr(w, http.StatusConflict, "已完成初始化")
 		return
 	}
 	var req passwordReq
 	if err := decodeJSON(r, &req); err != nil || len(req.Password) < 8 {
-		writeErr(w, http.StatusBadRequest, "password must be at least 8 characters")
+		writeErr(w, http.StatusBadRequest, "密码至少 8 位")
 		return
 	}
 	if err := auth.SetupMaster(s.st, req.Password); err != nil {
-		writeErr(w, http.StatusInternalServerError, "setup failed")
+		writeErr(w, http.StatusInternalServerError, "初始化失败")
 		return
 	}
 	key, ok, err := auth.VerifyMaster(s.st, req.Password)
 	if err != nil || !ok {
-		writeErr(w, http.StatusInternalServerError, "setup verify failed")
+		writeErr(w, http.StatusInternalServerError, "初始化校验失败")
 		return
 	}
 	if err := s.startSession(w, r, key); err != nil {
-		writeErr(w, http.StatusInternalServerError, "session failed")
+		writeErr(w, http.StatusInternalServerError, "会话处理失败")
 		return
 	}
 	s.startAllWorkers(key)
@@ -320,26 +398,26 @@ func (s *Server) resetLoginFailures() {
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req passwordReq
 	if err := decodeJSON(r, &req); err != nil || req.Password == "" {
-		writeErr(w, http.StatusBadRequest, "password required")
+		writeErr(w, http.StatusBadRequest, "请填写密码")
 		return
 	}
 	if s.loginWait() > 0 {
-		writeErr(w, http.StatusTooManyRequests, "too many failed attempts, try again later")
+		writeErr(w, http.StatusTooManyRequests, "尝试次数过多，请稍后再试")
 		return
 	}
 	key, ok, err := auth.VerifyMaster(s.st, req.Password)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "login failed")
+		writeErr(w, http.StatusInternalServerError, "登录失败")
 		return
 	}
 	if !ok {
 		s.noteLoginFailure()
-		writeErr(w, http.StatusUnauthorized, "wrong password")
+		writeErr(w, http.StatusUnauthorized, "密码不对")
 		return
 	}
 	s.resetLoginFailures()
 	if err := s.startSession(w, r, key); err != nil {
-		writeErr(w, http.StatusInternalServerError, "session failed")
+		writeErr(w, http.StatusInternalServerError, "会话处理失败")
 		return
 	}
 	s.startAllWorkers(key)
@@ -348,11 +426,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	token := s.sessionToken(r)
-	s.mgr.StopAll()
 	_ = auth.DeleteSession(s.st, token)
 	s.mu.Lock()
 	delete(s.keys, token)
 	s.mu.Unlock()
+	if n, err := auth.LiveSessionCount(s.st); err == nil && n == 0 {
+		s.mgr.StopAll()
+		s.mu.Lock()
+		s.keys = make(map[string][]byte)
+		s.mu.Unlock()
+	}
 	http.SetCookie(w, &http.Cookie{Name: "wm_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -398,21 +481,21 @@ func validateAccount(in *accountIn, passwordRequired bool) (imapPort, smtpPort i
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" ||
 		strings.TrimSpace(in.ImapHost) == "" || strings.TrimSpace(in.SmtpHost) == "" ||
 		strings.TrimSpace(in.Username) == "" {
-		return 0, 0, errors.New("label, email, hosts and username are required")
+		return 0, 0, userFacing("请填写名称、邮箱、服务器地址和用户名")
 	}
 	if passwordRequired && in.Password == "" {
-		return 0, 0, errors.New("password is required")
+		return 0, 0, userFacing("请填写密码")
 	}
 	if !auth.ValidTLSMode(in.ImapTLS) || !auth.ValidTLSMode(in.SmtpTLS) {
-		return 0, 0, errors.New("tls mode must be tls, starttls or none")
+		return 0, 0, userFacing("加密方式只能是 tls、starttls 或 none")
 	}
 	imapPort, err = auth.ParsePort(in.ImapPort)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, userFacing(err.Error())
 	}
 	smtpPort, err = auth.ParsePort(in.SmtpPort)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, userFacing(err.Error())
 	}
 	return imapPort, smtpPort, nil
 }
@@ -421,7 +504,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.st.DB.Query(`SELECT id, label, email, imap_host, imap_port, imap_tls,
 		smtp_host, smtp_port, smtp_tls, username, signature, from_name, tls_skip_verify, kind FROM accounts ORDER BY sort, id`)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "list failed")
+		writeErr(w, http.StatusInternalServerError, "列表加载失败")
 		return
 	}
 	defer rows.Close()
@@ -430,7 +513,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 		var a accountOut
 		if err := rows.Scan(&a.ID, &a.Label, &a.Email, &a.ImapHost, &a.ImapPort, &a.ImapTLS,
 			&a.SmtpHost, &a.SmtpPort, &a.SmtpTLS, &a.Username, &a.Signature, &a.FromName, &a.TLSSkipVerify, &a.Kind); err != nil {
-			writeErr(w, http.StatusInternalServerError, "list failed")
+			writeErr(w, http.StatusInternalServerError, "列表加载失败")
 			return
 		}
 		out = append(out, a)
@@ -442,7 +525,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var in accountIn
 	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json")
+		writeErr(w, http.StatusBadRequest, "请求格式不对")
 		return
 	}
 	if in.Kind == "proton" {
@@ -455,12 +538,12 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	imapPort, smtpPort, err := validateAccount(&in, true)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeUserErr(w, http.StatusBadRequest, "账号信息不完整，请检查后重试", err)
 		return
 	}
 	enc, err := auth.Encrypt(key, in.Password)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "encrypt failed")
+		writeErr(w, http.StatusInternalServerError, "加密失败")
 		return
 	}
 	res, err := s.st.DB.Exec(`INSERT INTO accounts(label, email, imap_host, imap_port, imap_tls,
@@ -469,7 +552,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
 		in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, enc, in.Signature, in.FromName, in.TLSSkipVerify, time.Now().Unix())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "insert failed")
+		writeErr(w, http.StatusInternalServerError, "保存失败")
 		return
 	}
 	id, _ := res.LastInsertId()
@@ -481,7 +564,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var in accountIn
 	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json")
+		writeErr(w, http.StatusBadRequest, "请求格式不对")
 		return
 	}
 	if in.Kind == "proton" {
@@ -494,14 +577,14 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	imapPort, smtpPort, err := validateAccount(&in, false)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeUserErr(w, http.StatusBadRequest, "账号信息不完整，请检查后重试", err)
 		return
 	}
 	id := r.PathValue("id")
 	if in.Password != "" {
 		enc, err := auth.Encrypt(key, in.Password)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "encrypt failed")
+			writeErr(w, http.StatusInternalServerError, "加密失败")
 			return
 		}
 		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, imap_host=?, imap_port=?, imap_tls=?,
@@ -509,7 +592,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
 			in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, enc, in.Signature, in.FromName, in.TLSSkipVerify, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "update failed")
+			writeErr(w, http.StatusInternalServerError, "更新失败")
 			return
 		}
 	} else {
@@ -518,7 +601,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
 			in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, in.Signature, in.FromName, in.TLSSkipVerify, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "update failed")
+			writeErr(w, http.StatusInternalServerError, "更新失败")
 			return
 		}
 	}
@@ -532,12 +615,12 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	idNum, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad account id")
+		writeErr(w, http.StatusBadRequest, "账号编号不对")
 		return
 	}
 	s.mgr.Stop(idNum)
 	if err := s.st.DeleteAccount(idNum); err != nil {
-		writeErr(w, http.StatusInternalServerError, "delete failed")
+		writeErr(w, http.StatusInternalServerError, "删除失败")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -584,7 +667,7 @@ func (s *Server) authorizeProton(in *accountIn) (string, error) {
 
 func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *accountIn) {
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" || in.Password == "" {
-		writeErr(w, http.StatusBadRequest, "label, email and password are required")
+		writeErr(w, http.StatusBadRequest, "请填写名称、邮箱和密码")
 		return
 	}
 	bridgePassword, err := s.authorizeProton(in)
@@ -598,12 +681,12 @@ func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *acco
 		return
 	}
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱和密码", err)
 		return
 	}
 	enc, err := auth.Encrypt(key, bridgePassword)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "encrypt failed")
+		writeErr(w, http.StatusInternalServerError, "加密失败")
 		return
 	}
 	username := in.Username
@@ -616,7 +699,7 @@ func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *acco
 		in.Label, in.Email, "", 0, "none",
 		"", 0, "none", username, enc, in.Signature, in.FromName, false, "proton", time.Now().Unix())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "insert failed")
+		writeErr(w, http.StatusInternalServerError, "保存失败")
 		return
 	}
 	id, _ := res.LastInsertId()
@@ -627,7 +710,7 @@ func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *acco
 func (s *Server) updateProtonAccount(w http.ResponseWriter, r *http.Request, key []byte, in *accountIn) {
 	id := r.PathValue("id")
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" {
-		writeErr(w, http.StatusBadRequest, "label and email are required")
+		writeErr(w, http.StatusBadRequest, "请填写名称和邮箱")
 		return
 	}
 	username := in.Username
@@ -646,25 +729,25 @@ func (s *Server) updateProtonAccount(w http.ResponseWriter, r *http.Request, key
 			return
 		}
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
+			writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱和密码", err)
 			return
 		}
 		enc, err := auth.Encrypt(key, bridgePassword)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "encrypt failed")
+			writeErr(w, http.StatusInternalServerError, "加密失败")
 			return
 		}
 		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, enc_password=?, signature=?, from_name=? WHERE id=?`,
 			in.Label, in.Email, username, enc, in.Signature, in.FromName, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "update failed")
+			writeErr(w, http.StatusInternalServerError, "更新失败")
 			return
 		}
 	} else {
 		_, err := s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, signature=?, from_name=? WHERE id=?`,
 			in.Label, in.Email, username, in.Signature, in.FromName, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "update failed")
+			writeErr(w, http.StatusInternalServerError, "更新失败")
 			return
 		}
 	}
@@ -677,7 +760,7 @@ func (s *Server) updateProtonAccount(w http.ResponseWriter, r *http.Request, key
 
 func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accountIn) {
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" || in.Password == "" {
-		writeErr(w, http.StatusBadRequest, "label, email and password are required")
+		writeErr(w, http.StatusBadRequest, "请填写名称、邮箱和密码")
 		return
 	}
 	start := time.Now()
@@ -688,13 +771,13 @@ func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accoun
 	}
 	if err != nil {
 		log.Printf("tuta: create account authorize failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱、密码和两步验证码", err)
 		return
 	}
 	log.Printf("tuta: create account authorize ok in %s", time.Since(start).Round(time.Millisecond))
 	enc, err := auth.Encrypt(key, in.Password)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "encrypt failed")
+		writeErr(w, http.StatusInternalServerError, "加密失败")
 		return
 	}
 	username := in.Username
@@ -707,12 +790,12 @@ func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accoun
 		in.Label, in.Email, "", 0, "none",
 		"", 0, "none", username, enc, in.Signature, in.FromName, false, "tuta", time.Now().Unix())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "insert failed")
+		writeErr(w, http.StatusInternalServerError, "保存失败")
 		return
 	}
 	id, _ := res.LastInsertId()
 	if err := s.st.SaveTutaSession(id, userID, accessToken); err != nil {
-		writeErr(w, http.StatusInternalServerError, "session save failed")
+		writeErr(w, http.StatusInternalServerError, "保存会话失败")
 		return
 	}
 	s.startWorkerFor(id, key)
@@ -722,7 +805,7 @@ func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accoun
 func (s *Server) updateTutaAccount(w http.ResponseWriter, r *http.Request, key []byte, in *accountIn) {
 	id := r.PathValue("id")
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" {
-		writeErr(w, http.StatusBadRequest, "label and email are required")
+		writeErr(w, http.StatusBadRequest, "请填写名称和邮箱")
 		return
 	}
 	username := in.Username
@@ -739,19 +822,19 @@ func (s *Server) updateTutaAccount(w http.ResponseWriter, r *http.Request, key [
 		}
 		if err != nil {
 			log.Printf("tuta: update account %d authorize failed after %s: %v", idNum, time.Since(start).Round(time.Millisecond), err)
-			writeErr(w, http.StatusBadRequest, err.Error())
+			writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱、密码和两步验证码", err)
 			return
 		}
 		log.Printf("tuta: update account %d authorize ok in %s", idNum, time.Since(start).Round(time.Millisecond))
 		enc, err := auth.Encrypt(key, in.Password)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "encrypt failed")
+			writeErr(w, http.StatusInternalServerError, "加密失败")
 			return
 		}
 		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, enc_password=<redacted>, signature=?, from_name=? WHERE id=?`,
 			in.Label, in.Email, username, enc, in.Signature, in.FromName, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "update failed")
+			writeErr(w, http.StatusInternalServerError, "更新失败")
 			return
 		}
 		if idNum > 0 {
@@ -761,7 +844,7 @@ func (s *Server) updateTutaAccount(w http.ResponseWriter, r *http.Request, key [
 		_, err := s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, signature=?, from_name=? WHERE id=?`,
 			in.Label, in.Email, username, in.Signature, in.FromName, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "update failed")
+			writeErr(w, http.StatusInternalServerError, "更新失败")
 			return
 		}
 	}
@@ -834,7 +917,7 @@ func (s *Server) handleTestAccountForm(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var in accountTestIn
 	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json")
+		writeErr(w, http.StatusBadRequest, "请求格式不对")
 		return
 	}
 	if in.Kind == "proton" {
@@ -851,11 +934,11 @@ func (s *Server) handleTestAccountForm(w http.ResponseWriter, r *http.Request) {
 func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
 	if strings.TrimSpace(in.ImapHost) == "" || strings.TrimSpace(in.SmtpHost) == "" ||
 		strings.TrimSpace(in.Username) == "" {
-		writeErr(w, http.StatusBadRequest, "hosts and username are required")
+		writeErr(w, http.StatusBadRequest, "请填写服务器地址和用户名")
 		return
 	}
 	if !auth.ValidTLSMode(in.ImapTLS) || !auth.ValidTLSMode(in.SmtpTLS) {
-		writeErr(w, http.StatusBadRequest, "tls mode must be tls, starttls or none")
+		writeErr(w, http.StatusBadRequest, "加密方式只能是 tls、starttls 或 none")
 		return
 	}
 	imapPort, err := auth.ParsePort(in.ImapPort)
@@ -872,13 +955,13 @@ func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountT
 	if password == "" && in.ID > 0 {
 		stored, err := s.loadMailAccount(in.ID, key)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, "stored credentials unavailable")
+			writeErr(w, http.StatusBadRequest, "保存的登录凭据不可用，请重新登录")
 			return
 		}
 		password = stored.Password
 	}
 	if password == "" {
-		writeErr(w, http.StatusBadRequest, "password is required")
+		writeErr(w, http.StatusBadRequest, "请填写密码")
 		return
 	}
 	acct := mail.Account{
@@ -896,13 +979,15 @@ func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountT
 	}
 	imapRes := testSideResult{}
 	if cl, err := mail.Connect(acct, nil); err != nil {
-		imapRes.Error = err.Error()
+		log.Printf("namakani: test imap connect: %v", err)
+		imapRes.Error = describeConnError(err)
 	} else {
 		folders, ferr := cl.ListFolders()
 		caps := cl.Capabilities()
 		cl.Close()
 		if ferr != nil {
-			imapRes.Error = "list folders: " + ferr.Error()
+			log.Printf("namakani: test imap list folders: %v", ferr)
+			imapRes.Error = "读取文件夹列表失败"
 		} else {
 			imapRes.OK = true
 			imapRes.Folders = len(folders)
@@ -911,7 +996,8 @@ func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountT
 	}
 	smtpRes := testSideResult{}
 	if err := mail.TestSMTP(acct); err != nil {
-		smtpRes.Error = err.Error()
+		log.Printf("namakani: test smtp: %v", err)
+		smtpRes.Error = describeConnError(err)
 	} else {
 		smtpRes.OK = true
 	}
@@ -920,12 +1006,12 @@ func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountT
 
 func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
 	if strings.TrimSpace(in.Email) == "" {
-		writeErr(w, http.StatusBadRequest, "email is required")
+		writeErr(w, http.StatusBadRequest, "请填写邮箱")
 		return
 	}
 	if in.Password == "" {
 		if in.ID <= 0 {
-			writeErr(w, http.StatusBadRequest, "password is required")
+			writeErr(w, http.StatusBadRequest, "请填写密码")
 			return
 		}
 		s.testProtonStored(w, key, in.ID)
@@ -942,19 +1028,19 @@ func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accoun
 			writeJSON(w, http.StatusOK, map[string]any{"needs_captcha": true, "captcha_url": capErr.URL, "captcha_token": capErr.Token})
 			return
 		}
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱和密码", err)
 		return
 	}
 	acct := mail.Account{Kind: "proton", Email: in.Email, Username: in.Email, Password: bridgePassword}
 	cl, err := proton.Connect(s.st, acct)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
 		return
 	}
 	defer cl.Close()
 	folders, err := cl.ListFolders()
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
@@ -963,18 +1049,18 @@ func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accoun
 func (s *Server) testProtonStored(w http.ResponseWriter, key []byte, id int64) {
 	acct, err := s.loadMailAccount(id, key)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "stored credentials unavailable")
+		writeErr(w, http.StatusBadRequest, "保存的登录凭据不可用，请重新登录")
 		return
 	}
 	cl, err := proton.Connect(s.st, acct)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
 		return
 	}
 	defer cl.Close()
 	folders, err := cl.ListFolders()
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
@@ -982,12 +1068,12 @@ func (s *Server) testProtonStored(w http.ResponseWriter, key []byte, id int64) {
 
 func (s *Server) testTutaAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
 	if strings.TrimSpace(in.Email) == "" {
-		writeErr(w, http.StatusBadRequest, "email is required")
+		writeErr(w, http.StatusBadRequest, "请填写邮箱")
 		return
 	}
 	if in.Password == "" {
 		if in.ID <= 0 {
-			writeErr(w, http.StatusBadRequest, "password is required")
+			writeErr(w, http.StatusBadRequest, "请填写密码")
 			return
 		}
 		s.testTutaStored(w, key, in.ID)
@@ -1001,14 +1087,14 @@ func (s *Server) testTutaAccount(w http.ResponseWriter, key []byte, in *accountT
 			return
 		}
 		log.Printf("tuta: test authorize failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱、密码和两步验证码", err)
 		return
 	}
 	log.Printf("tuta: test authorize ok in %s", time.Since(start).Round(time.Millisecond))
 	folders, err := listFoldersBounded(cl, listFoldersTimeout)
 	if err != nil {
 		log.Printf("tuta: test list folders failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
-		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
@@ -1038,20 +1124,20 @@ func (s *Server) testTutaStored(w http.ResponseWriter, key []byte, id int64) {
 	start := time.Now()
 	acct, err := s.loadMailAccount(id, key)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "stored credentials unavailable")
+		writeErr(w, http.StatusBadRequest, "保存的登录凭据不可用，请重新登录")
 		return
 	}
 	cl, err := tuta.Connect(s.st, acct)
 	if err != nil {
 		log.Printf("tuta: test stored account %d connect failed after %s: %v", id, time.Since(start).Round(time.Millisecond), err)
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
 		return
 	}
 	defer cl.Close()
 	folders, err := listFoldersBounded(cl, listFoldersTimeout)
 	if err != nil {
 		log.Printf("tuta: test stored account %d list folders failed after %s: %v", id, time.Since(start).Round(time.Millisecond), err)
-		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
 		return
 	}
 	log.Printf("tuta: test stored account %d ok in %s (%d folders)", id, time.Since(start).Round(time.Millisecond), len(folders))
@@ -1062,12 +1148,12 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad account id")
+		writeErr(w, http.StatusBadRequest, "账号编号不对")
 		return
 	}
 	acct, err := s.loadMailAccount(id, key)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "account not found")
+		writeErr(w, http.StatusNotFound, "账号不存在")
 		return
 	}
 	var cl mail.Conn
@@ -1079,7 +1165,7 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 		cl, err = mail.Connect(acct, nil)
 	}
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
 		return
 	}
 	defer cl.Close()
@@ -1094,7 +1180,7 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 		if acct.Kind == "tuta" {
 			log.Printf("tuta: test account %d list folders failed: %v", id, err)
 		}
-		writeErr(w, http.StatusBadGateway, "list folders: "+err.Error())
+		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
 		return
 	}
 	type folderJSON struct {
@@ -1114,7 +1200,7 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad account id")
+		writeErr(w, http.StatusBadRequest, "账号编号不对")
 		return
 	}
 	writeJSON(w, http.StatusOK, s.mgr.Status(id))
@@ -1130,23 +1216,23 @@ type reconnectIn struct {
 func (s *Server) handleReconnectAccount(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad account id")
+		writeErr(w, http.StatusBadRequest, "账号编号不对")
 		return
 	}
 	key, ok := s.credentialKey(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not logged in")
+		writeErr(w, http.StatusUnauthorized, "尚未登录")
 		return
 	}
 	acct, err := s.loadMailAccount(id, key)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "account not found")
+		writeErr(w, http.StatusNotFound, "账号不存在")
 		return
 	}
 	var in reconnectIn
 	if r.ContentLength > 0 {
 		if err := decodeJSON(r, &in); err != nil {
-			writeErr(w, http.StatusBadRequest, "invalid json")
+			writeErr(w, http.StatusBadRequest, "请求格式不对")
 			return
 		}
 	}
@@ -1163,16 +1249,16 @@ func (s *Server) handleReconnectAccount(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
+			writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱和密码", err)
 			return
 		}
 		enc, err := auth.Encrypt(key, bridgePassword)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "encrypt failed")
+			writeErr(w, http.StatusInternalServerError, "加密失败")
 			return
 		}
 		if _, err := s.st.DB.Exec(`UPDATE accounts SET enc_password = ? WHERE id = ?`, enc, id); err != nil {
-			writeErr(w, http.StatusInternalServerError, "update failed")
+			writeErr(w, http.StatusInternalServerError, "更新失败")
 			return
 		}
 		acct.Password = bridgePassword
@@ -1192,83 +1278,46 @@ type folderOut struct {
 }
 
 func (s *Server) handlePurgeFolder(w http.ResponseWriter, r *http.Request) {
-	key, _ := s.credentialKey(r)
 	folderID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad folder id")
+		writeErr(w, http.StatusBadRequest, "文件夹编号不对")
 		return
 	}
 	var accountID int64
 	var name, special string
-	if err := s.st.DB.QueryRow("SELECT account_id, name, special_use FROM folders WHERE id = ?", folderID).Scan(&accountID, &name, &special); err != nil {
-		writeErr(w, http.StatusNotFound, "folder not found")
+	if err := s.st.DB.QueryRow("SELECT account_id, name, COALESCE(special_use, '') FROM folders WHERE id = ?", folderID).Scan(&accountID, &name, &special); err != nil {
+		writeErr(w, http.StatusNotFound, "文件夹不存在")
 		return
 	}
 	if special != "trash" && special != "junk" {
-		writeErr(w, http.StatusBadRequest, "only trash or junk folders can be purged")
+		writeErr(w, http.StatusBadRequest, "只有回收站和垃圾箱可以清空")
 		return
 	}
 	rows, err := s.st.DB.Query("SELECT id FROM messages WHERE folder_id = ?", folderID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "list messages failed")
+		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
 		return
 	}
 	var ids []int64
 	for rows.Next() {
 		var mid int64
-		if err := rows.Scan(&mid); err != nil {
-			rows.Close()
-			writeErr(w, http.StatusInternalServerError, "scan failed")
-			return
+		if err := rows.Scan(&mid); err == nil {
+			ids = append(ids, mid)
 		}
-		ids = append(ids, mid)
 	}
 	rows.Close()
-	if err := rows.Err(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "list messages failed")
-		return
-	}
-	if len(ids) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"deleted": 0})
-		return
-	}
-	cl, err := s.openConn(key, accountID)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	defer cl.Close()
-	if _, err := cl.SelectRW(name); err != nil {
-		log.Printf("namakani: purge folder %d select failed: %v", folderID, err)
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	deletedIDs := make([]int64, 0, len(ids))
+	deleted := 0
 	for _, mid := range ids {
-		route, err := s.st.MessageRoute(mid)
-		if err != nil {
-			continue
+		if _, err := s.st.EnqueueExpunge(accountID, mid, ""); err == nil {
+			deleted++
 		}
-		s.st.MarkPendingRemoval(mid, folderID)
-		if err := cl.DeleteMessage(route.UID); err != nil {
-			s.st.ClearPendingRemoval(mid)
-			log.Printf("namakani: purge folder %d msg %d failed: %v", folderID, mid, err)
-			if len(deletedIDs) > 0 {
-				s.broadcastRemoved(folderID, deletedIDs)
-				s.broadcastFolder(folderID)
-			}
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		s.st.ClearPendingRemoval(mid)
-		if err := s.st.DeleteLocalMessage(mid); err != nil {
-			log.Printf("namakani: purge folder %d local delete %d failed: %v", folderID, mid, err)
-		}
-		deletedIDs = append(deletedIDs, mid)
 	}
-	s.broadcastRemoved(folderID, deletedIDs)
-	s.broadcastFolder(folderID)
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": len(deletedIDs)})
+	if deleted > 0 {
+		s.broadcastRemoved(folderID, ids)
+		s.broadcastFolder(folderID)
+		s.kickDrain()
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"deleted": deleted})
 }
 
 func (s *Server) handleListFolders(w http.ResponseWriter, r *http.Request) {
@@ -1276,7 +1325,7 @@ func (s *Server) handleListFolders(w http.ResponseWriter, r *http.Request) {
 		FROM folders f JOIN accounts a ON a.id = f.account_id
 		ORDER BY f.account_id, f.id`)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "list folders failed")
+		writeErr(w, http.StatusInternalServerError, "文件夹列表加载失败")
 		return
 	}
 	defer rows.Close()
@@ -1284,7 +1333,7 @@ func (s *Server) handleListFolders(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var f folderOut
 		if err := rows.Scan(&f.ID, &f.AccountID, &f.AccountLabel, &f.Name, &f.SpecialUse, &f.Total, &f.Unread); err != nil {
-			writeErr(w, http.StatusInternalServerError, "list folders failed")
+			writeErr(w, http.StatusInternalServerError, "文件夹列表加载失败")
 			return
 		}
 		out = append(out, f)
@@ -1308,6 +1357,7 @@ type messageOut struct {
 	HasAttach     bool   `json:"has_attach"`
 	Snippet       string `json:"snippet"`
 	Size          int64  `json:"size"`
+	TrashOriginFolderID int64 `json:"trash_origin_folder_id"`
 }
 
 type threadOut struct {
@@ -1317,7 +1367,8 @@ type threadOut struct {
 }
 
 const messageCols = `m.id, m.account_id, a.label, m.folder_id, f.name, f.special_use,
-	m.thread_key, m.subject, m.from_json, m.date_ts, m.flags, m.has_attach, m.snippet, m.size`
+	m.thread_key, m.subject, m.from_json, m.date_ts, m.flags, m.has_attach, m.snippet, m.size,
+	m.trash_origin_folder_id`
 
 const messageJoins = `FROM messages m
 	JOIN accounts a ON a.id = m.account_id
@@ -1331,7 +1382,7 @@ func scanMessage(rows interface {
 	var hasAttach int
 	if err := rows.Scan(&mo.ID, &mo.AccountID, &mo.AccountLabel, &mo.FolderID, &mo.FolderName,
 		&mo.FolderSpecial, &mo.ThreadKey, &mo.Subject, &fromJSON, &mo.DateTS, &mo.Flags,
-		&hasAttach, &mo.Snippet, &mo.Size); err != nil {
+		&hasAttach, &mo.Snippet, &mo.Size, &mo.TrashOriginFolderID); err != nil {
 		return err
 	}
 	mo.HasAttach = hasAttach != 0
@@ -1343,7 +1394,15 @@ func scanMessage(rows interface {
 	return nil
 }
 
+type rowQuerier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
 func (s *Server) messageRowsByIDs(ids []int64) []messageOut {
+	return s.messageRowsByIDsQ(s.st.DB, ids)
+}
+
+func (s *Server) messageRowsByIDsQ(q rowQuerier, ids []int64) []messageOut {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -1353,7 +1412,7 @@ func (s *Server) messageRowsByIDs(ids []int64) []messageOut {
 		ph[i] = "?"
 		args[i] = id
 	}
-	dbRows, err := s.st.DB.Query(`SELECT `+messageCols+` `+messageJoins+
+	dbRows, err := q.Query(`SELECT `+messageCols+` `+messageJoins+
 		` WHERE m.id IN (`+strings.Join(ph, ",")+`) ORDER BY m.date_ts DESC, m.id DESC`, args...)
 	if err != nil {
 		return nil
@@ -1394,7 +1453,7 @@ func listScope(q map[string][]string) (string, []any) {
 		where += " AND m.account_id = ? AND COALESCE(NULLIF(m.thread_key, ''), 'id:' || m.id) = ?"
 		args = append(args, get("account_id"), tk)
 	}
-	where += " AND NOT EXISTS (SELECT 1 FROM pending_removals pr WHERE pr.message_id = m.id)"
+	where += " AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = m.id AND o.type = 'expunge' AND o.status IN ('pending', 'in_flight', 'needs_attention'))"
 	return where, args
 }
 
@@ -1415,25 +1474,33 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	where, args := listScope(q)
 
 	if tk := q.Get("thread_key"); tk != "" {
-		dbRows, err := s.st.DB.Query(`SELECT `+messageCols+` `+messageJoins+
-			` WHERE `+where+` ORDER BY m.date_ts ASC, m.id ASC`, args...)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "list messages failed")
-			return
-		}
-		defer dbRows.Close()
 		out := []messageOut{}
-		for dbRows.Next() {
-			var mo messageOut
-			if err := scanMessage(dbRows, &mo); err != nil {
-				writeErr(w, http.StatusInternalServerError, "list messages failed")
+		if acctID, perr := strconv.ParseInt(q.Get("account_id"), 10, 64); perr == nil && acctID > 0 {
+			ids, err := s.st.ThreadMembers(acctID, tk)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
 				return
 			}
-			out = append(out, mo)
+			byID := make(map[int64]messageOut, len(ids))
+			for _, mo := range s.messageRowsByIDs(ids) {
+				byID[mo.ID] = mo
+			}
+			for _, id := range ids {
+				if mo, ok := byID[id]; ok {
+					out = append(out, mo)
+				}
+			}
 		}
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
+
+	tx, err := s.st.DB.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		return
+	}
+	defer tx.Rollback()
 
 	if q.Get("threaded") == "1" {
 		type pageThread struct {
@@ -1446,45 +1513,44 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			repID  int64
 		}
 		var threads []pageThread
-		kRows, err := s.st.DB.Query(`SELECT m.account_id, m.thread_key, COUNT(*),
-				COALESCE(SUM(CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END), 0),
+		kRows, err := tx.Query(`SELECT m.account_id, m.thread_key,
 				MAX(m.date_ts), MAX(m.id)
 			FROM messages m JOIN folders f ON f.id = m.folder_id
 			WHERE `+where+` AND m.thread_key <> ''
 			GROUP BY m.account_id, m.thread_key
 			ORDER BY MAX(m.date_ts) DESC, MAX(m.id) DESC`, args...)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "list threads failed")
+			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 			return
 		}
 		for kRows.Next() {
 			var t pageThread
-			if err := kRows.Scan(&t.acct, &t.tk, &t.cnt, &t.unread, &t.lastTS, &t.tieID); err != nil {
+			if err := kRows.Scan(&t.acct, &t.tk, &t.lastTS, &t.tieID); err != nil {
 				kRows.Close()
-				writeErr(w, http.StatusInternalServerError, "list threads failed")
+				writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 				return
 			}
 			threads = append(threads, t)
 		}
 		kRows.Close()
 		if err := kRows.Err(); err != nil {
-			writeErr(w, http.StatusInternalServerError, "list threads failed")
+			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 			return
 		}
-		sRows, err := s.st.DB.Query(`SELECT m.id, m.account_id, m.date_ts,
+		sRows, err := tx.Query(`SELECT m.id, m.account_id, m.date_ts,
 				CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END
 			`+messageJoins+`
 			WHERE `+where+` AND m.thread_key = ''
 			ORDER BY m.date_ts DESC, m.id DESC`, args...)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "list threads failed")
+			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 			return
 		}
 		for sRows.Next() {
 			var t pageThread
 			if err := sRows.Scan(&t.repID, &t.acct, &t.lastTS, &t.unread); err != nil {
 				sRows.Close()
-				writeErr(w, http.StatusInternalServerError, "list threads failed")
+				writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 				return
 			}
 			t.tk = "id:" + strconv.FormatInt(t.repID, 10)
@@ -1494,7 +1560,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		sRows.Close()
 		if err := sRows.Err(); err != nil {
-			writeErr(w, http.StatusInternalServerError, "list threads failed")
+			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 			return
 		}
 		sort.Slice(threads, func(i, j int) bool {
@@ -1511,16 +1577,37 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			end = len(threads)
 		}
 		page := threads[offset:end]
+		keysByAcct := make(map[int64][]string)
+		for i := range page {
+			if page[i].repID == 0 {
+				keysByAcct[page[i].acct] = append(keysByAcct[page[i].acct], page[i].tk)
+			}
+		}
+		for acct, keys := range keysByAcct {
+			counts, err := s.st.ThreadGroupCountsQ(tx, acct, keys)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+				return
+			}
+			for i := range page {
+				if page[i].acct == acct {
+					if gc, ok := counts[page[i].tk]; ok {
+						page[i].cnt = gc.Count
+						page[i].unread = gc.Unread
+					}
+				}
+			}
+		}
 		repIDs := make([]int64, 0, len(page))
 		for i := range page {
 			if page[i].repID == 0 {
 				var id int64
 				repArgs := append(append([]any{}, args...), page[i].acct, page[i].tk)
-				if err := s.st.DB.QueryRow(`SELECT m.id
+				if err := tx.QueryRow(`SELECT m.id
 					FROM messages m JOIN folders f ON f.id = m.folder_id
 					WHERE `+where+` AND m.account_id = ? AND m.thread_key = ?
 					ORDER BY m.date_ts DESC, m.id DESC LIMIT 1`, repArgs...).Scan(&id); err != nil {
-					writeErr(w, http.StatusInternalServerError, "list threads failed")
+					writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 					return
 				}
 				page[i].repID = id
@@ -1528,7 +1615,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			repIDs = append(repIDs, page[i].repID)
 		}
 		byID := make(map[int64]messageOut, len(repIDs))
-		for _, mo := range s.messageRowsByIDs(repIDs) {
+		for _, mo := range s.messageRowsByIDsQ(tx, repIDs) {
 			byID[mo.ID] = mo
 		}
 		out := []threadOut{}
@@ -1543,28 +1630,59 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, to)
 		}
+		wm, err := listVersionTx(tx)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+			return
+		}
+		w.Header().Set("X-WM-Ver", strconv.FormatInt(wm, 10))
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
 
-	dbRows, err := s.st.DB.Query(`SELECT `+messageCols+` `+messageJoins+
+	dbRows, err := tx.Query(`SELECT `+messageCols+` `+messageJoins+
 		` WHERE `+where+` ORDER BY m.date_ts DESC, m.id DESC LIMIT ? OFFSET ?`,
 		append(args, limit, offset)...)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "list messages failed")
+		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
 		return
 	}
-	defer dbRows.Close()
 	out := []messageOut{}
 	for dbRows.Next() {
 		var mo messageOut
 		if err := scanMessage(dbRows, &mo); err != nil {
-			writeErr(w, http.StatusInternalServerError, "list messages failed")
+			dbRows.Close()
+			writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
 			return
 		}
 		out = append(out, mo)
 	}
+	dbRows.Close()
+	if err := dbRows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		return
+	}
+	wm, err := listVersionTx(tx)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		return
+	}
+	w.Header().Set("X-WM-Ver", strconv.FormatInt(wm, 10))
 	writeJSON(w, http.StatusOK, out)
+}
+
+func listVersionTx(tx *sql.Tx) (int64, error) {
+	var v int64
+	err := tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM place_log`).Scan(&v)
+	return v, err
 }
 
 type turnConn struct {
@@ -1618,6 +1736,7 @@ type messageDetail struct {
 	HasAttach    bool                  `json:"has_attach"`
 	Text         string                `json:"text"`
 	HTML         string                `json:"html"`
+	BodyTruncated bool                 `json:"body_truncated,omitempty"`
 	Attachments  []store.AttachmentRow `json:"attachments"`
 	ThreadKey    string                `json:"thread_key"`
 	FolderSpecial string               `json:"folder_special"`
@@ -1632,33 +1751,39 @@ func parseAddrs(jsonStr string) []mail.Addr {
 	return addrs
 }
 
-func (s *Server) ensureBody(key []byte, messageID int64, route store.MessageRoute) (string, string, []store.AttachmentRow, error) {
-	if route.BodyState == 1 {
+var errFolderEpochChanged = errors.New("文件夹已在服务器上重建，正在重新同步")
+
+func (s *Server) ensureBody(key []byte, messageID int64, route store.MessageRoute) (string, string, []store.AttachmentRow, bool, error) {
+	if route.BodyState == 1 || route.BodyState == 2 {
 		text, html, _, err := s.st.GetBody(messageID)
 		if err != nil {
-			return "", "", nil, err
+			return "", "", nil, false, err
 		}
 		atts, err := s.st.ListAttachments(messageID)
-		return text, html, atts, err
+		return text, html, atts, route.BodyState == 2, err
 	}
 	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, false, err
 	}
 	defer cl.Close()
-	if _, err := cl.Select(route.Folder); err != nil {
-		return "", "", nil, err
+	sel, err := cl.Select(route.Folder)
+	if err != nil {
+		return "", "", nil, false, err
+	}
+	if route.FolderUIDValidity != 0 && sel.UIDValidity != 0 && sel.UIDValidity != route.FolderUIDValidity {
+		return "", "", nil, false, errFolderEpochChanged
 	}
 	raw, err := cl.FetchRaw(route.UID)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, false, err
 	}
 	parsed, err := mail.ParseBody(raw)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, false, err
 	}
-	if err := s.st.SaveBody(messageID, parsed.Text, parsed.HTML, mail.MakeSnippet(parsed.Text, parsed.HTML)); err != nil {
-		return "", "", nil, err
+	if err := s.st.SaveBody(messageID, parsed.Text, parsed.HTML, mail.MakeSnippet(parsed.Text, parsed.HTML), parsed.Truncated); err != nil {
+		return "", "", nil, false, err
 	}
 	rows := make([]store.AttachmentRow, 0, len(parsed.Attachments))
 	for _, a := range parsed.Attachments {
@@ -1672,16 +1797,16 @@ func (s *Server) ensureBody(key []byte, messageID int64, route store.MessageRout
 	}
 	atts, err := s.st.ReplaceAttachments(messageID, rows)
 	if err != nil {
-		return "", "", nil, err
+		return "", "", nil, false, err
 	}
-	return parsed.Text, parsed.HTML, atts, nil
+	return parsed.Text, parsed.HTML, atts, parsed.Truncated, nil
 }
 
 func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad message id")
+		writeErr(w, http.StatusBadRequest, "邮件编号不对")
 		return
 	}
 	var (
@@ -1698,14 +1823,13 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		Scan(&d.AccountID, &d.AccountLabel, &d.FolderID, &d.FolderName, &d.Subject,
 			&fromJSON, &toJSON, &ccJSON, &d.DateTS, &d.Flags, &d.Size, &hasAttach, &d.ThreadKey, &d.FolderSpecial)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "message not found")
+		writeErr(w, http.StatusNotFound, "邮件不存在")
 		return
 	}
 	d.ID = id
 	d.HasAttach = hasAttach != 0
 	if d.ThreadKey != "" {
-		_ = s.st.DB.QueryRow("SELECT COUNT(*) FROM messages WHERE account_id = ? AND thread_key = ?",
-			d.AccountID, d.ThreadKey).Scan(&d.ThreadCount)
+		d.ThreadCount, _ = s.st.ThreadUniqueCount(d.AccountID, d.ThreadKey)
 	}
 	from := parseAddrs(fromJSON)
 	if len(from) > 0 {
@@ -1716,15 +1840,16 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "route failed")
+		writeErr(w, http.StatusInternalServerError, "定位邮件失败")
 		return
 	}
-	text, html, atts, err := s.ensureBody(key, id, route)
+	text, html, atts, truncated, err := s.ensureBody(key, id, route)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "fetch body failed: "+err.Error())
+		writeUserErr(w, http.StatusBadGateway, "正文加载失败，请稍后重试", err)
 		return
 	}
 	d.Text = text
+	d.BodyTruncated = truncated
 	cidURLs := map[string]string{}
 	visible := []store.AttachmentRow{}
 	for _, a := range atts {
@@ -1745,17 +1870,17 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad message id")
+		writeErr(w, http.StatusBadRequest, "邮件编号不对")
 		return
 	}
 	attID, err := strconv.ParseInt(r.PathValue("attId"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad attachment id")
+		writeErr(w, http.StatusBadRequest, "附件编号不对")
 		return
 	}
 	att, err := s.st.GetAttachment(id, attID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "attachment not found")
+		writeErr(w, http.StatusNotFound, "附件不存在")
 		return
 	}
 	if att.LocalPath != "" {
@@ -1778,27 +1903,27 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 	}
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "route failed")
+		writeErr(w, http.StatusInternalServerError, "定位邮件失败")
 		return
 	}
 	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "邮件不存在或已被删除", err)
 		return
 	}
 	defer cl.Close()
 	if _, err := cl.Select(route.Folder); err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "连接邮件服务器失败", err)
 		return
 	}
 	raw, err := cl.FetchRaw(route.UID)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "打开文件夹失败", err)
 		return
 	}
 	part, err := mail.ParseBodyPart(raw, att.PartPath)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "读取邮件内容失败", err)
 		return
 	}
 	filename := att.Filename
@@ -1817,71 +1942,93 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 }
 
 type flagsReq struct {
-	Seen    *bool `json:"seen"`
-	Flagged *bool `json:"flagged"`
+	Seen      *bool  `json:"seen"`
+	Flagged   *bool  `json:"flagged"`
+	ClientKey string `json:"client_key"`
 }
 
 func (s *Server) handleSetFlags(w http.ResponseWriter, r *http.Request) {
-	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad message id")
+		writeErr(w, http.StatusBadRequest, "邮件编号不对")
 		return
 	}
 	var req flagsReq
 	if err := decodeJSON(r, &req); err != nil || (req.Seen == nil && req.Flagged == nil) {
-		writeErr(w, http.StatusBadRequest, "seen or flagged required")
+		writeErr(w, http.StatusBadRequest, "缺少标记参数")
 		return
 	}
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "message not found")
+		writeErr(w, http.StatusNotFound, "邮件不存在")
 		return
 	}
-	flags, err := s.st.MessageFlags(id)
+	opID, flags, err := s.st.EnqueueFlags(route.AccountID, id, req.Seen, req.Flagged, req.ClientKey)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "flags failed")
-		return
-	}
-	cl, err := s.openConn(key, route.AccountID)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	defer cl.Close()
-	if _, err := cl.SelectRW(route.Folder); err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	apply := func(flag imap.Flag, bit uint32, val *bool) error {
-		if val == nil {
-			return nil
-		}
-		if err := cl.StoreFlag(route.UID, flag, *val); err != nil {
-			return err
-		}
-		if *val {
-			flags |= bit
-		} else {
-			flags &^= bit
-		}
-		return nil
-	}
-	if err := apply(imap.FlagSeen, mail.FlagSeen, req.Seen); err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	if err := apply(imap.FlagFlagged, mail.FlagFlagged, req.Flagged); err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	if err := s.st.SetLocalFlags(id, flags); err != nil {
-		writeErr(w, http.StatusInternalServerError, "local flags failed")
+		writeErr(w, http.StatusInternalServerError, "操作入队失败")
 		return
 	}
 	s.broadcastFlags([]int64{id})
 	s.broadcastFolder(route.FolderID)
-	writeJSON(w, http.StatusOK, map[string]uint32{"flags": flags})
+	s.kickDrain()
+	writeJSON(w, http.StatusOK, map[string]any{"flags": flags, "op_id": opID})
+}
+
+type batchFlagsReq struct {
+	IDs       []int64 `json:"ids"`
+	Seen      *bool   `json:"seen"`
+	Flagged   *bool   `json:"flagged"`
+	ClientKey string  `json:"client_key"`
+}
+
+type batchItemOut struct {
+	ID    int64  `json:"id"`
+	Flags uint32 `json:"flags"`
+	OpID  int64  `json:"op_id"`
+}
+
+type batchFailOut struct {
+	ID    int64  `json:"id"`
+	Error string `json:"error"`
+}
+
+func (s *Server) handleBatchFlags(w http.ResponseWriter, r *http.Request) {
+	var req batchFlagsReq
+	if err := decodeJSON(r, &req); err != nil || len(req.IDs) == 0 || (req.Seen == nil && req.Flagged == nil) {
+		writeErr(w, http.StatusBadRequest, "缺少标记参数")
+		return
+	}
+	items := []batchItemOut{}
+	failed := []batchFailOut{}
+	folders := map[int64]bool{}
+	ids := []int64{}
+	for _, id := range req.IDs {
+		route, err := s.st.MessageRoute(id)
+		if err != nil {
+			failed = append(failed, batchFailOut{ID: id, Error: "邮件不存在"})
+			continue
+		}
+		key := ""
+		if req.ClientKey != "" {
+			key = req.ClientKey + ":" + strconv.FormatInt(id, 10)
+		}
+		opID, flags, err := s.st.EnqueueFlags(route.AccountID, id, req.Seen, req.Flagged, key)
+		if err != nil {
+			failed = append(failed, batchFailOut{ID: id, Error: "操作入队失败"})
+			continue
+		}
+		items = append(items, batchItemOut{ID: id, Flags: flags, OpID: opID})
+		ids = append(ids, id)
+		folders[route.FolderID] = true
+	}
+	if len(ids) > 0 {
+		s.broadcastFlags(ids)
+		for fid := range folders {
+			s.broadcastFolder(fid)
+		}
+		s.kickDrain()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "failed": failed})
 }
 
 func isNotInFolder(err error) bool {
@@ -1891,6 +2038,12 @@ func isNotInFolder(err error) bool {
 type moveReq struct {
 	To         string `json:"to"`
 	ToFolderID int64  `json:"to_folder_id"`
+	ClientKey  string `json:"client_key"`
+}
+
+type deleteReq struct {
+	Permanent *bool  `json:"permanent"`
+	ClientKey string `json:"client_key"`
 }
 
 func (s *Server) findMovedUID(cl mail.Conn, id int64, destFolder string) uint32 {
@@ -1912,167 +2065,130 @@ func (s *Server) findMovedUID(cl mail.Conn, id int64, destFolder string) uint32 
 }
 
 func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
-	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad message id")
+		writeErr(w, http.StatusBadRequest, "邮件编号不对")
 		return
 	}
 	var req moveReq
-	if err := decodeJSON(r, &req); err != nil || (req.To == "" && req.ToFolderID == 0) {
-		writeErr(w, http.StatusBadRequest, "destination required")
+	if err := decodeJSON(r, &req); err != nil || (req.ToFolderID == 0 && req.To == "") {
+		writeErr(w, http.StatusBadRequest, "请选择目标文件夹")
 		return
 	}
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "message not found")
+		writeErr(w, http.StatusNotFound, "邮件不存在")
 		return
 	}
-	var destID int64
-	var dest string
-	var ok bool
-	if req.ToFolderID > 0 {
-		destID = req.ToFolderID
-		if err := s.st.DB.QueryRow("SELECT name FROM folders WHERE id = ? AND account_id = ?", req.ToFolderID, route.AccountID).Scan(&dest); err != nil {
-			writeErr(w, http.StatusBadRequest, "folder not found for this account")
-			return
-		}
-		ok = true
-	} else {
-		var err error
-		destID, dest, ok, err = s.st.FolderBySpecial(route.AccountID, req.To)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "folder lookup failed")
+	destID := req.ToFolderID
+	if destID == 0 {
+		var ok bool
+		destID, _, ok, err = s.st.FolderBySpecial(route.AccountID, req.To)
+		if err != nil || !ok {
+			writeErr(w, http.StatusBadRequest, "目标文件夹不存在")
 			return
 		}
 	}
-	if !ok {
-		writeErr(w, http.StatusBadRequest, "this account has no folder for "+req.To)
+	if destID == route.FolderID {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
-	if dest == route.Folder {
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-		return
-	}
-	s.st.MarkPendingRemoval(id, route.FolderID)
-	defer s.st.ClearPendingRemoval(id)
-	cl, err := s.openConn(key, route.AccountID)
+	opID, err := s.st.EnqueueMove(route.AccountID, id, destID, req.ClientKey)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeErr(w, http.StatusInternalServerError, "操作入队失败")
 		return
 	}
-	defer cl.Close()
-	if _, err := cl.SelectRW(route.Folder); err != nil {
-		log.Printf("namakani: msg %d select %q failed: %v", id, route.Folder, err)
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
+	o, _ := s.st.GetOp(opID)
+	if o != nil {
+		s.broadcastOpApplied(o)
 	}
-	destUID, err := cl.MoveMessage(route.UID, dest)
-	if err != nil && !isNotInFolder(err) {
-		log.Printf("namakani: msg %d move to %q failed: %v", id, dest, err)
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	if destUID == 0 {
-		destUID = s.findMovedUID(cl, id, dest)
-	}
-	if destUID > 0 {
-		err = s.st.MoveLocalMessage(id, destID, destUID)
-	} else {
-		err = s.st.DeleteLocalMessage(id)
-	}
+	s.kickDrain()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "op_id": opID})
+}
+
+func (s *Server) handleRestoreMessage(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "local move failed")
+		writeErr(w, http.StatusBadRequest, "邮件编号不对")
 		return
 	}
-	s.st.ClearPendingRemoval(id)
-	s.broadcastRemoved(route.FolderID, []int64{id})
-	s.broadcastFolder(route.FolderID)
-	s.broadcastFolder(destID)
-	if destUID > 0 {
-		s.broadcastMessages([]int64{id})
+	var req moveReq
+	_ = decodeJSON(r, &req)
+	route, err := s.st.MessageRoute(id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "邮件不存在")
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	destID, err := s.st.ResolveRestoreFolder(route.AccountID, id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "确定还原位置失败")
+		return
+	}
+	if destID == route.FolderID {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "to_folder_id": destID})
+		return
+	}
+	opID, err := s.st.EnqueueMove(route.AccountID, id, destID, req.ClientKey)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "操作入队失败")
+		return
+	}
+	o, _ := s.st.GetOp(opID)
+	if o != nil {
+		s.broadcastOpApplied(o)
+	}
+	s.kickDrain()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "op_id": opID, "to_folder_id": destID})
 }
 
 func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
-	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad message id")
+		writeErr(w, http.StatusBadRequest, "邮件编号不对")
 		return
 	}
+	var req deleteReq
+	_ = decodeJSON(r, &req)
+	permanent := req.Permanent != nil && *req.Permanent
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "message not found")
+		writeErr(w, http.StatusNotFound, "邮件不存在")
 		return
 	}
 	var special string
-	_ = s.st.DB.QueryRow("SELECT special_use FROM folders WHERE id = ?", route.FolderID).Scan(&special)
-
-	s.st.MarkPendingRemoval(id, route.FolderID)
-	defer s.st.ClearPendingRemoval(id)
-	cl, err := s.openConn(key, route.AccountID)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	defer cl.Close()
-	if _, err := cl.SelectRW(route.Folder); err != nil {
-		log.Printf("namakani: msg %d select %q failed: %v", id, route.Folder, err)
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	permanent := special == "trash" || special == "junk"
-	if permanent {
-		if err := cl.DeleteMessage(route.UID); err != nil && !isNotInFolder(err) {
-			log.Printf("namakani: msg %d permanent delete failed: %v", id, err)
-			writeErr(w, http.StatusBadGateway, err.Error())
+	_ = s.st.DB.QueryRow("SELECT COALESCE(special_use, '') FROM folders WHERE id = ?", route.FolderID).Scan(&special)
+	var opID int64
+	if req.ClientKey != "" {
+		if prev, perr := s.st.OpByClientKey(req.ClientKey); perr == nil && prev != nil &&
+			prev.AccountID == route.AccountID && prev.MessageID == id &&
+			(prev.Type == store.OpMove || prev.Type == store.OpExpunge) {
+			s.kickDrain()
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "op_id": prev.ID})
 			return
 		}
-		if err := s.st.DeleteLocalMessage(id); err != nil {
-			writeErr(w, http.StatusInternalServerError, "local delete failed")
-			return
-		}
-		s.broadcastRemoved(route.FolderID, []int64{id})
-		s.broadcastFolder(route.FolderID)
+	}
+	if permanent || special == "trash" || special == "junk" {
+		opID, err = s.st.EnqueueExpunge(route.AccountID, id, req.ClientKey)
 	} else {
-		destID, dest, ok, err := s.st.FolderBySpecial(route.AccountID, "trash")
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "folder lookup failed")
-			return
-		}
-		if !ok {
-			writeErr(w, http.StatusBadRequest, "this account has no trash folder")
-			return
-		}
-		destUID, err := cl.MoveMessage(route.UID, dest)
-		if err != nil && !isNotInFolder(err) {
-			log.Printf("namakani: msg %d move to trash %q failed: %v", id, dest, err)
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		if destUID == 0 {
-			destUID = s.findMovedUID(cl, id, dest)
-		}
-		if destUID > 0 {
-			err = s.st.MoveLocalMessage(id, destID, destUID)
-		} else {
-			err = s.st.DeleteLocalMessage(id)
-		}
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "local move failed")
-			return
-		}
-		s.st.ClearPendingRemoval(id)
-		s.broadcastRemoved(route.FolderID, []int64{id})
-		s.broadcastFolder(route.FolderID)
-		s.broadcastFolder(destID)
-		if destUID > 0 {
-			s.broadcastMessages([]int64{id})
+		var trashID int64
+		var ok bool
+		trashID, _, ok, err = s.st.FolderBySpecial(route.AccountID, "trash")
+		if err == nil && ok {
+			opID, err = s.st.EnqueueMove(route.AccountID, id, trashID, req.ClientKey)
+		} else if err == nil {
+			err = errors.New("no trash folder")
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "操作入队失败")
+		return
+	}
+	o, _ := s.st.GetOp(opID)
+	if o != nil {
+		s.broadcastOpApplied(o)
+	}
+	s.kickDrain()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "op_id": opID})
 }
 
 type markAllReadReq struct {
@@ -2081,10 +2197,9 @@ type markAllReadReq struct {
 }
 
 func (s *Server) handleMarkAllRead(w http.ResponseWriter, r *http.Request) {
-	key, _ := s.credentialKey(r)
 	var req markAllReadReq
 	if err := decodeJSON(r, &req); err != nil || (req.FolderID == 0 && req.Special == "") {
-		writeErr(w, http.StatusBadRequest, "folder_id or special required")
+		writeErr(w, http.StatusBadRequest, "缺少文件夹参数")
 		return
 	}
 	type folderRef struct {
@@ -2099,14 +2214,14 @@ func (s *Server) handleMarkAllRead(w http.ResponseWriter, r *http.Request) {
 		err := s.st.DB.QueryRow("SELECT account_id, name FROM folders WHERE id = ?", req.FolderID).
 			Scan(&fr.accountID, &fr.name)
 		if err != nil {
-			writeErr(w, http.StatusNotFound, "folder not found")
+			writeErr(w, http.StatusNotFound, "文件夹不存在")
 			return
 		}
 		refs = append(refs, fr)
 	} else {
 		rows, err := s.st.DB.Query("SELECT id, account_id, name FROM folders WHERE special_use = ?", req.Special)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "folder lookup failed")
+			writeErr(w, http.StatusInternalServerError, "查找文件夹失败")
 			return
 		}
 		defer rows.Close()
@@ -2120,57 +2235,41 @@ func (s *Server) handleMarkAllRead(w http.ResponseWriter, r *http.Request) {
 	}
 	updated := 0
 	for _, fr := range refs {
-		rows, err := s.st.DB.Query(`SELECT id, uid FROM messages
-			WHERE folder_id = ? AND (flags & 1) = 0`, fr.id)
+		rows, err := s.st.DB.Query(`SELECT id FROM messages m
+			WHERE m.folder_id = ? AND (m.flags & 1) = 0
+			AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = m.id AND o.type = 'expunge'
+				AND o.status IN ('pending', 'in_flight', 'needs_attention'))`, fr.id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "message lookup failed")
+			writeErr(w, http.StatusInternalServerError, "查找邮件失败")
 			return
 		}
 		var ids []int64
-		var uids []uint32
 		for rows.Next() {
 			var mid int64
-			var uid uint32
-			if err := rows.Scan(&mid, &uid); err == nil {
+			if err := rows.Scan(&mid); err == nil {
 				ids = append(ids, mid)
-				uids = append(uids, uid)
 			}
 		}
 		rows.Close()
-		if len(uids) == 0 {
-			continue
-		}
-		cl, err := s.openConn(key, fr.accountID)
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		if _, err := cl.SelectRW(fr.name); err != nil {
-			cl.Close()
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		for start := 0; start < len(uids); start += 500 {
-			end := start + 500
-			if end > len(uids) {
-				end = len(uids)
+		seenTrue := true
+		doneIDs := []int64{}
+		for _, mid := range ids {
+			_, flags, err := s.st.EnqueueFlags(fr.accountID, mid, &seenTrue, nil, "")
+			if err != nil {
+				continue
 			}
-			if err := cl.StoreFlags(uids[start:end], imap.FlagSeen, true); err != nil {
-				cl.Close()
-				writeErr(w, http.StatusBadGateway, err.Error())
-				return
+			if flags&1 != 0 {
+				updated++
 			}
+			doneIDs = append(doneIDs, mid)
 		}
-		cl.Close()
-		if _, err := s.st.DB.Exec(`UPDATE messages SET flags = flags | 1
-			WHERE folder_id = ? AND (flags & 1) = 0`, fr.id); err != nil {
-			writeErr(w, http.StatusInternalServerError, "local update failed")
-			return
+		if len(doneIDs) > 0 {
+			s.broadcastFlags(doneIDs)
+			s.broadcastFolder(fr.id)
 		}
-		_ = s.st.RefreshUnread(fr.id)
-		updated += len(ids)
-		s.broadcastFlags(ids)
-		s.broadcastFolder(fr.id)
+	}
+	if updated > 0 {
+		s.kickDrain()
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"updated": updated})
 }
@@ -2231,15 +2330,15 @@ func (s *Server) prepareOutgoing(key []byte, req composeReq, requireRcpts bool) 
 	}
 	to, err := parseAddrList(req.To)
 	if err != nil {
-		return nil, fmt.Errorf("收件人格式不对: %w", err)
+		return nil, userFacing("收件人格式不对")
 	}
 	cc, err := parseAddrList(req.Cc)
 	if err != nil {
-		return nil, fmt.Errorf("抄送格式不对: %w", err)
+		return nil, userFacing("抄送格式不对")
 	}
 	bcc, err := parseAddrList(req.Bcc)
 	if err != nil {
-		return nil, fmt.Errorf("密送格式不对: %w", err)
+		return nil, userFacing("密送格式不对")
 	}
 	rcpts := []string{}
 	for _, group := range [][]mail.Addr{to, cc, bcc} {
@@ -2248,7 +2347,7 @@ func (s *Server) prepareOutgoing(key []byte, req composeReq, requireRcpts bool) 
 		}
 	}
 	if requireRcpts && len(rcpts) == 0 {
-		return nil, fmt.Errorf("至少填写一个收件人")
+		return nil, userFacing("至少填写一个收件人")
 	}
 	from := mail.Addr{Name: acct.FromName, Email: acct.Email}
 
@@ -2257,11 +2356,11 @@ func (s *Server) prepareOutgoing(key []byte, req composeReq, requireRcpts bool) 
 	for _, a := range req.Attachments {
 		data, err := base64.StdEncoding.DecodeString(a.DataB64)
 		if err != nil {
-			return nil, fmt.Errorf("附件 %s 的数据无效", a.Filename)
+			return nil, userFacing(fmt.Sprintf("附件 %s 的数据无效", a.Filename))
 		}
 		totalAttach += len(data)
 		if int64(totalAttach) > s.st.AppSettings().MaxAttachmentMB<<20 {
-			return nil, fmt.Errorf("附件总大小超过 %d MB 上限", s.st.AppSettings().MaxAttachmentMB)
+			return nil, userFacing(fmt.Sprintf("附件总大小超过 %d MB 上限", s.st.AppSettings().MaxAttachmentMB))
 		}
 		attachments = append(attachments, mail.OutgoingAttachment{
 			Filename: a.Filename, ContentType: a.ContentType, Data: data,
@@ -2330,7 +2429,12 @@ func (s *Server) appendCopy(key []byte, accountID int64, special string,
 	if !ok {
 		return 0, fmt.Errorf("该账号没有 %s 文件夹", special)
 	}
-	cl, err := s.openConn(key, accountID)
+	var existing int64
+	if err := s.st.DB.QueryRow("SELECT id FROM messages WHERE folder_id = ? AND message_id = ?",
+		folderID, out.messageID).Scan(&existing); err == nil {
+		return existing, nil
+	}
+	cl, err := s.appendOpen(key, accountID)
 	if err != nil {
 		return 0, err
 	}
@@ -2351,14 +2455,28 @@ func (s *Server) appendCopy(key []byte, accountID int64, special string,
 		Flags:     localFlags,
 		Size:      int64(len(out.raw)),
 	}
-	id, _, err := s.st.UpsertMessage(accountID, folderID, row)
+	id, inserted, err := s.st.UpsertMessage(accountID, folderID, row)
 	if err != nil {
 		return 0, err
 	}
-	if err := s.st.SaveBody(id, out.text, out.html, mail.MakeSnippet(out.text, out.html)); err != nil {
+	if err := s.st.SaveBody(id, out.text, out.html, mail.MakeSnippet(out.text, out.html), false); err != nil {
 		return 0, err
 	}
-	_, _ = s.st.DB.Exec("UPDATE folders SET total = total + 1 WHERE id = ?", folderID)
+	if parsed, perr := mail.ParseBody(out.raw); perr == nil && len(parsed.Attachments) > 0 {
+		attRows := make([]store.AttachmentRow, 0, len(parsed.Attachments))
+		for _, a := range parsed.Attachments {
+			attRows = append(attRows, store.AttachmentRow{
+				PartPath: a.PartPath, Filename: a.Filename, Mime: a.Mime,
+				Size: a.Size, ContentID: a.ContentID, Inline: a.Inline,
+			})
+		}
+		if _, err := s.st.ReplaceAttachments(id, attRows); err == nil {
+			_, _ = s.st.DB.Exec("UPDATE messages SET has_attach = 1 WHERE id = ?", id)
+		}
+	}
+	if inserted {
+		_, _ = s.st.DB.Exec("UPDATE folders SET total = total + 1 WHERE id = ?", folderID)
+	}
 	_ = s.st.RefreshUnread(folderID)
 	return id, nil
 }
@@ -2391,14 +2509,16 @@ func (s *Server) fileSentCopy(acct mail.Account, sess uidAssigner, sentID string
 		Flags:     mail.FlagSeen,
 		Size:      int64(len(out.raw)),
 	}
-	id, _, err := s.st.UpsertMessage(acct.ID, folderID, row)
+	id, inserted, err := s.st.UpsertMessage(acct.ID, folderID, row)
 	if err != nil {
 		return 0, err
 	}
-	if err := s.st.SaveBody(id, out.text, out.html, mail.MakeSnippet(out.text, out.html)); err != nil {
+	if err := s.st.SaveBody(id, out.text, out.html, mail.MakeSnippet(out.text, out.html), false); err != nil {
 		return 0, err
 	}
-	_, _ = s.st.DB.Exec("UPDATE folders SET total = total + 1 WHERE id = ?", folderID)
+	if inserted {
+		_, _ = s.st.DB.Exec("UPDATE folders SET total = total + 1 WHERE id = ?", folderID)
+	}
 	_ = s.st.RefreshUnread(folderID)
 	return id, nil
 }
@@ -2428,89 +2548,23 @@ func (s *Server) deleteMessageEverywhere(key []byte, messageID int64) error {
 	return nil
 }
 
-func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
-	key, _ := s.credentialKey(r)
-	var req composeReq
-	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad request")
-		return
-	}
-	out, err := s.prepareOutgoing(key, req, true)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	var fileCopy func() (int64, error)
-	if out.acct.Kind == "proton" {
-		sess, err := proton.Connect(s.st, out.acct)
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		sentProtonID, err := sess.SendRaw(out.raw)
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		fileCopy = func() (int64, error) { return s.fileSentCopy(out.acct, sess, sentProtonID, out) }
-	} else if out.acct.Kind == "tuta" {
-		sess, err := tuta.Connect(s.st, out.acct)
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		sentTutaID, err := sess.SendRaw(out.raw)
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		fileCopy = func() (int64, error) { return s.fileSentCopy(out.acct, sess, sentTutaID, out) }
-	} else {
-		if err := mail.SendSMTP(out.acct, out.acct.Email, out.rcpts, out.raw); err != nil {
-			writeErr(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		fileCopy = func() (int64, error) {
-			return s.appendCopy(key, req.AccountID, "sent", []imap.Flag{imap.FlagSeen}, mail.FlagSeen, out)
-		}
-	}
-	warnings := []string{}
-	if sentID, err := fileCopy(); err != nil {
-		warnings = append(warnings, "邮件已发送，但存入「已发送」失败："+err.Error())
-	} else {
-		s.broadcastMessages([]int64{sentID})
-		if fid, _, ok, _ := s.st.FolderBySpecial(req.AccountID, "sent"); ok {
-			s.broadcastFolder(fid)
-		}
-	}
-	if req.DraftID > 0 {
-		route, rerr := s.st.MessageRoute(req.DraftID)
-		if err := s.deleteMessageEverywhere(key, req.DraftID); err != nil {
-			warnings = append(warnings, "邮件已发送，但原草稿删除失败："+err.Error())
-		} else if rerr == nil {
-			s.broadcastRemoved(route.FolderID, []int64{req.DraftID})
-			s.broadcastFolder(route.FolderID)
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warning": strings.Join(warnings, "；")})
-}
 
 func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var req composeReq
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad request")
+		writeErr(w, http.StatusBadRequest, "请求格式不对")
 		return
 	}
 	out, err := s.prepareOutgoing(key, req, false)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		writeUserErr(w, http.StatusBadRequest, "邮件准备失败，请检查内容后重试", err)
 		return
 	}
 	id, err := s.appendCopy(key, req.AccountID, "drafts",
 		[]imap.Flag{imap.FlagDraft}, mail.FlagSeen|mail.FlagDraft, out)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, "存草稿失败："+err.Error())
+		writeUserErr(w, http.StatusBadGateway, "保存草稿失败", err)
 		return
 	}
 	s.broadcastMessages([]int64{id})
@@ -2541,23 +2595,55 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	rows, err := s.st.DB.Query(`SELECT m.id, m.account_id, a.label, m.folder_id, f.name, f.special_use, m.thread_key, m.subject,
-		m.from_json, m.date_ts, m.flags, m.has_attach, m.snippet, m.size,
-		(SELECT COUNT(*) FROM messages t WHERE t.account_id = m.account_id AND t.thread_key = m.thread_key AND m.thread_key <> '')
-		FROM (SELECT mm.id, ROW_NUMBER() OVER (PARTITION BY mm.account_id,
-			CASE WHEN mm.message_id = '' THEN 'id:' || mm.id ELSE mm.message_id END, mm.date_ts
-			ORDER BY CASE WHEN ff.special_use = 'all' THEN 1 ELSE 0 END, mm.id) AS rn
-			FROM messages_fts
-			JOIN messages mm ON mm.id = messages_fts.rowid
-			JOIN folders ff ON ff.id = mm.folder_id
-			WHERE messages_fts MATCH ? AND NOT EXISTS (SELECT 1 FROM pending_removals pr WHERE pr.message_id = mm.id)) picked
+	offset := 0
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			offset = n
+		}
+	}
+	const pickedWindow = `SELECT mm.id, ROW_NUMBER() OVER (PARTITION BY mm.account_id,
+		CASE WHEN mm.message_id = '' THEN 'id:' || mm.id ELSE mm.message_id END, mm.date_ts
+		ORDER BY CASE WHEN ff.special_use = 'all' THEN 1 ELSE 0 END, mm.id) AS rn FROM `
+	const pickedTail = ` AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = mm.id AND o.type = 'expunge' AND o.status IN ('pending', 'in_flight', 'needs_attention'))) picked
 		JOIN messages m ON m.id = picked.id
 		JOIN accounts a ON a.id = m.account_id
 		JOIN folders f ON f.id = m.folder_id
-		WHERE picked.rn = 1 ORDER BY m.date_ts DESC LIMIT ?`,
-		store.BuildFTSQuery(q), limit)
+		WHERE picked.rn = 1 ORDER BY m.date_ts DESC, m.id DESC LIMIT ? OFFSET ?`
+	const searchCols = `SELECT m.id, m.account_id, a.label, m.folder_id, f.name, f.special_use, m.thread_key, m.subject,
+		m.from_json, m.date_ts, m.flags, m.has_attach, m.snippet, m.size,
+		(SELECT COUNT(*) FROM (SELECT 1 FROM messages t WHERE t.account_id = m.account_id AND t.thread_key = m.thread_key AND m.thread_key <> '' AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = t.id AND o.type = 'expunge' AND o.status IN ('pending', 'in_flight', 'needs_attention')) GROUP BY CASE WHEN t.message_id = '' THEN 'id:' || t.id ELSE t.message_id END, t.date_ts))
+		FROM (`
+	terms := strings.Fields(q)
+	short := len(terms) > 0
+	for _, t := range terms {
+		if len([]rune(t)) >= 3 {
+			short = false
+		}
+	}
+	var rows *sql.Rows
+	var err error
+	if short {
+		conds := make([]string, 0, len(terms))
+		args := make([]any, 0, len(terms)*4+1)
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+		for _, t := range terms {
+			like := "%" + esc.Replace(t) + "%"
+			conds = append(conds, `(mm.subject LIKE ? ESCAPE '\' OR mm.from_json LIKE ? ESCAPE '\' OR mm.to_json LIKE ? ESCAPE '\' OR mm.cc_json LIKE ? ESCAPE '\')`)
+			args = append(args, like, like, like, like)
+		}
+		args = append(args, limit, offset)
+		rows, err = s.st.DB.Query(searchCols+pickedWindow+`messages mm
+			JOIN folders ff ON ff.id = mm.folder_id
+			WHERE `+strings.Join(conds, " AND ")+pickedTail, args...)
+	} else {
+		rows, err = s.st.DB.Query(searchCols+pickedWindow+`messages_fts
+			JOIN messages mm ON mm.id = messages_fts.rowid
+			JOIN folders ff ON ff.id = mm.folder_id
+			WHERE messages_fts MATCH ?`+pickedTail,
+			store.BuildFTSQuery(q), limit, offset)
+	}
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "search failed")
+		writeErr(w, http.StatusInternalServerError, "搜索失败")
 		return
 	}
 	defer rows.Close()
@@ -2569,7 +2655,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		var cnt int
 		if err := rows.Scan(&row.ID, &row.AccountID, &row.AccountLabel, &row.FolderID, &row.FolderName, &row.FolderSpecial, &row.ThreadKey,
 			&row.Subject, &fromJSON, &row.DateTS, &row.Flags, &hasAttach, &row.Snippet, &row.Size, &cnt); err != nil {
-			writeErr(w, http.StatusInternalServerError, "scan failed")
+			writeErr(w, http.StatusInternalServerError, "读取数据失败")
 			return
 		}
 		row.HasAttach = hasAttach != 0
@@ -2602,7 +2688,7 @@ func (s *Server) handleContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := s.st.DB.Query("SELECT from_json, to_json, cc_json FROM messages")
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "contacts failed")
+		writeErr(w, http.StatusInternalServerError, "读取通讯录失败")
 		return
 	}
 	defer rows.Close()
@@ -2647,7 +2733,7 @@ func (s *Server) spaHandler() http.Handler {
 			log.Printf("entry: %s %s ua=%q referer=%q", r.Method, r.URL.Path, r.UserAgent(), r.Referer())
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			writeErr(w, http.StatusNotFound, "no such endpoint")
+			writeErr(w, http.StatusNotFound, "接口不存在")
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/assets/") {
@@ -2670,7 +2756,7 @@ func (s *Server) spaHandler() http.Handler {
 func (s *Server) handleGetAppSettings(w http.ResponseWriter, r *http.Request) {
 	used, err := s.st.CacheUsedBytes()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "cache usage failed")
+		writeErr(w, http.StatusInternalServerError, "读取缓存用量失败")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -2683,18 +2769,18 @@ func (s *Server) handleGetAppSettings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePutAppSettings(w http.ResponseWriter, r *http.Request) {
 	var req store.AppSettings
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad settings")
+		writeErr(w, http.StatusBadRequest, "设置内容不对")
 		return
 	}
 	if req.CacheBudgetGB < 0 || req.CacheBudgetGB > 1024 ||
 		req.SyncBatch < 1 || req.SyncBatch > 1000 ||
 		req.MaxAttachmentMB < 1 || req.MaxAttachmentMB > 200 ||
 		req.PushWindowMinutes < 0 || req.PushWindowMinutes > 43200 {
-		writeErr(w, http.StatusBadRequest, "settings out of range")
+		writeErr(w, http.StatusBadRequest, "设置超出允许范围")
 		return
 	}
 	if err := s.st.SaveAppSettings(req); err != nil {
-		writeErr(w, http.StatusInternalServerError, "save settings failed")
+		writeErr(w, http.StatusInternalServerError, "保存设置失败")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

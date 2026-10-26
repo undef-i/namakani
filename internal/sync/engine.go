@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -35,13 +36,19 @@ type Status struct {
 	CacheBudgetBytes       int64 `json:"cache_budget_bytes"`
 }
 
+type CrossRemoval struct {
+	FolderID int64
+	IDs      []int64
+}
+
 type Change struct {
-	AccountID int64
-	FolderID  int64
-	Inserted  []int64
-	Flagged   []int64
-	Removed   []int64
-	Initial   bool
+	AccountID    int64
+	FolderID     int64
+	Inserted     []int64
+	Flagged      []int64
+	Removed      []int64
+	CrossRemoved []CrossRemoval
+	Initial      bool
 }
 
 type repairInfo struct {
@@ -60,12 +67,13 @@ type Manager struct {
 	repair      map[int64]repairInfo
 	folderLocks map[int64]*sync.Mutex
 	initTurn    chan struct{}
+	ftsOnce     sync.Once
 
 	OnChange func(Change)
 }
 
 func (m *Manager) emit(c Change) {
-	if m.OnChange != nil && (len(c.Inserted) > 0 || len(c.Flagged) > 0 || len(c.Removed) > 0) {
+	if m.OnChange != nil && (len(c.Inserted) > 0 || len(c.Flagged) > 0 || len(c.Removed) > 0 || len(c.CrossRemoved) > 0) {
 		m.OnChange(c)
 	}
 }
@@ -123,7 +131,26 @@ func (m *Manager) Start(acct mail.Account) {
 	m.workers[acct.ID] = w
 	m.setStatusLocked(acct.ID, &Status{State: "connecting"})
 	m.mu.Unlock()
+	m.ftsOnce.Do(func() { go m.backfillFTSHTML() })
 	go m.run(ctx, w)
+}
+
+func (m *Manager) backfillFTSHTML() {
+	if v, ok, err := m.st.GetSetting("fts_html_text_v1"); err == nil && ok && v == "1" {
+		return
+	}
+	n, err := m.st.BackfillFTSHTMLBodies()
+	if err != nil {
+		log.Printf("fts html backfill: %v", err)
+		return
+	}
+	if err := m.st.SetSetting("fts_html_text_v1", "1"); err != nil {
+		log.Printf("fts html backfill marker: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("fts html backfill: indexed text for %d html-only bodies", n)
+	}
 }
 
 func (m *Manager) Restart(acct mail.Account) {
@@ -219,12 +246,12 @@ func classifySessionError(acct mail.Account, err error) (bool, string) {
 	case "tuta":
 		var re *tuta.RestError
 		if errors.As(err, &re) && (re.StatusCode == 401 || re.StatusCode == 403) {
-			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。（" + err.Error() + "）"
+			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。"
 		}
 	default:
 		var ie *imap.Error
 		if errors.As(err, &ie) && ie.Code == imap.ResponseCodeAuthenticationFailed {
-			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。（" + err.Error() + "）"
+			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。"
 		}
 	}
 	return false, ""
@@ -243,6 +270,7 @@ func (m *Manager) parkRepair(w *worker, reason string) {
 
 func (m *Manager) run(ctx context.Context, w *worker) {
 	acct := w.acct
+	failures := 0
 	for {
 		m.mu.Lock()
 		m.live[acct.ID] = false
@@ -252,6 +280,7 @@ func (m *Manager) run(ctx context.Context, w *worker) {
 			return
 		}
 		if err == nil {
+			failures = 0
 			continue
 		}
 		if term, reason := classifySessionError(acct, err); term {
@@ -265,12 +294,18 @@ func (m *Manager) run(ctx context.Context, w *worker) {
 		lived := m.live[acct.ID]
 		m.mu.Unlock()
 		if lived {
+			failures = 0
 			continue
 		}
+		failures++
+		timer := time.NewTimer(time.Duration(store.BackoffSeconds(failures)) * time.Second)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		case <-w.retry:
+			timer.Stop()
+		case <-timer.C:
 		}
 	}
 }
@@ -393,9 +428,9 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 	m.mu.Lock()
 	m.live[acct.ID] = true
 	m.mu.Unlock()
+	release()
 	m.prewarm(ctx, cl, acct)
 	m.repairThreads(ctx, cl, acct)
-	release()
 
 	syncAll := func() {
 		for _, r := range refs {
@@ -623,7 +658,20 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 	live := m.live[acct.ID]
 	m.mu.Unlock()
 	change := Change{AccountID: acct.ID, FolderID: folderID, Initial: !live}
-	defer func() { m.emit(change) }()
+	defer func() {
+		// Rows may have been wiped and relisted under new ids during this
+		// pass. Ops bind messages by durable identity, so nothing about
+		// them changes here; only their cached row coordinates and this
+		// folder's unread counter are refreshed before the change is
+		// broadcast, keeping both honest against the new incarnations.
+		if _, err := m.st.RefreshOpHints(acct.ID); err != nil {
+			log.Printf("sync account %d: refresh op hints: %v", acct.ID, err)
+		}
+		if err := m.st.RecomputeFolderUnread(folderID); err != nil {
+			log.Printf("sync account %d: recompute unread for folder %d: %v", acct.ID, folderID, err)
+		}
+		m.emit(change)
+	}()
 	state, err := m.st.FolderState(folderID)
 	if err != nil {
 		return change, err
@@ -642,6 +690,8 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 			return change, err
 		}
 	}
+
+	startModSeq := state.HighestModSeq
 
 	if uidNext > state.UIDNext {
 		from := state.UIDNext
@@ -662,20 +712,7 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 				return change, fmt.Errorf("fetch envelopes %d:%d: %w", start, end, err)
 			}
 			for _, msg := range msgs {
-				row := &store.MessageRow{
-					UID:       msg.UID,
-					MessageID: msg.MessageID,
-					ThreadKey: m.st.ComputeThreadKey(acct.ID, msg.MessageID, msg.InReplyTo, msg.Subject),
-					Subject:   msg.Subject,
-					FromJSON:  addrsJSON(msg.From),
-					ToJSON:    addrsJSON(msg.To),
-					CcJSON:    addrsJSON(msg.Cc),
-					DateTS:    msg.Date.Unix(),
-					Flags:     msg.Flags,
-					HasAttach: msg.HasAttach,
-					Size:      msg.Size,
-					ModSeq:    msg.ModSeq,
-				}
+				row := m.messageRow(acct, msg, 0)
 				id, inserted, err := m.st.UpsertMessage(acct.ID, folderID, row)
 				if err != nil {
 					return change, fmt.Errorf("upsert message: %w", err)
@@ -686,17 +723,15 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 						_ = m.st.AdoptThreadKey(acct.ID, msg.MessageID, row.ThreadKey, id, msg.Subject)
 					}
 				}
-				if msg.ModSeq > state.HighestModSeq {
-					state.HighestModSeq = msg.ModSeq
-				}
+
 			}
 			start = end + 1
 		}
 	}
 
-	var highestModSeq = state.HighestModSeq
-	if cl.HasCap(imap.CapCondStore) && state.HighestModSeq > 0 && state.UIDNext > 0 {
-		changed, err := cl.FetchFlags(state.HighestModSeq)
+	var highestModSeq = startModSeq
+	if cl.HasCap(imap.CapCondStore) && startModSeq > 0 && state.UIDNext > 0 {
+		changed, err := cl.FetchFlags(startModSeq)
 		if err != nil {
 			return change, fmt.Errorf("fetch changed flags: %w", err)
 		}
@@ -726,7 +761,10 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 		for _, uid := range uids {
 			seen[uid] = true
 		}
-		if err := m.reconcileDeletions(folderID, seen, &change); err != nil {
+		if err := m.reconcileDeletions(acct.ID, folderID, seen, &change); err != nil {
+			return change, err
+		}
+		if err := m.reconcileMissing(cl, acct, folderID, seen, &change); err != nil {
 			return change, err
 		}
 	} else {
@@ -750,27 +788,210 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 				highestModSeq = msg.ModSeq
 			}
 		}
-		if err := m.reconcileDeletions(folderID, seen, &change); err != nil {
+		if err := m.reconcileDeletions(acct.ID, folderID, seen, &change); err != nil {
+			return change, err
+		}
+		if err := m.reconcileMissing(cl, acct, folderID, seen, &change); err != nil {
 			return change, err
 		}
 	}
 
+	if err := m.claimPendingTwins(acct.ID, folderID, &change); err != nil {
+		return change, err
+	}
 	err = m.st.UpdateFolderSync(folderID, sel.UIDValidity, uidNext, highestModSeq, int(sel.NumMessages))
 	return change, err
 }
 
-func (m *Manager) reconcileDeletions(folderID int64, seen map[uint32]bool, change *Change) error {
+func (m *Manager) messageRow(acct mail.Account, msg mail.Msg, firstSeenAt int64) *store.MessageRow {
+	return &store.MessageRow{
+		UID:         msg.UID,
+		MessageID:   msg.MessageID,
+		ThreadKey:   m.st.ComputeThreadKey(acct.ID, msg.MessageID, msg.InReplyTo, msg.Subject),
+		Subject:     msg.Subject,
+		FromJSON:    addrsJSON(msg.From),
+		ToJSON:      addrsJSON(msg.To),
+		CcJSON:      addrsJSON(msg.Cc),
+		DateTS:      msg.Date.Unix(),
+		Flags:       msg.Flags,
+		HasAttach:   msg.HasAttach,
+		Size:        msg.Size,
+		ModSeq:      msg.ModSeq,
+		FirstSeenAt: firstSeenAt,
+	}
+}
+
+func (m *Manager) reconcileMissing(cl mail.Conn, acct mail.Account, folderID int64, seen map[uint32]bool, change *Change) error {
 	local, err := m.st.FolderUIDs(folderID)
 	if err != nil {
 		return err
 	}
-	for uid := range local {
-		if !seen[uid] {
-			if id, ok := m.st.LocalID(folderID, uid); ok {
-				change.Removed = append(change.Removed, id)
+	claimed, err := m.st.ActiveOpPriorUIDs(acct.ID, folderID)
+	if err != nil {
+		return err
+	}
+	missing := make([]uint32, 0)
+	for uid := range seen {
+		if !local[uid] && !claimed[uid] {
+			missing = append(missing, uid)
+		}
+	}
+	sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+	for start := 0; start < len(missing); start += 200 {
+		end := start + 200
+		if end > len(missing) {
+			end = len(missing)
+		}
+		msgs, err := cl.FetchEnvelopes(missing[start:end])
+		if err != nil {
+			return fmt.Errorf("fetch missing envelopes: %w", err)
+		}
+		for _, msg := range msgs {
+			row := m.messageRow(acct, msg, msg.Date.Unix())
+			id, inserted, err := m.st.UpsertMessage(acct.ID, folderID, row)
+			if err != nil {
+				return fmt.Errorf("upsert missing message: %w", err)
 			}
-			if err := m.st.DeleteMessage(folderID, uid); err != nil {
+			if inserted {
+				change.Inserted = append(change.Inserted, id)
+				if row.ThreadKey != "" && msg.MessageID != "" {
+					_ = m.st.AdoptThreadKey(acct.ID, msg.MessageID, row.ThreadKey, id, msg.Subject)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) reconcileDeletions(accountID, folderID int64, seen map[uint32]bool, change *Change) error {
+	local, err := m.st.FolderUIDs(folderID)
+	if err != nil {
+		return err
+	}
+	pending, err := m.st.PendingUIDs(folderID)
+	if err != nil {
+		return err
+	}
+	for uid := range local {
+		if seen[uid] {
+			if pending[uid] {
+				if id, ok := m.st.LocalID(folderID, uid); ok {
+					if err := m.st.SetPendingDelete(id, false); err != nil {
+						return err
+					}
+				}
+			}
+			continue
+		}
+		row, _, err := m.st.RowForClaim(folderID, uid)
+		if err != nil {
+			return err
+		}
+		if row.ID == 0 {
+			continue
+		}
+		if active, err := m.st.MessageHasActiveOps(row.ID); err != nil {
+			return err
+		} else if active {
+			continue
+		}
+		if row.MessageID != "" {
+			if twin, found, err := m.st.TwinRow(accountID, row.MessageID, row.ID); err != nil {
 				return err
+			} else if found {
+				claimed, err := m.claimRows(row, twin, change)
+				if err != nil {
+					return err
+				}
+				if claimed {
+					continue
+				}
+			}
+		}
+		if !pending[uid] {
+			if err := m.st.SetPendingDelete(row.ID, true); err != nil {
+				return err
+			}
+			continue
+		}
+		change.Removed = append(change.Removed, row.ID)
+		if err := m.st.DeleteMessage(folderID, uid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) claimRows(orig, twin store.ClaimRow, change *Change) (bool, error) {
+	survivor, loser := orig, twin
+	if orig.BodyState == 0 && twin.BodyState != 0 {
+		survivor, loser = twin, orig
+	}
+	done, err := m.st.ClaimMove(survivor.ID, loser.ID, twin.FolderID, twin.UID)
+	if err != nil || !done {
+		return false, err
+	}
+	if survivor.ID == orig.ID {
+		change.Removed = append(change.Removed, orig.ID)
+		change.CrossRemoved = append(change.CrossRemoved, CrossRemoval{FolderID: twin.FolderID, IDs: []int64{twin.ID}})
+	} else {
+		change.Removed = append(change.Removed, orig.ID)
+	}
+	change.Inserted = append(change.Inserted, survivor.ID)
+	return true, nil
+}
+
+func (m *Manager) claimPendingTwins(accountID, folderID int64, change *Change) error {
+	pendings, err := m.st.PendingRows(accountID)
+	if err != nil {
+		return err
+	}
+	claimedMIDs := make(map[string]bool)
+	for _, p := range pendings {
+		if p.FolderID == folderID || claimedMIDs[p.MessageID] {
+			continue
+		}
+		twin, found, err := m.st.TwinInFolder(accountID, folderID, p.MessageID, p.ID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		survivor, loser := p, twin
+		if p.BodyState == 0 && twin.BodyState != 0 {
+			survivor, loser = twin, p
+		}
+		done, err := m.st.ClaimMove(survivor.ID, loser.ID, twin.FolderID, twin.UID)
+		if err != nil {
+			return err
+		}
+		if !done {
+			continue
+		}
+		claimedMIDs[p.MessageID] = true
+		change.CrossRemoved = append(change.CrossRemoved, CrossRemoval{FolderID: p.FolderID, IDs: []int64{p.ID}})
+		if survivor.ID == p.ID {
+			swapped := false
+			for i, id := range change.Inserted {
+				if id == twin.ID {
+					change.Inserted[i] = p.ID
+					swapped = true
+				}
+			}
+			if !swapped {
+				change.CrossRemoved = append(change.CrossRemoved, CrossRemoval{FolderID: twin.FolderID, IDs: []int64{twin.ID}})
+				change.Inserted = append(change.Inserted, p.ID)
+			}
+		} else {
+			seen := false
+			for _, id := range change.Inserted {
+				if id == twin.ID {
+					seen = true
+				}
+			}
+			if !seen {
+				change.Inserted = append(change.Inserted, twin.ID)
 			}
 		}
 	}

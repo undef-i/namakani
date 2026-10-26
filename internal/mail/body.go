@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	_ "github.com/emersion/go-message/charset"
 	"github.com/emersion/go-message/mail"
@@ -29,6 +30,7 @@ type ParsedBody struct {
 	Attachments []Attachment
 	References  []string
 	InReplyTo   string
+	Truncated   bool
 }
 
 type partData struct {
@@ -36,37 +38,55 @@ type partData struct {
 	data []byte
 }
 
-func parseAll(raw []byte) ([]partData, string, string, error) {
+func validText(data []byte, truncated *bool) string {
+	if utf8.Valid(data) {
+		return string(data)
+	}
+	*truncated = true
+	return strings.ToValidUTF8(string(data), "�")
+}
+
+func parseAll(raw []byte) ([]partData, string, string, bool, error) {
 	mr, err := mail.CreateReader(bytes.NewReader(raw))
 	if err != nil {
-		return nil, "", "", err
+		truncated := true
+		return nil, validText(raw, &truncated), "", true, nil
 	}
 	var (
-		parts []partData
-		text  string
-		html  string
-		idx   int
+		parts     []partData
+		text      string
+		html      string
+		idx       int
+		truncated bool
 	)
 	for {
 		p, err := mr.NextPart()
 		if err == io.EOF {
 			break
 		}
-		if err != nil {
+		if p == nil {
+			truncated = true
 			break
 		}
-		idx++
-		data, err := io.ReadAll(p.Body)
 		if err != nil {
-			return nil, "", "", err
+			truncated = true
+		}
+		idx++
+		data, readErr := io.ReadAll(p.Body)
+		if readErr != nil {
+			truncated = true
 		}
 		switch h := p.Header.(type) {
 		case *mail.InlineHeader:
 			mt, _, _ := h.ContentType()
 			if mt == "text/html" && html == "" {
-				html = string(data)
+				if readErr == nil {
+					html = validText(data, &truncated)
+				}
 			} else if mt == "text/plain" && text == "" {
-				text = string(data)
+				if readErr == nil {
+					text = validText(data, &truncated)
+				}
 			} else {
 				parts = append(parts, partData{
 					att: Attachment{
@@ -107,7 +127,21 @@ func parseAll(raw []byte) ([]partData, string, string, error) {
 			})
 		}
 	}
-	return parts, text, html, nil
+	if text == "" && html == "" && len(parts) == 0 {
+		body := raw
+		if i := bytes.Index(raw, []byte("\r\n\r\n")); i >= 0 {
+			body = raw[i+4:]
+		} else if i := bytes.Index(raw, []byte("\n\n")); i >= 0 {
+			body = raw[i+2:]
+		} else {
+			body = nil
+		}
+		if len(bytes.TrimSpace(body)) > 0 {
+			truncated = true
+			text = validText(raw, &truncated)
+		}
+	}
+	return parts, text, html, truncated, nil
 }
 
 func fallbackName(mime string) string {
@@ -125,11 +159,11 @@ func fallbackName(mime string) string {
 }
 
 func ParseBody(raw []byte) (*ParsedBody, error) {
-	parts, text, html, err := parseAll(raw)
+	parts, text, html, truncated, err := parseAll(raw)
 	if err != nil {
 		return nil, err
 	}
-	out := &ParsedBody{Text: text, HTML: html}
+	out := &ParsedBody{Text: text, HTML: html, Truncated: truncated}
 	for _, p := range parts {
 		out.Attachments = append(out.Attachments, p.att)
 	}
@@ -149,7 +183,7 @@ func ParseBody(raw []byte) (*ParsedBody, error) {
 }
 
 func ParseBodyPart(raw []byte, partPath string) (*Attachment, error) {
-	parts, _, _, err := parseAll(raw)
+	parts, _, _, _, err := parseAll(raw)
 	if err != nil {
 		return nil, err
 	}

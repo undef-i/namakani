@@ -382,7 +382,21 @@ func (cl *Client) AppendMessage(folder string, raw []byte, flags ...imap.Flag) (
 }
 
 func (cl *Client) DeleteMessage(uid uint32) error {
-	if err := cl.StoreFlag(uid, imap.FlagDeleted, true); err != nil {
+	return cl.DeleteMessages([]uint32{uid})
+}
+
+func (cl *Client) DeleteMessages(uids []uint32) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	set := imap.UIDSet{}
+	for _, uid := range uids {
+		set.AddNum(imap.UID(uid))
+	}
+	if _, err := cl.c.Store(set, &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagDeleted},
+	}, nil).Collect(); err != nil {
 		return err
 	}
 	_, err := cl.c.Expunge().Collect()
@@ -477,8 +491,37 @@ func convertMsg(buf *imapclient.FetchMessageBuffer) Msg {
 			m.Date = buf.Envelope.Date
 		}
 	}
+	if id, ok := headerFieldMessageID(buf); ok {
+		m.MessageID = id
+	}
 	m.HasAttach = hasAttachment(buf.BodyStructure)
 	return m
+}
+
+func headerFieldMessageID(buf *imapclient.FetchMessageBuffer) (string, bool) {
+	for _, sec := range buf.BodySection {
+		if sec.Section == nil || sec.Section.Specifier != imap.PartSpecifierHeader {
+			continue
+		}
+		data := make([]byte, 0, len(sec.Bytes)+2)
+		data = append(data, sec.Bytes...)
+		data = append(data, '\r', '\n')
+		tr := textproto.NewReader(bufio.NewReader(bytes.NewReader(data)))
+		hdr, err := tr.ReadMIMEHeader()
+		if err != nil {
+			return "", false
+		}
+		return normalizeMsgID(hdr.Get("Message-Id")), true
+	}
+	return "", false
+}
+
+func normalizeMsgID(s string) string {
+	s = strings.TrimSpace(s)
+	for len(s) >= 2 && s[0] == '<' && s[len(s)-1] == '>' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return s
 }
 
 func (cl *Client) fetch(uids imap.UIDSet, opts *imap.FetchOptions) ([]Msg, error) {
@@ -514,6 +557,9 @@ func (cl *Client) FetchEnvelopes(uids []uint32) ([]Msg, error) {
 		InternalDate:  true,
 		RFC822Size:    true,
 		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"Message-Id"}, Peek: true},
+		},
 	}
 	if cl.HasCap(imap.CapCondStore) {
 		opts.ModSeq = true

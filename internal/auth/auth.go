@@ -139,6 +139,12 @@ func LoadOrCreateServerKey(path string) ([]byte, error) {
 	return key, nil
 }
 
+func LiveSessionCount(st *store.Store) (int, error) {
+	var n int
+	err := st.DB.QueryRow("SELECT COUNT(*) FROM sessions WHERE expires_at > ?", time.Now().Unix()).Scan(&n)
+	return n, err
+}
+
 func DeleteSession(st *store.Store, token string) error {
 	_, err := st.DB.Exec("DELETE FROM sessions WHERE token_hash = ?", tokenHash(token))
 	return err
@@ -189,17 +195,17 @@ func ParsePort(v any) (int, error) {
 	case float64:
 		p := int(n)
 		if p < 1 || p > 65535 {
-			return 0, fmt.Errorf("port out of range")
+			return 0, fmt.Errorf("端口超出范围")
 		}
 		return p, nil
 	case string:
 		p, err := strconv.Atoi(n)
 		if err != nil || p < 1 || p > 65535 {
-			return 0, fmt.Errorf("invalid port")
+			return 0, fmt.Errorf("端口格式不对")
 		}
 		return p, nil
 	default:
-		return 0, fmt.Errorf("invalid port type")
+		return 0, fmt.Errorf("端口格式不对")
 	}
 }
 

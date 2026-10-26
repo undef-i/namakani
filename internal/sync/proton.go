@@ -48,7 +48,11 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseI
 		return fmt.Errorf("list folders: %w", err)
 	}
 
-	syncOne := func(r folderRef) { m.syncFolderLocked(ctx, sess, acct, r) }
+	ps := &protonSyncer{syncOneFn: func(r folderRef) error {
+		_, err := m.syncFolderLocked(ctx, sess, acct, r)
+		return err
+	}}
+	syncOne := ps.sync
 	if inboxRef != nil {
 		syncOne(*inboxRef)
 	}
@@ -68,9 +72,9 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseI
 	m.mu.Lock()
 	m.live[acct.ID] = true
 	m.mu.Unlock()
+	releaseInit()
 	m.prewarm(ctx, sess, acct)
 	m.repairThreads(ctx, sess, acct)
-	releaseInit()
 
 	syncNames := func(names map[string]bool) {
 		for _, r := range refs {
@@ -94,14 +98,29 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseI
 	events := make(chan *protonmail.Event, 4)
 	go protonEventLoop(ctx, sess, acct.ID, events)
 
+	var retryTimer *time.Timer
+	var retryC <-chan time.Time
+	armRetry := func() {
+		if len(ps.pending()) == 0 || retryTimer != nil {
+			return
+		}
+		retryTimer = time.NewTimer(protonEventErrMax)
+		retryC = retryTimer.C
+	}
+	armRetry()
+
 	sweep := time.NewTicker(10 * time.Minute)
 	defer sweep.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-retryC:
+			retryTimer = nil
+			retryC = nil
+			ps.retryOnce()
+			armRetry()
 		case <-sweep.C:
-			sess.InvalidateFolders()
 			if newRefs, _, err := listRefs(); err == nil {
 				refs = newRefs
 				m.setStatus(acct.ID, &Status{State: "idle", Folders: len(refs)})
@@ -109,22 +128,56 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseI
 				log.Printf("sync account %d list folders: %v", acct.ID, err)
 			}
 			syncAll()
+			armRetry()
 		case ev := <-events:
 			if ev.Refresh&protonmail.EventRefreshMail != 0 {
 				syncAll()
+				armRetry()
 				continue
 			}
 			affected, err := m.protonAffectedFolders(acct, sess, ev)
 			if err != nil {
 				log.Printf("sync account %d proton events map: %v", acct.ID, err)
 				syncAll()
+				armRetry()
 				continue
 			}
 			if len(affected) == 0 {
 				continue
 			}
 			syncNames(affected)
+			armRetry()
 		}
+	}
+}
+
+type protonSyncer struct {
+	syncOneFn func(folderRef) error
+	failed    map[int64]folderRef
+}
+
+func (p *protonSyncer) sync(r folderRef) {
+	if err := p.syncOneFn(r); err != nil {
+		if p.failed == nil {
+			p.failed = make(map[int64]folderRef)
+		}
+		p.failed[r.id] = r
+	} else {
+		delete(p.failed, r.id)
+	}
+}
+
+func (p *protonSyncer) pending() []folderRef {
+	out := make([]folderRef, 0, len(p.failed))
+	for _, r := range p.failed {
+		out = append(out, r)
+	}
+	return out
+}
+
+func (p *protonSyncer) retryOnce() {
+	for _, r := range p.pending() {
+		p.sync(r)
 	}
 }
 
@@ -217,11 +270,7 @@ func protonEventLoop(ctx context.Context, src protonEventSource, accountID int64
 	}
 }
 
-func (m *Manager) protonAffectedFolders(acct mail.Account, sess *proton.Session, ev *protonmail.Event) (map[string]bool, error) {
-	pairs, err := sess.FolderLabelPairs()
-	if err != nil {
-		return nil, err
-	}
+func computeProtonAffected(pairs map[string]string, counts, totals map[string]int, ev *protonmail.Event, foldersForID func(string) ([]string, error)) map[string]bool {
 	byLabel := make(map[string]string, len(pairs))
 	for name, label := range pairs {
 		byLabel[label] = name
@@ -234,6 +283,12 @@ func (m *Manager) protonAffectedFolders(acct mail.Account, sess *proton.Session,
 	}
 	for _, em := range ev.Messages {
 		switch em.Action {
+		case protonmail.EventDelete:
+			if names, err := foldersForID(em.ID); err == nil {
+				for _, name := range names {
+					affected[name] = true
+				}
+			}
 		case protonmail.EventCreate:
 			if em.Created != nil {
 				for _, lid := range em.Created.LabelIDs {
@@ -243,6 +298,13 @@ func (m *Manager) protonAffectedFolders(acct mail.Account, sess *proton.Session,
 		case protonmail.EventUpdate, protonmail.EventUpdateFlags:
 			if em.Updated != nil {
 				added, removed := em.Updated.DiffLabelIDs(nil)
+				if em.Updated.LabelIDsAdded != nil {
+					added = em.Updated.LabelIDsAdded
+				}
+				if em.Updated.LabelIDsRemoved != nil {
+					removed = em.Updated.LabelIDsRemoved
+				}
+				marked := len(affected)
 				for _, lid := range added {
 					mark(lid)
 				}
@@ -252,8 +314,30 @@ func (m *Manager) protonAffectedFolders(acct mail.Account, sess *proton.Session,
 				for _, lid := range em.Updated.LabelIDs {
 					mark(lid)
 				}
+				if len(affected) == marked {
+					if names, err := foldersForID(em.ID); err == nil {
+						for _, name := range names {
+							affected[name] = true
+						}
+					}
+				}
 			}
 		}
+	}
+	for name, label := range pairs {
+		if c, ok := counts[label]; ok {
+			if t, ok := totals[name]; ok && t != c {
+				affected[name] = true
+			}
+		}
+	}
+	return affected
+}
+
+func (m *Manager) protonAffectedFolders(acct mail.Account, sess *proton.Session, ev *protonmail.Event) (map[string]bool, error) {
+	pairs, err := sess.FolderLabelPairs()
+	if err != nil {
+		return nil, err
 	}
 	counts, err := sess.MessageCounts()
 	if err != nil {
@@ -263,12 +347,7 @@ func (m *Manager) protonAffectedFolders(acct mail.Account, sess *proton.Session,
 	if err != nil {
 		return nil, err
 	}
-	for name, label := range pairs {
-		if c, ok := counts[label]; ok {
-			if t, ok := totals[name]; ok && t != c {
-				affected[name] = true
-			}
-		}
-	}
-	return affected, nil
+	return computeProtonAffected(pairs, counts, totals, ev, func(id string) ([]string, error) {
+		return m.st.ProtonFoldersForID(acct.ID, id)
+	}), nil
 }

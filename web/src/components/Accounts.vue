@@ -2,20 +2,23 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { intlLocale, lang, setLang, t } from '../i18n'
+import { LANGUAGE_CODES } from '../languages'
 import * as api from '../api.js'
+import RawError from './RawError.vue'
 
 const display = useDisplay()
 const lgAndUp = computed(() => display.lgAndUp.value)
 const activeSection = ref('accounts')
 
 function showSection(s) {
-  return !lgAndUp.value || activeSection.value === s
+  return activeSection.value === s
 }
 
 const SECTIONS = computed(() => [
   { key: 'accounts', label: t('账号'), icon: 'mdi-account-multiple' },
   { key: 'appearance', label: t('外观'), icon: 'mdi-palette' },
   { key: 'compose', label: t('写信与发送'), icon: 'mdi-email-edit' },
+  { key: 'translate', label: t('翻译'), icon: 'mdi-translate' },
   { key: 'push', label: t('推送'), icon: 'mdi-bell' },
   { key: 'advanced', label: t('高级'), icon: 'mdi-cog' },
 ])
@@ -81,6 +84,20 @@ function statusText(a) {
   return t('未同步')
 }
 
+const statusRetrying = reactive({})
+
+function retryStatus(a) {
+  statusRetrying[a.id] = true
+  emit('changed')
+}
+
+watch(
+  () => props.statuses,
+  () => {
+    for (const k of Object.keys(statusRetrying)) delete statusRetrying[k]
+  },
+)
+
 const testState = reactive({})
 
 async function runTest(a) {
@@ -90,13 +107,7 @@ async function runTest(a) {
     testState[a.id] = {
       busy: false,
       ok: true,
-      text: t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
-        folders: (res.folders || []).length,
-        caps: (res.capabilities || []).length,
-        sample: (res.capabilities || [])
-          .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
-          .join('/'),
-      }),
+      text: testSuccessText((res.folders || []).length, res.capabilities || []),
     }
   } catch (err) {
     testState[a.id] = { busy: false, ok: false, text: t('连接失败：{error}', { error: err.message }) }
@@ -411,15 +422,21 @@ function reportTestResult(res) {
   }
 }
 
-function showTestSuccess(folders, capabilities) {
+function testSuccessText(folders, capabilities) {
   const caps = capabilities || []
-  testResult.value = t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
+  const sample = caps
+    .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
+    .join('/')
+  if (!sample) return t('连接成功：{folders} 个文件夹，能力 {caps} 项', { folders, caps: caps.length })
+  return t('连接成功：{folders} 个文件夹，能力 {caps} 项（含 {sample}）', {
     folders,
     caps: caps.length,
-    sample: caps
-      .filter((c) => ['IDLE', 'CONDSTORE', 'QRESYNC', 'MOVE', 'SPECIAL-USE'].includes(c))
-      .join('/'),
+    sample,
   })
+}
+
+function showTestSuccess(folders, capabilities) {
+  testResult.value = testSuccessText(folders, capabilities)
 }
 
 function askDelete(a) {
@@ -639,6 +656,137 @@ function fmtBytes(n) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB'
 }
 
+const trStatus = ref('loading')
+const trMsg = ref('')
+const trBusy = ref(false)
+const tr = reactive({
+  engine: 'google',
+  target: 'auto',
+  llm_format: 'openai',
+  llm_endpoint: '',
+  llm_model: '',
+  llm_api_key: '',
+  has_key: false,
+})
+
+const trEngineItems = computed(() => [
+  { title: t('谷歌翻译'), value: 'google' },
+  { title: 'LLM', value: 'llm' },
+])
+const trTargetItems = computed(() => {
+  const items = [{ title: t('跟随界面语言'), value: 'auto' }]
+  for (const code of LANGUAGE_CODES) {
+    items.push({ title: langName(code), value: code })
+  }
+  if (tr.target && tr.target !== 'auto' && !LANGUAGE_CODES.includes(tr.target)) {
+    items.push({ title: langName(tr.target), value: tr.target })
+  }
+  return items
+})
+
+const visiblePairs = computed(() => modelsData.value?.pairs || [])
+const trFormatItems = [
+  { title: 'OpenAI 兼容', value: 'openai' },
+  { title: 'Anthropic 兼容', value: 'anthropic' },
+]
+
+const trModelList = ref([])
+const trModelsBusy = ref(false)
+const trModelsError = ref('')
+const trModelItems = computed(() => {
+  const ids = [...trModelList.value]
+  if (tr.llm_model && !ids.includes(tr.llm_model)) ids.unshift(tr.llm_model)
+  return ids
+})
+
+async function fetchLLMModels() {
+  trModelsBusy.value = true
+  trModelsError.value = ''
+  try {
+    const res = await api.fetchLLMModels({
+      llm_format: tr.llm_format,
+      llm_endpoint: tr.llm_endpoint,
+      llm_api_key: tr.llm_api_key,
+    })
+    trModelList.value = res.models || []
+  } catch (err) {
+    trModelsError.value = t('获取模型失败：{error}', { error: err.message })
+  } finally {
+    trModelsBusy.value = false
+  }
+}
+
+async function loadTranslate() {
+  trStatus.value = 'loading'
+  try {
+    const res = await api.getTranslateSettings()
+    Object.assign(tr, res.settings, { llm_api_key: '' })
+    trStatus.value = 'ready'
+    loadModels()
+  } catch (err) {
+    trStatus.value = 'error'
+    trMsg.value = err.message
+  }
+}
+
+async function saveTranslate() {
+  trBusy.value = true
+  try {
+    const res = await api.saveTranslateSettings({
+      engine: tr.engine,
+      target: tr.target,
+      llm_format: tr.llm_format,
+      llm_endpoint: tr.llm_endpoint,
+      llm_model: tr.llm_model,
+      llm_api_key: tr.llm_api_key,
+    })
+    Object.assign(tr, res.settings, { llm_api_key: '' })
+    showSnack(t('已保存'))
+  } catch (err) {
+    showSnack(t('保存失败：{error}', { error: err.message }))
+  } finally {
+    trBusy.value = false
+  }
+}
+
+const modelsData = ref(null)
+const modelsError = ref('')
+
+async function loadModels() {
+  try {
+    const res = await api.getTranslateModels()
+    modelsData.value = res
+    modelsError.value = ''
+  } catch (err) {
+    modelsError.value = err.message
+  }
+}
+
+let dnCache = { locale: '', dn: null }
+
+function langName(code) {
+  const loc = intlLocale()
+  if (dnCache.locale !== loc) {
+    let dn = null
+    try {
+      dn = new Intl.DisplayNames([loc], { type: 'language' })
+    } catch {
+      dn = null
+    }
+    dnCache = { locale: loc, dn }
+  }
+  if (!dnCache.dn) return code
+  try {
+    return dnCache.dn.of(code) || code
+  } catch {
+    return code
+  }
+}
+
+function pairTitle(p) {
+  return langName(p.from) + ' → ' + langName(p.to)
+}
+
 async function loadAppSet() {
   appSetState.value = 'loading'
   try {
@@ -677,23 +825,34 @@ onMounted(() => {
   loadAppSet()
   loadTG()
   loadWP()
+  loadTranslate()
 })
 </script>
 
 <template>
-  <div class="settings-root">
+  <div class="settings-root" :class="{ 'settings-root-m': !lgAndUp }">
     <nav v-if="lgAndUp" class="settings-nav">
-      <v-list nav density="comfortable" class="bg-transparent">
-        <v-list-item
+      <v-tabs v-model="activeSection" direction="vertical">
+        <v-tab
           v-for="s in SECTIONS"
           :key="s.key"
+          :value="s.key"
           :prepend-icon="s.icon"
-          :title="s.label"
-          :active="activeSection === s.key"
-          @click="activeSection = s.key"
-        />
-      </v-list>
+        >
+          {{ s.label }}
+        </v-tab>
+      </v-tabs>
     </nav>
+    <v-tabs v-if="!lgAndUp" v-model="activeSection" class="mt-2">
+      <v-tab
+        v-for="s in SECTIONS"
+        :key="s.key"
+        :value="s.key"
+        :prepend-icon="s.icon"
+      >
+        {{ s.label }}
+      </v-tab>
+    </v-tabs>
     <div class="settings-content">
     <section v-if="showSection('accounts')">
     <div class="d-flex align-center justify-space-between mb-3">
@@ -711,7 +870,7 @@ onMounted(() => {
       </v-alert>
     </template>
     <p v-else-if="accounts.length === 0" class="text-body-2 text-medium-emphasis">
-      {{ t('还没有账号。添加第一个邮箱后，它的邮件会自动同步进聚合收件箱。') }}
+      {{ t('还没有账号。添加第一个邮箱后，它的邮件会自动同步进全部收件箱。') }}
     </p>
     <div v-else class="d-flex flex-column ga-3">
       <v-card v-for="a in accounts" :key="a.id" variant="outlined" rounded="lg">
@@ -738,11 +897,22 @@ onMounted(() => {
             {{ statusText(a) }}<template v-if="cacheText(a)">{{ t('，') }}{{ cacheText(a) }}</template>
           </div>
           <div
+            v-else-if="statuses[a.id] === null && !statusRetrying[a.id]"
+            class="text-body-2 text-error mt-1 d-flex align-center"
+            style="overflow-wrap: anywhere"
+          >
+            <span>{{ t('状态加载失败') }}</span>
+            <v-btn variant="text" size="small" @click="retryStatus(a)">{{ t('重试') }}</v-btn>
+          </div>
+          <div v-else class="mt-1">
+            <v-skeleton-loader type="text" />
+          </div>
+          <div
             v-if="statuses[a.id] && statuses[a.id].last_error && (statuses[a.id].state === 'error' || statuses[a.id].state === 'repair')"
             class="text-body-2 text-error mt-1"
             style="overflow-wrap: anywhere"
           >
-            {{ statuses[a.id].last_error }}
+            <RawError :text="statuses[a.id].last_error" />
           </div>
           <div
             v-if="testState[a.id] && testState[a.id].text"
@@ -762,7 +932,7 @@ onMounted(() => {
     </div>
     </section>
 
-    <section v-if="showSection('appearance')" class="settings-sec">
+    <section v-if="showSection('appearance')">
     <h2 class="text-h6 mb-3">{{ t('外观') }}</h2>
     <div style="max-width: 640px">
       <div class="text-body-2 mb-2">{{ t('深色模式') }}</div>
@@ -805,7 +975,7 @@ onMounted(() => {
 
     </section>
 
-    <section v-if="showSection('advanced')" class="settings-sec">
+    <section v-if="showSection('advanced')">
     <h2 class="text-h6 mb-3">{{ t('同步与缓存') }}</h2>
     <v-skeleton-loader v-if="appSetState === 'loading'" type="article" class="skel-clip" />
     <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" class="mb-3">
@@ -859,7 +1029,7 @@ onMounted(() => {
 
     </section>
 
-    <section v-if="showSection('compose')" class="settings-sec">
+    <section v-if="showSection('compose')">
     <h2 class="text-h6 mb-3">{{ t('写信与发送') }}</h2>
     <div style="max-width: 640px" class="mb-6">
       <v-select
@@ -875,7 +1045,108 @@ onMounted(() => {
     </div>
     </section>
 
-    <section v-if="showSection('push')" class="settings-sec">
+    <section v-if="showSection('translate')">
+    <h2 class="text-h6 mb-3">{{ t('翻译') }}</h2>
+    <template v-if="trStatus === 'loading'">
+      <v-skeleton-loader type="article" max-width="640" class="skel-clip" />
+    </template>
+    <template v-else-if="trStatus === 'error'">
+      <v-alert type="error" variant="tonal" density="compact" max-width="640">
+        {{ t('设置加载失败：{error}', { error: trMsg }) }}
+        <v-btn variant="text" size="small" @click="loadTranslate">{{ t('重试') }}</v-btn>
+      </v-alert>
+    </template>
+    <div v-else style="max-width: 640px">
+      <v-select
+        v-model="tr.engine"
+        :items="trEngineItems"
+        :label="t('翻译引擎')"
+        variant="filled"
+        density="comfortable"
+        class="mb-2"
+      />
+      <v-select
+        v-model="tr.target"
+        :items="trTargetItems"
+        :label="t('目标语言')"
+        variant="filled"
+        density="comfortable"
+        class="mb-2"
+      />
+      <template v-if="tr.engine === 'llm'">
+        <v-select
+          v-model="tr.llm_format"
+          :items="trFormatItems"
+          :label="t('接口格式')"
+          variant="filled"
+          density="comfortable"
+          class="mb-2"
+        />
+        <v-text-field
+          v-model="tr.llm_endpoint"
+          :label="t('端点地址')"
+          variant="filled"
+          density="comfortable"
+          autocomplete="off"
+          placeholder="https://api.example.com"
+          class="mb-2"
+        />
+        <v-select
+          v-model="tr.llm_model"
+          :items="trModelItems"
+          :label="t('模型名')"
+          variant="filled"
+          density="comfortable"
+          class="mb-2"
+        />
+        <div class="mb-2">
+          <v-btn variant="tonal" :loading="trModelsBusy" @click="fetchLLMModels">{{ t('获取模型') }}</v-btn>
+          <p v-if="trModelsError" class="text-body-2 text-error mt-2">{{ trModelsError }}</p>
+        </div>
+        <v-text-field
+          v-model="tr.llm_api_key"
+          label="API Key"
+          type="password"
+          variant="filled"
+          density="comfortable"
+          autocomplete="off"
+          :placeholder="tr.has_key ? t('已保存，留空不改') : ''"
+          class="mb-2"
+        />
+      </template>
+      <v-btn color="primary" :loading="trBusy" @click="saveTranslate">{{ t('保存') }}</v-btn>
+    </div>
+
+    <template v-if="tr.engine === 'local'">
+    <div class="text-subtitle-1 font-weight-medium mb-3 mt-8">{{ t('本地模型') }}</div>
+    <v-alert v-if="modelsError" type="error" variant="tonal" density="compact" max-width="640" class="mb-3">
+      {{ t('模型列表加载失败：{error}', { error: modelsError }) }}
+      <v-btn variant="text" size="small" @click="loadModels">{{ t('重试') }}</v-btn>
+    </v-alert>
+    <div v-if="modelsData" style="max-width: 640px">
+      <div
+        v-for="p in visiblePairs"
+        :key="p.id"
+        class="d-flex align-center ga-3 py-2 border-b"
+      >
+        <div class="flex-1-1" style="min-width: 0">
+          <div class="text-body-1">{{ pairTitle(p) }}</div>
+          <div class="text-body-2 text-medium-emphasis">
+            {{ t('占用 {b}', { b: fmtBytes(p.disk_bytes) }) }}
+          </div>
+        </div>
+      </div>
+      <p v-if="visiblePairs.length === 0" class="text-body-2 text-medium-emphasis">
+        {{ t('本地没有模型') }}
+      </p>
+    </div>
+    <div v-else-if="!modelsError" class="d-flex justify-center pa-6">
+      <v-progress-circular indeterminate />
+    </div>
+    </template>
+    </section>
+
+    <section v-if="showSection('push')">
     <h2 class="text-h6 mb-3">{{ t('推送') }}</h2>
     <div class="text-subtitle-1 font-weight-medium mb-3">Telegram</div>
     <template v-if="tgStatus === 'loading'">
@@ -1173,9 +1444,17 @@ onMounted(() => {
   flex: 1 1 auto;
   min-height: 0;
 }
+.settings-root-m {
+  flex-direction: column;
+}
+.settings-root-m .settings-content {
+  overflow-y: auto;
+  margin-inline: 0;
+}
 .settings-nav {
   width: 240px;
   flex: none;
+  padding-top: 24px;
 }
 .settings-content {
   flex: 1;
@@ -1185,12 +1464,7 @@ onMounted(() => {
   padding: 16px;
   min-height: 0;
 }
-.settings-sec {
-  margin-top: 24px;
-}
-.settings-content > section:first-child {
-  margin-top: 0;
-}
+
 
 
 </style>

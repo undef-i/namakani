@@ -2,7 +2,6 @@ package store
 
 import (
 	"os"
-	"strings"
 )
 
 type AttachmentRow struct {
@@ -17,18 +16,19 @@ type AttachmentRow struct {
 }
 
 type MessageRoute struct {
-	AccountID int64
-	FolderID  int64
-	Folder    string
-	UID       uint32
-	BodyState int
+	AccountID         int64
+	FolderID          int64
+	Folder            string
+	UID               uint32
+	BodyState         int
+	FolderUIDValidity uint32
 }
 
 func (s *Store) MessageRoute(messageID int64) (MessageRoute, error) {
 	var r MessageRoute
-	err := s.DB.QueryRow(`SELECT m.account_id, m.folder_id, f.name, m.uid, m.body_state
+	err := s.DB.QueryRow(`SELECT m.account_id, m.folder_id, f.name, m.uid, m.body_state, f.uidvalidity
 		FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?`, messageID).
-		Scan(&r.AccountID, &r.FolderID, &r.Folder, &r.UID, &r.BodyState)
+		Scan(&r.AccountID, &r.FolderID, &r.Folder, &r.UID, &r.BodyState, &r.FolderUIDValidity)
 	return r, err
 }
 
@@ -41,7 +41,7 @@ func (s *Store) GetBody(messageID int64) (text, html string, ok bool, err error)
 	return text, html, true, nil
 }
 
-func (s *Store) SaveBody(messageID int64, text, html, snippet string) error {
+func (s *Store) SaveBody(messageID int64, text, html, snippet string, truncated bool) error {
 	oldLen := s.bodyLen(messageID)
 	s.beginBodyMutation()
 	if _, err := s.DB.Exec(`INSERT INTO bodies(message_id, text_body, html_body) VALUES(?, ?, ?)
@@ -51,10 +51,18 @@ func (s *Store) SaveBody(messageID int64, text, html, snippet string) error {
 		return err
 	}
 	s.endBodyMutation(s.bodyLen(messageID) - oldLen)
-	if _, err := s.DB.Exec("UPDATE messages SET body_state = 1, snippet = ? WHERE id = ?", snippet, messageID); err != nil {
+	state := 1
+	if truncated {
+		state = 2
+	}
+	if _, err := s.DB.Exec("UPDATE messages SET body_state = ?, snippet = ? WHERE id = ?", state, snippet, messageID); err != nil {
 		return err
 	}
-	return s.ftsSetBody(messageID, text)
+	indexed := text
+	if indexed == "" && html != "" {
+		indexed = HTMLToText(html)
+	}
+	return s.ftsSetBody(messageID, indexed)
 }
 
 func (s *Store) ReplaceAttachments(messageID int64, atts []AttachmentRow) ([]AttachmentRow, error) {
@@ -83,39 +91,6 @@ func (s *Store) ReplaceAttachments(messageID int64, atts []AttachmentRow) ([]Att
 		}
 	}
 	return s.ListAttachments(messageID)
-}
-
-func (s *Store) MarkPendingRemoval(messageID, fromFolderID int64) {
-	_, _ = s.DB.Exec(`INSERT OR REPLACE INTO pending_removals(message_id, from_folder_id, created_at) VALUES(?, ?, unixepoch())`, messageID, fromFolderID)
-}
-
-func (s *Store) ClearPendingRemoval(messageID int64) {
-	_, _ = s.DB.Exec(`DELETE FROM pending_removals WHERE message_id = ?`, messageID)
-}
-
-func (s *Store) PendingRemovalSet(ids []int64) map[int64]bool {
-	out := map[int64]bool{}
-	if len(ids) == 0 {
-		return out
-	}
-	ph := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		ph[i] = "?"
-		args[i] = id
-	}
-	rows, err := s.DB.Query(`SELECT message_id FROM pending_removals WHERE message_id IN (`+strings.Join(ph, ",")+`)`, args...)
-	if err != nil {
-		return out
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err == nil {
-			out[id] = true
-		}
-	}
-	return out
 }
 
 func (s *Store) ListAttachments(messageID int64) ([]AttachmentRow, error) {
@@ -150,7 +125,9 @@ func (s *Store) GetAttachment(messageID, attachmentID int64) (AttachmentRow, err
 
 func (s *Store) RefreshUnread(folderID int64) error {
 	_, err := s.DB.Exec(`UPDATE folders SET unread =
-		(SELECT COUNT(*) FROM messages WHERE folder_id = ? AND (flags & 1) = 0) WHERE id = ?`,
+		(SELECT COUNT(*) FROM messages m WHERE m.folder_id = ? AND (m.flags & 1) = 0
+			AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = m.id AND o.type = 'expunge'
+				AND o.status IN ('pending', 'in_flight', 'needs_attention'))) WHERE id = ?`,
 		folderID, folderID)
 	return err
 }
@@ -224,6 +201,9 @@ func (s *Store) MoveLocalMessage(oldID, destFolderID int64, destUID uint32) erro
 		}
 	}
 	if _, err := s.DB.Exec("UPDATE messages SET folder_id = ?, uid = ? WHERE id = ?", destFolderID, destUID, oldID); err != nil {
+		return err
+	}
+	if err := noteFolderChange(s.DB, oldID, srcFolderID, destFolderID); err != nil {
 		return err
 	}
 	if srcFolderID != destFolderID {

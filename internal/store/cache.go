@@ -6,28 +6,44 @@ import (
 	"strconv"
 )
 
+func (s *Store) WarmBodyBytes() {
+	_, _ = s.cacheBodyBytes()
+}
+
 func (s *Store) cacheBodyBytes() (int64, error) {
-	s.bodyBytesMu.Lock()
-	if s.bodyBytesOK {
-		n := s.bodyBytes
+	for {
+		s.bodyBytesMu.Lock()
+		if s.bodyBytesOK {
+			n := s.bodyBytes
+			s.bodyBytesMu.Unlock()
+			return n, nil
+		}
+		if s.bodyComputing != nil {
+			ch := s.bodyComputing
+			s.bodyBytesMu.Unlock()
+			<-ch
+			continue
+		}
+		ch := make(chan struct{})
+		s.bodyComputing = ch
+		epoch := s.bodyEpoch
 		s.bodyBytesMu.Unlock()
+		stable := epoch%2 == 0
+		var n int64
+		err := s.DB.QueryRow(`SELECT COALESCE(SUM(LENGTH(text_body) + LENGTH(html_body)), 0) FROM bodies`).Scan(&n)
+		s.bodyBytesMu.Lock()
+		if err == nil && stable && s.bodyEpoch == epoch {
+			s.bodyBytes = n
+			s.bodyBytesOK = true
+		}
+		s.bodyComputing = nil
+		close(ch)
+		s.bodyBytesMu.Unlock()
+		if err != nil {
+			return 0, err
+		}
 		return n, nil
 	}
-	epoch := s.bodyEpoch
-	s.bodyBytesMu.Unlock()
-	stable := epoch%2 == 0
-	var n int64
-	err := s.DB.QueryRow(`SELECT COALESCE(SUM(LENGTH(text_body) + LENGTH(html_body)), 0) FROM bodies`).Scan(&n)
-	if err != nil {
-		return 0, err
-	}
-	s.bodyBytesMu.Lock()
-	if stable && s.bodyEpoch == epoch {
-		s.bodyBytes = n
-		s.bodyBytesOK = true
-	}
-	s.bodyBytesMu.Unlock()
-	return n, nil
 }
 
 func (s *Store) bodyLen(messageID int64) int64 {
@@ -333,7 +349,7 @@ func (s *Store) AccountCacheStats(accountID int64) (AccountCacheStats, error) {
 		return st, err
 	}
 	err = s.DB.QueryRow(`SELECT COUNT(*) FROM messages m JOIN folders f ON f.id = m.folder_id
-		WHERE m.account_id = ? AND f.special_use <> 'junk' AND m.body_state = 1`, accountID).Scan(&st.BodiesCached)
+		WHERE m.account_id = ? AND f.special_use <> 'junk' AND m.body_state IN (1, 2)`, accountID).Scan(&st.BodiesCached)
 	if err != nil {
 		return st, err
 	}

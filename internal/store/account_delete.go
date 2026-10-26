@@ -37,6 +37,10 @@ func (s *Store) DeleteAccount(accountID int64) error {
 		s.endBodyMutation(0)
 		return err
 	}
+	if _, err := s.DB.Exec("DELETE FROM op_client_keys WHERE account_id = ?", accountID); err != nil {
+		s.endBodyMutation(0)
+		return err
+	}
 	if _, err := s.DB.Exec("DELETE FROM accounts WHERE id = ?", accountID); err != nil {
 		s.endBodyMutation(0)
 		return err

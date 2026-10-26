@@ -464,6 +464,12 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	sentDone := false
+	defer func() {
+		if !sentDone {
+			_ = s.rest.eraseEntity("tutanota", "mail", modelVersionTutanota, draftList, draftID)
+		}
+	}()
 	s.cur = nil
 	draft, err := s.rest.getEntity("tutanota", "mail", modelVersionTutanota, draftList, draftID)
 	if err != nil {
@@ -570,6 +576,7 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	sentDone = true
 	if _, el, ok := ret.idTuple("562"); ok {
 		return el, nil
 	}

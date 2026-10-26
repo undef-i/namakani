@@ -131,6 +131,12 @@ func (s *Session) createMessageLocked(r io.Reader) (msg *protonmail.Message, att
 	if err != nil {
 		return nil, nil, nil, "", nil, fmt.Errorf("cannot create draft message: %v", err)
 	}
+	draftDone := false
+	defer func() {
+		if !draftDone {
+			_ = s.c.DeleteMessages([]string{msg.ID})
+		}
+	}()
 
 	attachmentKeys = make(map[string]*packet.EncryptedKey)
 	var bodyBuf *bytes.Buffer
@@ -224,6 +230,7 @@ func (s *Session) createMessageLocked(r io.Reader) (msg *protonmail.Message, att
 		return nil, nil, nil, "", nil, fmt.Errorf("cannot update draft message: %v", err)
 	}
 
+	draftDone = true
 	return msg, attachmentKeys, body, bodyType, privateKey, nil
 }
 
@@ -235,6 +242,12 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	sentDone := false
+	defer func() {
+		if !sentDone {
+			_ = s.c.DeleteMessages([]string{msg.ID})
+		}
+	}()
 
 	recipients := make([]*protonmail.MessageAddress, 0, len(msg.ToList)+len(msg.CCList)+len(msg.BCCList))
 	recipients = append(recipients, msg.ToList...)
@@ -315,6 +328,7 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot send message: %v", err)
 	}
+	sentDone = true
 	s.cur = nil
 	return sent.ID, nil
 }

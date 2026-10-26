@@ -53,7 +53,7 @@ func (c tgConfig) ready() bool {
 
 var tgHTTPClient = &http.Client{Timeout: 12 * time.Second}
 
-func tgCall(token, method string, payload any) (json.RawMessage, error) {
+var tgCall = func(token, method string, payload any) (json.RawMessage, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -297,7 +297,7 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 		BotToken string `json:"bot_token"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad request body")
+		writeErr(w, http.StatusBadRequest, "请求格式不对")
 		return
 	}
 	req.ChatID = strings.TrimSpace(req.ChatID)
@@ -305,21 +305,21 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 
 	if req.BotToken != "" {
 		if s.serverKey == nil {
-			writeErr(w, http.StatusInternalServerError, "server key unavailable, cannot store token")
+			writeErr(w, http.StatusInternalServerError, "服务器密钥不可用，无法保存令牌")
 			return
 		}
 		enc, err := auth.Encrypt(s.serverKey, req.BotToken)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "encrypt token failed")
+			writeErr(w, http.StatusInternalServerError, "令牌加密失败")
 			return
 		}
 		if err := s.st.SetSetting(settingTGTokenEnc, enc); err != nil {
-			writeErr(w, http.StatusInternalServerError, "store token failed")
+			writeErr(w, http.StatusInternalServerError, "保存令牌失败")
 			return
 		}
 	}
 	if err := s.st.SetSetting(settingTGChatID, req.ChatID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "store chat id failed")
+		writeErr(w, http.StatusInternalServerError, "保存聊天编号失败")
 		return
 	}
 	enabled := "0"
@@ -327,7 +327,7 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 		enabled = "1"
 	}
 	if err := s.st.SetSetting(settingTGEnabled, enabled); err != nil {
-		writeErr(w, http.StatusInternalServerError, "store enabled flag failed")
+		writeErr(w, http.StatusInternalServerError, "保存开关失败")
 		return
 	}
 	s.tgReconcile()
@@ -364,7 +364,7 @@ func (s *Server) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tgSendMessage(token, chatID, chatID); err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
+		writeUserErr(w, http.StatusBadGateway, "Telegram 发送失败，请检查 Bot Token 和 Chat ID", err)
 		return
 	}
 	if _, err := tgCall(token, "setChatMenuButton", map[string]any{
@@ -433,6 +433,39 @@ func tgFooterText(it tgItem) any {
 	return []any{rtItalic(it.Snippet), "\n", it.Account}
 }
 
+func (s *Server) tgPushedIDs(ids []int64) map[int64]bool {
+	out := make(map[int64]bool)
+	if len(ids) == 0 {
+		return out
+	}
+	ph := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		ph[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.st.DB.Query(`SELECT message_id FROM tg_pushes WHERE message_id IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		log.Printf("namakani: telegram push ledger lookup failed: %v", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err == nil {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+func (s *Server) tgRecordPush(id int64) {
+	if _, err := s.st.DB.Exec(`INSERT OR IGNORE INTO tg_pushes(message_id, pushed_at) VALUES(?, ?)`,
+		id, time.Now().Unix()); err != nil {
+		log.Printf("namakani: telegram push ledger record failed for message %d: %v", id, err)
+	}
+}
+
 func (s *Server) tgPushOne(cfg tgConfig, it tgItem) {
 	_, err := tgCall(cfg.Token, "sendRichMessage", map[string]any{
 		"chat_id":      cfg.ChatID,
@@ -450,7 +483,37 @@ func (s *Server) tgPushOne(cfg tgConfig, it tgItem) {
 	})
 	if err != nil {
 		log.Printf("namakani: telegram rich push failed: %v", err)
+		return
 	}
+	s.tgRecordPush(it.ID)
+}
+
+func (s *Server) tgArrivedInboxIDs(c syncmgr.Change) map[int64]bool {
+	out := make(map[int64]bool)
+	if len(c.Inserted) == 0 {
+		return out
+	}
+	ph := make([]string, len(c.Inserted))
+	args := make([]any, 0, len(c.Inserted)+1)
+	args = append(args, c.AccountID)
+	for i, id := range c.Inserted {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	rows, err := s.st.DB.Query(`SELECT message_id FROM first_seen WHERE account_id = ? AND folder_special = 'inbox'
+		AND message_id IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		log.Printf("namakani: telegram arrival lookup failed: %v", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err == nil {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 func (s *Server) freshInboxItems(c syncmgr.Change) []tgItem {
@@ -492,12 +555,59 @@ func (s *Server) freshInboxItems(c syncmgr.Change) []tgItem {
 	return items
 }
 
+func (s *Server) arrivalInboxItems(c syncmgr.Change) []tgItem {
+	if len(c.Inserted) == 0 {
+		return nil
+	}
+	arrived := s.tgArrivedInboxIDs(c)
+	if len(arrived) == 0 {
+		return nil
+	}
+	var items []tgItem
+	for _, row := range s.messageRowsByIDs(c.Inserted) {
+		if !arrived[row.ID] {
+			continue
+		}
+		from := row.FromName
+		if from == "" {
+			from = row.FromEmail
+		} else if row.FromEmail != "" {
+			from += " <" + row.FromEmail + ">"
+		}
+		subject := row.Subject
+		if subject == "" {
+			subject = "(无主题)"
+		}
+		items = append(items, tgItem{
+			ID:      row.ID,
+			DateTS:  row.DateTS,
+			Account: row.AccountLabel,
+			From:    from,
+			Subject: subject,
+			Snippet: row.Snippet,
+		})
+	}
+	return items
+}
+
 func (s *Server) tgNotify(c syncmgr.Change) {
 	cfg := s.tgLoadConfig()
 	if !cfg.ready() {
 		return
 	}
-	for _, it := range s.freshInboxItems(c) {
+	items := s.arrivalInboxItems(c)
+	if len(items) == 0 {
+		return
+	}
+	ids := make([]int64, len(items))
+	for i, it := range items {
+		ids[i] = it.ID
+	}
+	pushed := s.tgPushedIDs(ids)
+	for _, it := range items {
+		if pushed[it.ID] {
+			continue
+		}
 		go s.tgPushOne(cfg, it)
 	}
 }
