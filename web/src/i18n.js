@@ -326,6 +326,8 @@ const en = {
   '已保存，留空不改': 'Saved, leave empty to keep',
   '如 123456:ABC-DEF...': 'e.g. 123456:ABC-DEF...',
   '如 123456789': 'e.g. 123456789',
+  公开地址: 'Public address',
+  '如 https://mail.example.com': 'e.g. https://mail.example.com',
   保存: 'Save',
   发送测试消息: 'Send test message',
   浏览器推送: 'Browser push',

@@ -455,7 +455,7 @@ async function confirmDelete() {
 }
 
 
-const tg = ref({ enabled: false, chat_id: '', bot_token: '', has_token: false })
+const tg = ref({ enabled: false, chat_id: '', bot_token: '', has_token: false, public_base: '' })
 const tgStatus = ref('loading')
 const tgMsg = ref('')
 const tgBusy = ref('')
@@ -474,6 +474,7 @@ async function loadTG() {
       chat_id: s.chat_id || '',
       bot_token: '',
       has_token: !!s.has_token,
+      public_base: s.public_base || '',
     }
     tgStatus.value = 'ready'
   } catch (err) {
@@ -489,9 +490,11 @@ async function saveTG() {
       enabled: tg.value.enabled,
       chat_id: tg.value.chat_id,
       bot_token: tg.value.bot_token,
+      public_base: tg.value.public_base,
     })
     tg.value.has_token = !!s.has_token
     tg.value.bot_token = ''
+    tg.value.public_base = s.public_base || ''
     showSnack(t('已保存'))
   } catch (err) {
     showSnack(t('保存失败：{error}', { error: err.message }))
@@ -1261,6 +1264,15 @@ onMounted(() => {
         density="comfortable"
         autocomplete="off"
         :placeholder="t('如 123456789')"
+        class="mb-2"
+      />
+      <v-text-field
+        v-model="tg.public_base"
+        :label="t('公开地址')"
+        variant="filled"
+        density="comfortable"
+        autocomplete="off"
+        :placeholder="t('如 https://mail.example.com')"
         class="mb-2"
       />
       <div class="d-flex align-center ga-2">

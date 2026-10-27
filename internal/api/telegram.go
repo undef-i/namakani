@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -16,16 +17,18 @@ import (
 )
 
 const (
-	settingTGEnabled  = "tg_enabled"
-	settingTGChatID   = "tg_chat_id"
-	settingTGTokenEnc = "tg_token_enc"
+	settingTGEnabled    = "tg_enabled"
+	settingTGChatID     = "tg_chat_id"
+	settingTGTokenEnc   = "tg_token_enc"
+	settingTGPublicBase = "tg_public_base"
 )
 
 type tgConfig struct {
-	Enabled bool
-	ChatID  string
-	Token   string
-	HasTok  bool
+	Enabled    bool
+	ChatID     string
+	Token      string
+	HasTok     bool
+	PublicBase string
 }
 
 func (s *Server) tgLoadConfig() tgConfig {
@@ -44,7 +47,25 @@ func (s *Server) tgLoadConfig() tgConfig {
 			}
 		}
 	}
+	if v, ok, _ := s.st.GetSetting(settingTGPublicBase); ok {
+		cfg.PublicBase = strings.TrimRight(strings.TrimSpace(v), "/")
+	}
 	return cfg
+}
+
+// tgNormalizePublicBase validates a user-entered public base URL and returns
+// its canonical form (no trailing slash). Empty input is allowed and means
+// notifications carry no jump link.
+func tgNormalizePublicBase(v string) (string, bool) {
+	v = strings.TrimRight(strings.TrimSpace(v), "/")
+	if v == "" {
+		return "", true
+	}
+	u, err := url.Parse(v)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", false
+	}
+	return v, true
 }
 
 func (c tgConfig) ready() bool {
@@ -284,17 +305,19 @@ func tgCallCtx(ctx context.Context, token, method string, payload any) (json.Raw
 func (s *Server) handleGetTelegram(w http.ResponseWriter, r *http.Request) {
 	cfg := s.tgLoadConfig()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":   cfg.Enabled,
-		"chat_id":   cfg.ChatID,
-		"has_token": cfg.HasTok,
+		"enabled":     cfg.Enabled,
+		"chat_id":     cfg.ChatID,
+		"has_token":   cfg.HasTok,
+		"public_base": cfg.PublicBase,
 	})
 }
 
 func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Enabled  bool   `json:"enabled"`
-		ChatID   string `json:"chat_id"`
-		BotToken string `json:"bot_token"`
+		Enabled    bool   `json:"enabled"`
+		ChatID     string `json:"chat_id"`
+		BotToken   string `json:"bot_token"`
+		PublicBase string `json:"public_base"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式不对")
@@ -302,6 +325,11 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ChatID = strings.TrimSpace(req.ChatID)
 	req.BotToken = strings.TrimSpace(req.BotToken)
+	publicBase, ok := tgNormalizePublicBase(req.PublicBase)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "公开地址格式不对，应以 http:// 或 https:// 开头，例如 https://mail.example.com")
+		return
+	}
 
 	if req.BotToken != "" {
 		if s.serverKey == nil {
@@ -320,6 +348,10 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.st.SetSetting(settingTGChatID, req.ChatID); err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存聊天编号失败")
+		return
+	}
+	if err := s.st.SetSetting(settingTGPublicBase, publicBase); err != nil {
+		writeErr(w, http.StatusInternalServerError, "保存公开地址失败")
 		return
 	}
 	enabled := "0"
@@ -367,15 +399,17 @@ func (s *Server) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		writeUserErr(w, http.StatusBadGateway, "Telegram 发送失败，请检查 Bot Token 和 Chat ID", err)
 		return
 	}
-	if _, err := tgCall(token, "setChatMenuButton", map[string]any{
-		"chat_id": chatID,
-		"menu_button": map[string]any{
-			"type":    "web_app",
-			"text":    "邮箱",
-			"web_app": map[string]any{"url": tgNamakaniBase},
-		},
-	}); err != nil {
-		log.Printf("tg setChatMenuButton failed: %v", err)
+	if cfg.PublicBase != "" {
+		if _, err := tgCall(token, "setChatMenuButton", map[string]any{
+			"chat_id": chatID,
+			"menu_button": map[string]any{
+				"type":    "web_app",
+				"text":    "邮箱",
+				"web_app": map[string]any{"url": cfg.PublicBase},
+			},
+		}); err != nil {
+			log.Printf("tg setChatMenuButton failed: %v", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -389,10 +423,14 @@ type tgItem struct {
 	Snippet string
 }
 
-const tgNamakaniBase = "https://namakani.example.com"
-
-func tgDeepLink(id int64) string {
-	return fmt.Sprintf("%s/m/%d", tgNamakaniBase, id)
+// tgDeepLink builds the jump link for one message from the configured
+// public base. It returns "" when no public base is configured, in which
+// case notifications carry no jump link.
+func tgDeepLink(base string, id int64) string {
+	if base == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/m/%d", base, id)
 }
 
 func rtBold(s string) any {
@@ -467,20 +505,23 @@ func (s *Server) tgRecordPush(id int64) {
 }
 
 func (s *Server) tgPushOne(cfg tgConfig, it tgItem) {
-	_, err := tgCall(cfg.Token, "sendRichMessage", map[string]any{
+	payload := map[string]any{
 		"chat_id":      cfg.ChatID,
 		"rich_message": map[string]any{"blocks": tgRichBlocks(it)},
-		"reply_markup": map[string]any{
+	}
+	if link := tgDeepLink(cfg.PublicBase, it.ID); link != "" {
+		payload["reply_markup"] = map[string]any{
 			"inline_keyboard": [][]any{
 				{
 					map[string]any{
 						"text":    "打开邮件",
-						"web_app": map[string]any{"url": tgDeepLink(it.ID)},
+						"web_app": map[string]any{"url": link},
 					},
 				},
 			},
-		},
-	})
+		}
+	}
+	_, err := tgCall(cfg.Token, "sendRichMessage", payload)
 	if err != nil {
 		log.Printf("namakani: telegram rich push failed: %v", err)
 		return

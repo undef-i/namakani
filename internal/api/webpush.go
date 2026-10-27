@@ -128,7 +128,7 @@ func (s *Server) wpNotify(c syncmgr.Change) {
 			payload, err := json.Marshal(map[string]any{
 				"title": it.Subject,
 				"body":  it.From,
-				"url":   tgDeepLink(it.ID),
+				"url":   tgDeepLink(s.tgLoadConfig().PublicBase, it.ID),
 				"id":    it.ID,
 			})
 			if err != nil {
@@ -204,10 +204,14 @@ func (s *Server) handleWebPushTest(w http.ResponseWriter, r *http.Request) {
 		writeUserErr(w, http.StatusInternalServerError, "推送密钥不可用", err)
 		return
 	}
+	testURL := "/"
+	if base := s.tgLoadConfig().PublicBase; base != "" {
+		testURL = base + "/"
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"title": "namakani",
 		"body":  "测试推送",
-		"url":   tgNamakaniBase + "/",
+		"url":   testURL,
 	})
 	sent := s.wpSend(pub, priv, subs, payload)
 	writeJSON(w, http.StatusOK, map[string]any{"sent": sent, "subscriptions": len(s.wpSubscriptions())})
