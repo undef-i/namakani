@@ -1130,6 +1130,8 @@ async function bulkAct(kind) {
   const itemById = new Map()
   const gestureKey = api.newClientKey()
   let intent = null
+  let sendGateResolve = null
+  let sendPending = null
   if (removable) {
     const undoItems = rows
       .filter((x) => {
@@ -1143,6 +1145,21 @@ async function bulkAct(kind) {
       ids: ids.filter((id) => id > 0),
       rows: rows.filter((x) => x.id > 0),
       exiting: rows.map((x) => x.id),
+    })
+    const sendGate = new Promise((r) => { sendGateResolve = r })
+    sendPending = { flush: () => sendGateResolve() }
+    swipePendingSends.add(sendPending)
+    const deferredToastFns = []
+    let toastLive = false
+    let toastDead = false
+    const deferOrRun = (fn) => {
+      if (toastLive) fn()
+      else deferredToastFns.push(fn)
+    }
+    void sendGate.then(() => {
+      toastLive = true
+      if (toastDead) return
+      for (const fn of deferredToastFns.splice(0)) fn()
     })
     work = (async () => {
       if (needsExpansion) {
@@ -1177,14 +1194,18 @@ async function bulkAct(kind) {
         touchIntents()
         const have = new Set(rows.map((x) => x.id))
         const restItems = extraItems.filter((x) => !have.has(x.id))
-        if ((enqueuedCount() !== bulkCount0 || restItems.length) && toastShow.value && Date.now() < toastHideAt) {
-          showCountToast(
-            bulkDest,
-            enqueuedCount() - bulkCount0,
-            restItems.length ? { items: restItems, settled: settledMoved, intentIds: [intent.id] } : null,
-          )
-        }
+        deferOrRun(() => {
+          if ((enqueuedCount() !== bulkCount0 || restItems.length) && toastShow.value && Date.now() < toastHideAt) {
+            showCountToast(
+              bulkDest,
+              enqueuedCount() - bulkCount0,
+              restItems.length ? { items: restItems, settled: settledMoved, intentIds: [intent.id] } : null,
+            )
+          }
+        })
       }
+      await sendGate
+      swipePendingSends.delete(sendPending)
       if (listSnap.value.scope === 'scheduled' && (kind === 'delete' || kind === 'archive')) {
         for (const id of opIds) {
           try {
@@ -1250,7 +1271,10 @@ async function bulkAct(kind) {
     clearSelectionIds()
     if (openRemoved) clearSelection()
     const settledMoved = settledFullP
-    showCountToast(bulkDest, bulkCount0, undoItems.length ? { items: undoItems, settled: settledMoved, intentIds: [intent.id], obKeys: [gestureKey] } : null)
+    deferOrRun(() =>
+      showCountToast(bulkDest, bulkCount0, undoItems.length ? { items: undoItems, settled: settledMoved, intentIds: [intent.id], obKeys: [gestureKey] } : null),
+    )
+    work.catch(() => { toastDead = true })
   }
   const flagEntries = []
   const rollbackFlagEntries = (entries) => {
@@ -1330,7 +1354,13 @@ async function bulkAct(kind) {
       })()
     }
     if (removable) {
-      await Promise.all([collapseRows(rows), work.catch((e) => { if (!firstErr) firstErr = e })])
+      const foldDone = collapseRows(rows)
+      void foldDone.then(
+        () => { if (sendGateResolve) sendGateResolve() },
+        () => { if (sendGateResolve) sendGateResolve() },
+      )
+      await Promise.all([foldDone, work.catch((e) => { if (!firstErr) firstErr = e })])
+      if (sendPending) swipePendingSends.delete(sendPending)
       for (const id of ids) exitDoneIntent(intent, id)
       for (const id of ids) clearExitRow(id)
       for (const id of ids) exitNatural.delete(id)
@@ -2105,6 +2135,10 @@ const exitMap = ref(new Map())
 const exitAnim = ref(false)
 const exitShift = ref(new Map())
 const swipeVisualDone = new Map()
+const swipePendingSends = new Set()
+function flushSwipeSends() {
+  for (const p of [...swipePendingSends]) p.flush()
+}
 const toastText = ref('')
 const toastShow = ref(false)
 let toastTimer = 0
@@ -2514,7 +2548,7 @@ async function settleSwipe(m, action) {
   const visualDone = new Promise((r) => { signalVisual = r })
   swipeVisualDone.set(m.id, signalVisual)
   exitShift.value = new Map(exitShift.value).set(m.id, action === 'delete' ? swipeWidth : -swipeWidth)
-  const p = action === 'archive' ? archiveFor(m, true) : action === 'inbox' ? inboxFor(m, true) : deleteFor(m, true)
+  const p = action === 'archive' ? archiveFor(m, true, true) : action === 'inbox' ? inboxFor(m, true, true) : deleteFor(m, true, true)
   p.catch(() => {})
   try {
     await visualDone
@@ -3130,6 +3164,7 @@ function onDrawerPressClick(e) {
 }
 
 function selectScope(key) {
+  flushSwipeSends()
   mobileSearch.value = false
   scope.value = key
   clearSelection()
@@ -3847,7 +3882,7 @@ async function animateRowRemoval(m, intent, abortCheck) {
   return aborted ? 'aborted' : 'done'
 }
 
-async function actOnThread(m, kind, animate = false) {
+async function actOnThread(m, kind, animate = false, deferSend = false) {
   const gesture = threadGestureFor(kind, m.folder_special)
   let settleResolve
   const settledAll = new Promise((res) => { settleResolve = res })
@@ -3860,19 +3895,41 @@ async function actOnThread(m, kind, animate = false) {
     thread: { accountId: m.account_id, threadKey: m.thread_key || 'id:' + m.id, repId: m.id },
   })
   let dest = threadDestFor(kind, m, null)
-  showCountToast(
-    dest,
-    m.thread_count || 1,
-    repUndoable
-      ? {
-          items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }],
-          settled: settledAll,
-          intentIds: [intent.id],
-        }
-      : null,
+  const defer = animate && deferSend
+  let gateResolve = null
+  const sendGate = defer ? new Promise((r) => { gateResolve = r }) : null
+  const pending = defer ? { flush: () => gateResolve() } : null
+  if (pending) swipePendingSends.add(pending)
+  const deferredToastFns = []
+  let toastLive = !defer
+  let toastDead = false
+  const deferOrRun = (fn) => {
+    if (toastLive) fn()
+    else deferredToastFns.push(fn)
+  }
+  deferOrRun(() =>
+    showCountToast(
+      dest,
+      m.thread_count || 1,
+      repUndoable
+        ? {
+            items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }],
+            settled: settledAll,
+            intentIds: [intent.id],
+          }
+        : null,
+    ),
   )
+  if (defer) {
+    void sendGate.then(() => {
+      toastLive = true
+      if (toastDead) return
+      for (const fn of deferredToastFns.splice(0)) fn()
+    })
+  }
   if (animate) {
-    animateRowRemoval(m, intent)
+    const animDone = animateRowRemoval(m, intent)
+    if (defer) void animDone.then(() => gateResolve())
   } else if (selected.value?.id === m.id) {
     clearSelection()
   }
@@ -3881,6 +3938,8 @@ async function actOnThread(m, kind, animate = false) {
     members = await api.getThreadMessagesAll(m.account_id, m.thread_key || 'id:' + m.id)
     journalRows(members)
   } catch (err) {
+    if (pending) swipePendingSends.delete(pending)
+    toastDead = true
     failIntent(intent, [m.id])
     showRemovalFailure(dest, m.thread_count || 1)
     animateRollback([m.id])
@@ -3923,31 +3982,40 @@ async function actOnThread(m, kind, animate = false) {
     undoItems: undoItems.length ? undoItems : null,
     destLabel: dest,
   }
+  if (defer) {
+    await sendGate
+    swipePendingSends.delete(pending)
+  }
   try {
     obAdd(entry)
   } catch (e) {
+    toastDead = true
     failIntent(intent, [m.id])
     showRemovalFailure(dest, m.thread_count || 1)
     animateRollback([m.id])
     settleResolve([])
     return
   }
-  if (
-    (reqs.length !== (m.thread_count || 1) || restItems.length) &&
-    toastShow.value &&
-    Date.now() < toastHideAt &&
-    pendingUndo.value &&
-    (pendingUndo.value.intentIds ?? []).includes(intent.id)
-  ) {
-    showCountToast(
-      dest,
-      reqs.length - (m.thread_count || 1),
-      restItems.length ? { items: restItems, settled: settledAll, intentIds: [intent.id], obKeys: [entry.key] } : null,
-    )
-  }
-  if (pendingUndo.value && (pendingUndo.value.intentIds ?? []).includes(intent.id)) {
-    pendingUndo.value.obKeys = [entry.key]
-  }
+  deferOrRun(() => {
+    if (
+      (reqs.length !== (m.thread_count || 1) || restItems.length) &&
+      toastShow.value &&
+      Date.now() < toastHideAt &&
+      pendingUndo.value &&
+      (pendingUndo.value.intentIds ?? []).includes(intent.id)
+    ) {
+      showCountToast(
+        dest,
+        reqs.length - (m.thread_count || 1),
+        restItems.length ? { items: restItems, settled: settledAll, intentIds: [intent.id], obKeys: [entry.key] } : null,
+      )
+    }
+  })
+  deferOrRun(() => {
+    if (pendingUndo.value && (pendingUndo.value.intentIds ?? []).includes(intent.id)) {
+      pendingUndo.value.obKeys = [entry.key]
+    }
+  })
   const movedFrom = (out) =>
     undoItems
       .filter((x) => out.okIds.has(x.id))
@@ -3978,20 +4046,20 @@ async function actOnThread(m, kind, animate = false) {
   })
 }
 
-async function archiveFor(m, animate = false) {
+async function archiveFor(m, animate = false, deferSend = false) {
   if (!m) return
-  if (m.folder_special === 'trash' || m.folder_special === 'junk') return inboxFor(m, animate)
-  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'archive', animate)
+  if (m.folder_special === 'trash' || m.folder_special === 'junk') return inboxFor(m, animate, deferSend)
+  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'archive', animate, deferSend)
   if (m.folder_special === 'scheduled') return toDraftsFor(m, animate)
-  return moveSingle(m, 'archive', animate)
+  return moveSingle(m, 'archive', animate, deferSend)
 }
 
-function inboxFor(m, animate = false) {
-  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'inbox', animate)
-  return moveSingle(m, 'inbox', animate)
+function inboxFor(m, animate = false, deferSend = false) {
+  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'inbox', animate, deferSend)
+  return moveSingle(m, 'inbox', animate, deferSend)
 }
 
-async function moveSingle(m, dest, animate = false) {
+async function moveSingle(m, dest, animate = false, deferSend = false) {
   const intent = registerHideIntent({
     ids: [m.id],
     rows: [m],
@@ -4012,57 +4080,91 @@ async function moveSingle(m, dest, animate = false) {
     undoItems: undoable ? [{ id: m.id, special: m.folder_special, folder_id: m.folder_id }] : null,
     destLabel: gestureDest,
   }
-  try {
-    obAdd(entry)
-  } catch (e) {
-    dropIntent(intent)
-    actionError.value = t('操作保存失败：{error}', { error: t(e.message) })
-    return
-  }
   let refusedOut = null
   let animRunning = animate
+  let rolledBack = false
   const doRollback = () => {
+    if (rolledBack) return
+    rolledBack = true
     failIntent(intent, [m.id])
     showRemovalFailure(gestureDest, 1)
   }
-  const ctrl = obDrive(entry, {
-    onOk: (out) => {
-      noteIntentOps(intent, out.items)
-      confirmIntent(intent)
-    },
-    onRefused: (out) => {
-      refusedOut = out
-      if (!animRunning) {
+  let ctrl = null
+  let sendFailed = false
+  const send = () => {
+    if (ctrl) return true
+    if (sendFailed) return false
+    try {
+      obAdd(entry)
+    } catch (e) {
+      sendFailed = true
+      dropIntent(intent)
+      actionError.value = t('操作保存失败：{error}', { error: t(e.message) })
+      return false
+    }
+    ctrl = obDrive(entry, {
+      onOk: (out) => {
+        noteIntentOps(intent, out.items)
+        confirmIntent(intent)
+      },
+      onRefused: (out) => {
+        refusedOut = out
+        if (!animRunning) {
+          doRollback()
+          animateRollback([m.id])
+        }
+      },
+    })
+    return true
+  }
+  const emitToast = () =>
+    showCountToast(
+      gestureDest,
+      1,
+      undoable
+        ? {
+            items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }],
+            settled: ctrl.undoPromise,
+            intentIds: [intent.id],
+            obKeys: [entry.key],
+          }
+        : null,
+    )
+  if (!(animate && deferSend)) {
+    if (!send()) return
+    emitToast()
+    if (animate) {
+      const r = await animateRowRemoval(m, intent, () => !!refusedOut)
+      animRunning = false
+      if (r === 'aborted') {
+        if (refusedOut) doRollback()
+        return
+      }
+      if (refusedOut) {
         doRollback()
         animateRollback([m.id])
       }
-    },
-  })
-  showCountToast(
-    gestureDest,
-    1,
-    undoable
-      ? {
-          items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }],
-          settled: ctrl.undoPromise,
-          intentIds: [intent.id],
-          obKeys: [entry.key],
-        }
-      : null,
-  )
-  if (animate) {
-    const r = await animateRowRemoval(m, intent, () => !!refusedOut)
-    animRunning = false
-    if (r === 'aborted') {
-      if (refusedOut) doRollback()
-      return
+    } else {
+      afterRemovalLocal(m.id)
     }
+    return
+  }
+  const pending = {
+    flush: () => {
+      if (send()) emitToast()
+    },
+  }
+  swipePendingSends.add(pending)
+  await animateRowRemoval(m, intent)
+  animRunning = false
+  swipePendingSends.delete(pending)
+  if (ctrl) {
     if (refusedOut) {
       doRollback()
       animateRollback([m.id])
     }
-  } else {
-    afterRemovalLocal(m.id)
+  } else if (send()) {
+    emitToast()
   }
 }
 
@@ -4107,9 +4209,9 @@ function toDraftsFor(m, animate = false) {
   return scheduledRowAction(m, animate, false)
 }
 
-async function deleteFor(m, animate = false) {
+async function deleteFor(m, animate = false, deferSend = false) {
   if (!m) return
-  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'delete', animate)
+  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'delete', animate, deferSend)
   if (m.folder_special === 'scheduled') return scheduledRowAction(m, animate, true)
   const intent = registerHideIntent({
     ids: [m.id],
@@ -4127,57 +4229,91 @@ async function deleteFor(m, animate = false) {
     undoItems: undoable ? [{ id: m.id, special: m.folder_special, folder_id: m.folder_id }] : null,
     destLabel: gestureDest,
   }
-  try {
-    obAdd(entry)
-  } catch (e) {
-    dropIntent(intent)
-    actionError.value = t('操作保存失败：{error}', { error: t(e.message) })
-    return
-  }
   let refusedOut = null
   let animRunning = animate
+  let rolledBack = false
   const doRollback = () => {
+    if (rolledBack) return
+    rolledBack = true
     failIntent(intent, [m.id])
     showRemovalFailure(gestureDest, 1)
   }
-  const ctrl = obDrive(entry, {
-    onOk: (out) => {
-      noteIntentOps(intent, out.items)
-      confirmIntent(intent)
-    },
-    onRefused: (out) => {
-      refusedOut = out
-      if (!animRunning) {
+  let ctrl = null
+  let sendFailed = false
+  const send = () => {
+    if (ctrl) return true
+    if (sendFailed) return false
+    try {
+      obAdd(entry)
+    } catch (e) {
+      sendFailed = true
+      dropIntent(intent)
+      actionError.value = t('操作保存失败：{error}', { error: t(e.message) })
+      return false
+    }
+    ctrl = obDrive(entry, {
+      onOk: (out) => {
+        noteIntentOps(intent, out.items)
+        confirmIntent(intent)
+      },
+      onRefused: (out) => {
+        refusedOut = out
+        if (!animRunning) {
+          doRollback()
+          animateRollback([m.id])
+        }
+      },
+    })
+    return true
+  }
+  const emitToast = () =>
+    showCountToast(
+      gestureDest,
+      1,
+      undoable
+        ? {
+            items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }],
+            settled: ctrl.undoPromise,
+            intentIds: [intent.id],
+            obKeys: [entry.key],
+          }
+        : null,
+    )
+  if (!(animate && deferSend)) {
+    if (!send()) return
+    emitToast()
+    if (animate) {
+      const r = await animateRowRemoval(m, intent, () => !!refusedOut)
+      animRunning = false
+      if (r === 'aborted') {
+        if (refusedOut) doRollback()
+        return
+      }
+      if (refusedOut) {
         doRollback()
         animateRollback([m.id])
       }
-    },
-  })
-  showCountToast(
-    gestureDest,
-    1,
-    undoable
-      ? {
-          items: [{ id: m.id, special: m.folder_special, folder_id: m.folder_id, row: m }],
-          settled: ctrl.undoPromise,
-          intentIds: [intent.id],
-          obKeys: [entry.key],
-        }
-      : null,
-  )
-  if (animate) {
-    const r = await animateRowRemoval(m, intent, () => !!refusedOut)
-    animRunning = false
-    if (r === 'aborted') {
-      if (refusedOut) doRollback()
-      return
+    } else {
+      afterRemovalLocal(m.id)
     }
+    return
+  }
+  const pending = {
+    flush: () => {
+      if (send()) emitToast()
+    },
+  }
+  swipePendingSends.add(pending)
+  await animateRowRemoval(m, intent)
+  animRunning = false
+  swipePendingSends.delete(pending)
+  if (ctrl) {
     if (refusedOut) {
       doRollback()
       animateRollback([m.id])
     }
-  } else {
-    afterRemovalLocal(m.id)
+  } else if (send()) {
+    emitToast()
   }
 }
 
@@ -4501,6 +4637,8 @@ function onOnlineChange() {
 
 onMounted(() => {
   window.addEventListener('hashchange', onHashChange)
+  window.addEventListener('pagehide', flushSwipeSends)
+  window.addEventListener('beforeunload', flushSwipeSends)
   document.addEventListener('visibilitychange', onVisibility)
   window.addEventListener('keydown', onGlobalKey)
   window.addEventListener('online', onOnlineChange)
@@ -5308,12 +5446,12 @@ onBeforeUnmount(() => {
                   variant="text"
                   size="small"
                  
-                  @click="archiveFor(selected, true)"
+                  @click="archiveFor(selected, true, true)"
                 >
                   <v-icon :icon="(selected.folder_special === 'trash' || selected.folder_special === 'junk') ? 'mdi-inbox' : 'mdi-archive'" />
                   <v-tooltip activator="parent" location="bottom">{{ selected.folder_special === 'junk' ? t('不是垃圾邮件') : selected.folder_special === 'trash' ? t('移回收件箱') : t('归档') }}</v-tooltip>
                 </v-btn>
-                <v-btn icon variant="text" size="small" @click="deleteFor(selected, true)">
+                <v-btn icon variant="text" size="small" @click="deleteFor(selected, true, true)">
                   <v-icon icon="mdi-delete" />
                   <v-tooltip activator="parent" location="bottom">
                     {{ scope === 'trash' || scope === 'junk' ? t('彻底删除') : t('删除') }}
@@ -5435,12 +5573,12 @@ onBeforeUnmount(() => {
                   icon
                   variant="text"
                  
-                  @click="archiveFor(selected, true)"
+                  @click="archiveFor(selected, true, true)"
                 >
                   <v-icon :icon="(selected.folder_special === 'trash' || selected.folder_special === 'junk') ? 'mdi-inbox' : 'mdi-archive'" />
                   <v-tooltip activator="parent" location="bottom">{{ selected.folder_special === 'junk' ? t('不是垃圾邮件') : selected.folder_special === 'trash' ? t('移回收件箱') : t('归档') }}</v-tooltip>
                 </v-btn>
-                <v-btn icon variant="text" @click="deleteFor(selected, true)">
+                <v-btn icon variant="text" @click="deleteFor(selected, true, true)">
                   <v-icon icon="mdi-delete" />
                   <v-tooltip activator="parent" location="bottom">
                     {{ scope === 'trash' || scope === 'junk' ? t('彻底删除') : t('删除') }}
