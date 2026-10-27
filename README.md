@@ -1,6 +1,6 @@
 # Namakani
 
-把多个邮箱聚合到一起读写的网页邮箱客户端，IMAP、Proton、Tuta 原生接入。Go 单二进制，数据存本地。
+把多个邮箱聚合到一起读写的网页邮箱客户端。支持 IMAP、SMTP 协议，支持 Proton、Tuta 邮箱。
 
 ## 构建与运行
 
