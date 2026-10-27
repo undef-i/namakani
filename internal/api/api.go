@@ -222,9 +222,6 @@ func (s *Server) sessionToken(r *http.Request) string {
 	return c.Value
 }
 
-// recoverKey is the single cold-recovery path shared by session cookies and
-// access tokens: it unwraps a credential key sealed under the server key,
-// caches it under cacheID, and starts every sync worker.
 func (s *Server) recoverKey(cacheID, wrapped string) ([]byte, bool) {
 	if s.serverKey == nil || wrapped == "" {
 		return nil, false
@@ -273,9 +270,6 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
-// bearerKey authenticates a development access token. The token row is the
-// only authority: it is re-read on every request, so revoking (deleting)
-// the row makes the very next request fail, exactly like a deleted session.
 func (s *Server) bearerKey(r *http.Request) ([]byte, bool) {
 	token := bearerToken(r)
 	if token == "" {
@@ -481,8 +475,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	token := s.sessionToken(r)
 	if token == "" {
-		// Authenticated by an access token, which has no session to end;
-		// revoking the token is its only off switch.
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
@@ -2689,16 +2681,6 @@ type searchHit struct {
 	threadKey string
 }
 
-// searchPage finds one page of search results in final display order
-// (date_ts desc, id desc) with the copies of one logical message collapsed to
-// a single representative: the copy in a non-'all' folder wins, then the
-// smallest id. Candidates arrive in that final order (FTS matches stream over
-// idx_messages_date; short terms are collected by a sequential scan and
-// sorted) and copies collapse as each date bucket closes (copies share
-// date_ts), so a window over the whole match set is never materialised and
-// the page is fixed before any display field or thread count is computed.
-// Copies under an active expunge op are excluded before the collapse,
-// exactly as the previous window query did.
 func (s *Server) searchPage(q string, limit, offset int) ([]searchHit, error) {
 	db := s.st.DB
 	special := map[int64]string{}
@@ -2782,8 +2764,6 @@ func (s *Server) searchPage(q string, limit, offset int) ([]searchHit, error) {
 		bucket = map[groupKey]candidate{}
 		return false
 	}
-	// consume folds one row, delivered in (date_ts desc, id desc) order, into
-	// the current date bucket; it reports whether the page is complete.
 	consume := func(r scanRow) bool {
 		if expunging[r.id] {
 			return false
@@ -2814,11 +2794,6 @@ func (s *Server) searchPage(q string, limit, offset int) ([]searchHit, error) {
 	}
 
 	if short {
-		// Short terms cannot use the FTS index, so their candidates come from
-		// a sequential scan, the same scan the previous query paid; walking
-		// the date index instead would fetch table rows in random order for a
-		// page that often cannot be filled. Matches are sorted here and folded
-		// through the same bucket collapse as the FTS stream.
 		conds := make([]string, 0, len(terms))
 		args := make([]any, 0, len(terms)*4)
 		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
@@ -2882,8 +2857,6 @@ func (s *Server) searchPage(q string, limit, offset int) ([]searchHit, error) {
 	return out, nil
 }
 
-// searchDetails loads the display rows for one page found by searchPage and
-// attaches each row's thread count, preserving the page order.
 func (s *Server) searchDetails(page []searchHit) ([]threadOut, error) {
 	args := make([]any, 0, len(page))
 	marks := make([]string, 0, len(page))
@@ -2935,10 +2908,6 @@ func (s *Server) searchDetails(page []searchHit) ([]threadOut, error) {
 	return out, nil
 }
 
-// searchThreadCounts computes the thread count of every row on one page in a
-// single grouped query. The count of a thread is its number of distinct
-// (message_id, date_ts) copies with copies under an active expunge op
-// excluded, the same definition the previous per-row subquery used.
 func (s *Server) searchThreadCounts(page []searchHit) (map[int64]int, error) {
 	counts := map[int64]int{}
 	type pair struct {

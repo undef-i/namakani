@@ -163,8 +163,6 @@ func (s *Session) currentLocked() (*folderCache, error) {
 	return s.cur, nil
 }
 
-// drop removes one message from the cached listing, updating every index
-// together so the selection stays valid for the next operation.
 func (fc *folderCache) drop(id string) {
 	uid, ok := fc.uidByID[id]
 	if !ok {
@@ -530,8 +528,6 @@ func (s *Session) AppendMessage(folder string, raw []byte, flags ...imap.Flag) (
 	if err != nil {
 		return 0, err
 	}
-	// The target listing is stale by the new message; the current selection
-	// is not: appending removed nothing from any view, so s.cur stays.
 	delete(s.folders, folder)
 	return uid, nil
 }

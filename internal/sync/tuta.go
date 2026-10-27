@@ -142,6 +142,7 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account, releaseIni
 		case err := <-terminal:
 			return err
 		case <-sweep.C:
+			sess.InvalidateCaches()
 			runSync()
 		case <-events:
 			if debounce != nil {

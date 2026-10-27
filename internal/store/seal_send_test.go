@@ -5,12 +5,6 @@ import (
 	"time"
 )
 
-// The send executor must cross exactly one atomic gate between "an undo
-// can still win" and "the provider call may start": SealSendForDelivery.
-// It rotates the claim token in the same statement that checks
-// undo_requested, so an undo serialized before the seal always wins and
-// an undo serialized after it can never be honored by mistake.
-
 func claimSendForSeal(t *testing.T, st *Store) *Op {
 	t.Helper()
 	opID, err := st.EnqueueSend(1, `{}`, 0, "")

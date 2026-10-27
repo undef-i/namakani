@@ -5,18 +5,6 @@ import (
 	"errors"
 )
 
-// An op's binding to its message is the message's durable identity, never a
-// local row id. The row id stored on the op is a cache coordinate refreshed
-// by resolution; folder wipes and rebuilds replace rows freely without ever
-// touching an op. Identity forms, strongest first:
-//
-//	p:<provider id>  Proton/Tuta server-side message id
-//	m:<message-id>   RFC Message-ID header
-//	f:<fingerprint>  envelope fingerprint (same value first_seen uses)
-//
-// Send ops carry no identity: their object is the payload itself, not a
-// pre-existing message.
-
 type idQuerier interface {
 	QueryRow(query string, args ...any) *sql.Row
 	Query(query string, args ...any) (*sql.Rows, error)
@@ -60,7 +48,6 @@ func identityForRow(q idQuerier, accountID, rowID int64) (string, error) {
 	return "f:" + envelopeFingerprint(fromJ, toJ, ccJ, subject, dateTS, size), nil
 }
 
-// IdentityForRow returns the durable identity of one message row.
 func (s *Store) IdentityForRow(accountID, rowID int64) (string, error) {
 	return identityForRow(s.DB, accountID, rowID)
 }
@@ -69,8 +56,6 @@ func identityForRowTx(tx *sql.Tx, accountID, rowID int64) (string, error) {
 	return identityForRow(tx, accountID, rowID)
 }
 
-// ResolvedTarget is one message incarnation resolved from an identity: the
-// current row plus its folder/uid route.
 type ResolvedTarget struct {
 	RowID      int64
 	FolderID   int64
@@ -104,10 +89,6 @@ func candidateRows(q idQuerier, accountID int64, identity string) ([]int64, erro
 		if err != nil {
 			return nil, err
 		}
-		// The mapping rows must be fully read and closed before the
-		// per-mapping message lookups run: while a Rows is open it holds
-		// the querier's connection, and a nested query on the same pool
-		// would wait for that connection forever.
 		type mapping struct {
 			fname string
 			uid   int64
@@ -175,13 +156,6 @@ func candidateRows(q idQuerier, accountID int64, identity string) ([]int64, erro
 	return nil, nil
 }
 
-// ResolveIdentityRow maps a durable identity to its current incarnation.
-// Disambiguation among several live incarnations of one identity (label
-// mirrors, cross-folder copies) is deterministic and never a guess: the
-// hinted row wins when it sits in the anchor folder, a single incarnation in
-// the anchor folder wins next, then the hinted row wherever it now lives,
-// then a sole incarnation. Anything else is unresolved: the caller treats
-// the target as gone rather than acting on a possibly wrong copy.
 func (s *Store) ResolveIdentityRow(accountID int64, identity string, anchorFolderID, hintRowID int64) (ResolvedTarget, bool, error) {
 	return resolveIdentityRow(s.DB, accountID, identity, anchorFolderID, hintRowID)
 }
@@ -190,11 +164,6 @@ func resolveIdentityRow(q idQuerier, accountID int64, identity string, anchorFol
 	return resolveIdentityRowMode(q, accountID, identity, anchorFolderID, hintRowID, false)
 }
 
-// resolveIdentityRowMode resolves an identity to its current incarnation.
-// With moveSource set, a real row counts only inside the anchor folder: a
-// move's source is the incarnation the user acted on, and a same-identity
-// copy already sitting in the destination is a twin for the completion
-// step to claim, never the thing to move.
 func resolveIdentityRowMode(q idQuerier, accountID int64, identity string, anchorFolderID, hintRowID int64, moveSource bool) (ResolvedTarget, bool, error) {
 	if identity == "" {
 		return ResolvedTarget{}, false, nil
@@ -206,13 +175,6 @@ func resolveIdentityRowMode(q idQuerier, accountID int64, identity string, ancho
 	if len(cands) == 0 {
 		return ResolvedTarget{}, false, nil
 	}
-	// Real rows are incarnations; provisional rows are optimistic
-	// projections written by a live move op and only a last resort. A
-	// provisional row's server route is its creator op's prior snapshot,
-	// valid only while that route is still free or still holds this
-	// identity: a stranger sitting on the route means the message's
-	// incarnation is gone, and a same-identity row there is itself the
-	// incarnation (the projection is then redundant).
 	var reals, provs []ResolvedTarget
 	for _, id := range cands {
 		t, err := targetForRow(q, accountID, id)
@@ -284,15 +246,10 @@ func isLiveOpStatus(status string) bool {
 	return status == OpPending || status == OpInFlight || status == OpNeedsAttention
 }
 
-// ResolveOpTarget resolves an op's identity to the message's current
-// incarnation and refreshes the op's cached row coordinate when it moved.
 func (s *Store) ResolveOpTarget(o *Op) (ResolvedTarget, bool, error) {
 	return s.resolveOpTargetMode(o, false)
 }
 
-// ResolveMoveSource resolves a move op's source incarnation: a real row
-// inside the folder the user acted from, or the op's own provisional
-// projection unwrapped to its server route.
 func (s *Store) ResolveMoveSource(o *Op) (ResolvedTarget, bool, error) {
 	return s.resolveOpTargetMode(o, true)
 }
@@ -310,9 +267,6 @@ func (s *Store) resolveOpTargetMode(o *Op, moveSource bool) (ResolvedTarget, boo
 	return t, true, nil
 }
 
-// RefreshOpHints re-resolves every live message-bound op of the account,
-// refreshing cached row coordinates. It never changes an op's status: only
-// execution pronounces a target gone.
 func (s *Store) RefreshOpHints(accountID int64) (int, error) {
 	rows, err := s.DB.Query(`SELECT `+opColumns+` FROM ops WHERE account_id = ? AND identity <> ''
 		AND status IN ('pending', 'in_flight', 'needs_attention')`, accountID)
@@ -345,8 +299,6 @@ func (s *Store) RefreshOpHints(accountID int64) (int, error) {
 	return changed, nil
 }
 
-// RecomputeFolderUnread rewrites a folder's unread counter from the current
-// rows, honouring live expunge ops through their (refreshed) row coordinates.
 func (s *Store) RecomputeFolderUnread(folderID int64) error {
 	_, err := s.DB.Exec(`UPDATE folders SET unread =
 		(SELECT COUNT(*) FROM messages m WHERE m.folder_id = ? AND (m.flags & 1) = 0
@@ -356,8 +308,6 @@ func (s *Store) RecomputeFolderUnread(folderID int64) error {
 	return err
 }
 
-// HasActiveOpForRow reports whether a live op of the given type binds the
-// message this row incarnates, by row coordinate or by identity.
 func (s *Store) HasActiveOpForRow(rowID int64, typ string) (bool, error) {
 	var accountID int64
 	if err := s.DB.QueryRow("SELECT account_id FROM messages WHERE id = ?", rowID).Scan(&accountID); err != nil {

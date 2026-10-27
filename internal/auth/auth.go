@@ -46,10 +46,6 @@ func SetupMaster(st *store.Store, password string) error {
 	if err := st.SetSetting("master_verifier", base64.StdEncoding.EncodeToString(verifier)); err != nil {
 		return err
 	}
-	// Every existing session wraps the master key of the password it
-	// was minted under; a (re)set of the password makes them all
-	// undecryptable, so they are revoked outright. At first-time setup
-	// there are no sessions and this is a no-op.
 	_, err := DeleteAllSessions(st)
 	return err
 }
@@ -120,12 +116,6 @@ func SessionInfo(st *store.Store, token string) (wrapped string, expiresAt int64
 	return wrapped, expiresAt, true, nil
 }
 
-// TouchSession applies the sliding renewal, bounded by an absolute
-// cap: a session never lives past created_at + SessionTTL, where
-// created_at is the first-login anchor recorded by NewSession (the
-// column has existed since the sessions table was introduced). The
-// renewal value is min(now+TTL, created_at+TTL); a legacy expiry
-// already beyond the cap is clamped back down to it.
 func TouchSession(st *store.Store, token string) error {
 	now := time.Now()
 	ttl := int64(SessionTTL / time.Second)
@@ -156,8 +146,6 @@ func LoadOrCreateServerKey(path string) ([]byte, error) {
 	return key, nil
 }
 
-// AccessToken is one development access-token row as shown to its owner.
-// The plaintext token is never stored; only its sha256 (tokenHash) is kept.
 type AccessToken struct {
 	ID         int64
 	Label      string
@@ -195,8 +183,6 @@ func AccessTokenInfo(st *store.Store, token string) (id int64, wrapped string, e
 	return id, wrapped, true, nil
 }
 
-// TouchAccessToken stamps last_used_at, throttled to one write per 30s per
-// token so a chatty client does not turn every request into a DB write.
 func TouchAccessToken(st *store.Store, id int64) error {
 	now := time.Now()
 	_, err := st.DB.Exec("UPDATE access_tokens SET last_used_at = ? WHERE id = ? AND last_used_at < ?",
@@ -241,9 +227,6 @@ func DeleteSession(st *store.Store, token string) error {
 	return err
 }
 
-// DeleteAllSessions revokes every session row, including the
-// caller's own. Access tokens live in a separate table and are not
-// affected.
 func DeleteAllSessions(st *store.Store) (int64, error) {
 	res, err := st.DB.Exec("DELETE FROM sessions")
 	if err != nil {

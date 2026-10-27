@@ -12,21 +12,6 @@ import (
 	"namakani/internal/store"
 )
 
-// D4: the scheduled view folded in_flight sends into "pending" and
-// its cancel path ran CancelOp directly, which refuses in_flight ops
-// outright — so cancelling a send that was claimed but not yet sealed
-// (a window that can last the whole prep of a bulk wave) always hit a
-// 409 even though the state machine could still honor the cancel
-// through the undo path. These tests pin the honest shapes: real
-// status out, cancel routed by state, sealed answered terminally.
-
-// claimSendOp claims the send op the way production does: register a
-// wave for the account first (drainAccount's registerWave), then claim
-// and stamp the claims with the wave's token (stampClaims). The wave
-// stays registered for the rest of the test, so the claim is a live
-// wave's claim. A bare claim with no registered wave is an orphan by
-// definition, and any background drain or watchdog pass may legally
-// release it back to pending mid-test.
 func (f *drainFixture) claimSendOp(t *testing.T, opID int64) *store.Op {
 	t.Helper()
 	var wave *drainWave
@@ -99,8 +84,6 @@ func TestCancelScheduledInFlightUnsealedDefersAndReturnsDraft(t *testing.T) {
 	if o.Status != store.OpInFlight || !o.UndoRequested {
 		t.Fatalf("op after the deferred cancel = (status %q, undo_requested %v), want in_flight with the undo flag set for the checkpoint", o.Status, o.UndoRequested)
 	}
-	// The executor reaches the checkpoint: the undo wins, the letter
-	// returns to Drafts, nothing is delivered.
 	if !f.srv.executeSend(f.srv.keys["tok"], claimed) {
 		t.Fatal("executeSend did not land the deferred cancel")
 	}

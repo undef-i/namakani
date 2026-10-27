@@ -139,15 +139,22 @@ type tutaFolder struct {
 }
 
 var systemFolderNames = map[string]struct{ name, special string }{
-	"1": {"Inbox", "inbox"},
-	"2": {"Sent", "sent"},
-	"3": {"Trash", "trash"},
-	"4": {"Archive", "archive"},
-	"5": {"Spam", "junk"},
-	"6": {"Drafts", "drafts"},
+	"1":  {"Inbox", "inbox"},
+	"2":  {"Sent", "sent"},
+	"3":  {"Trash", "trash"},
+	"4":  {"Archive", "archive"},
+	"5":  {"Spam", "junk"},
+	"6":  {"Drafts", "drafts"},
+	"10": {"Scheduled", ""},
 }
 
 func (s *Session) listFolders() ([]tutaFolder, error) {
+	s.evMu.Lock()
+	stale := s.foldersStale
+	s.evMu.Unlock()
+	if s.folders != nil && !stale {
+		return s.folders, nil
+	}
 	var out []tutaFolder
 	for _, groupID := range s.mailGroups {
 		root, err := s.rest.getEntity("tutanota", "mailboxgrouproot", modelVersionTutanota, groupID)
@@ -179,7 +186,7 @@ func (s *Session) listFolders() ([]tutaFolder, error) {
 				return nil, err
 			}
 			kind := set.str("436")
-			if kind == "7" {
+			if kind == "7" || kind == "8" {
 				continue
 			}
 			f := tutaFolder{
@@ -201,6 +208,10 @@ func (s *Session) listFolders() ([]tutaFolder, error) {
 			out = append(out, f)
 		}
 	}
+	s.folders = out
+	s.evMu.Lock()
+	s.foldersStale = false
+	s.evMu.Unlock()
 	return out, nil
 }
 
@@ -246,7 +257,6 @@ type mailMeta struct {
 	cc         []mail.Addr
 	date       time.Time
 	unread     bool
-	pinned     bool
 	confid     bool
 	messageID  string
 	references []string
@@ -293,9 +303,6 @@ func (m *mailMeta) toMsg(uid uint32, folderKind string) mail.Msg {
 	msg.Cc = m.cc
 	if !m.unread {
 		msg.Flags |= mail.FlagSeen
-	}
-	if m.pinned {
-		msg.Flags |= mail.FlagFlagged
 	}
 	if folderKind == "6" {
 		msg.Flags |= mail.FlagDraft

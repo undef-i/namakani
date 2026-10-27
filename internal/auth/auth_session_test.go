@@ -38,8 +38,6 @@ func backdateSession(t *testing.T, st *store.Store, token string, createdAt, exp
 	}
 }
 
-// Sliding renewal must never push a session past first-login + SessionTTL,
-// and a legacy expiry already past that cap is clamped down on touch.
 func TestTouchSessionAbsoluteCap(t *testing.T) {
 	st := openTestStore(t)
 	ttl := int64(SessionTTL / time.Second)
@@ -70,9 +68,6 @@ func TestTouchSessionAbsoluteCap(t *testing.T) {
 		t.Fatalf("over-cap legacy expiry = %d, want clamped to %d", got, want)
 	}
 }
-
-// A session still inside the renewal threshold (remaining life above
-// SessionTTL-24h, i.e. touched within its first day) is not rewritten.
 
 func TestDeleteAllSessionsKeepsAccessTokens(t *testing.T) {
 	st := openTestStore(t)
@@ -108,8 +103,6 @@ func TestDeleteAllSessionsKeepsAccessTokens(t *testing.T) {
 	}
 }
 
-// (Re)setting the master password invalidates every session: their
-// wrapped keys belong to the old key and can never be used again.
 func TestSetupMasterRevokesSessions(t *testing.T) {
 	st := openTestStore(t)
 	if err := SetupMaster(st, "first-password-1"); err != nil {

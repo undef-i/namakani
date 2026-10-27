@@ -10,7 +10,7 @@ const isUserCopy = computed(() => !summary.value && /[\u4e00-\u9fff]/.test(props
 </script>
 
 <template>
-  <span v-if="isUserCopy">{{ text }}</span>
+  <span v-if="isUserCopy">{{ t(text) }}</span>
   <span v-else-if="full">
     <span v-if="summary">{{ t(summary) }}</span>
     <span v-else>{{ t('执行失败') }}</span>

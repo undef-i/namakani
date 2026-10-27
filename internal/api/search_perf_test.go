@@ -18,10 +18,6 @@ import (
 	syncmgr "namakani/internal/sync"
 )
 
-// This file carries the search performance corpus, the verbatim pre-optimisation
-// query as a reference oracle, and the equivalence checks between the live
-// handler and that oracle. The oracle is test-only: production code never calls it.
-
 type searchCorpusFixture struct {
 	srv *Server
 	st  *store.Store
@@ -54,11 +50,6 @@ var searchVocab = []string{
 	"digest", "account", "service", "notice", "confirm", "delivery",
 }
 
-// seedSearchCorpus inserts `logical` logical messages (plus an All Mail copy
-// for ~30% of them) with deterministic content: "the" in ~65% of bodies,
-// "invoice" in ~10%, "xylophone" in exactly 5, a two-rune Chinese term in the
-// subjects of 40, thread groups of three-plus on a slice, and active expunge
-// ops against some copies and thread members.
 func seedSearchCorpus(t testing.TB, f *searchCorpusFixture, logical int) (rows int) {
 	t.Helper()
 	rng := rand.New(rand.NewSource(42))
@@ -175,8 +166,6 @@ func seedSearchCorpus(t testing.TB, f *searchCorpusFixture, logical int) (rows i
 	return rows
 }
 
-// ---------- reference oracle: the pre-optimisation query, verbatim ----------
-
 const refPickedWindow = `SELECT mm.id, ROW_NUMBER() OVER (PARTITION BY mm.account_id,
 		CASE WHEN mm.message_id = '' THEN 'id:' || mm.id ELSE mm.message_id END, mm.date_ts
 		ORDER BY CASE WHEN ff.special_use = 'all' THEN 1 ELSE 0 END, mm.id) AS rn FROM `
@@ -249,8 +238,6 @@ func referenceSearch(db *sql.DB, q string, limit, offset int) ([]searchRefRow, e
 	}
 	return out, rows.Err()
 }
-
-// ---------- streaming page finder (prototype of the optimised algorithm) ----------
 
 type searchPageRow struct {
 	ID        int64
@@ -431,7 +418,6 @@ func streamSQL(q string) (string, []any) {
 		[]any{store.BuildFTSQuery(q)}
 }
 
-// streamSearchCounts batches the per-thread counts for one page of rows.
 func streamSearchCounts(db *sql.DB, page []searchPageRow) (map[int64]int, error) {
 	counts := map[int64]int{}
 	type pair struct {
@@ -510,8 +496,6 @@ func explainPlan(db *sql.DB, query string, args ...any) (string, error) {
 	return b.String(), rows.Err()
 }
 
-// ---------- handler + comparison helpers ----------
-
 func (f *searchCorpusFixture) searchViaHandler(t testing.TB, q string, limit, offset int) []searchRefRow {
 	t.Helper()
 	v := url.Values{"q": {q}, "limit": {fmt.Sprint(limit)}, "offset": {fmt.Sprint(offset)}}
@@ -560,8 +544,6 @@ func requireSameRows(t testing.TB, what string, want, got []searchRefRow) {
 	}
 }
 
-// ---------- equivalence: small nasty corpus ----------
-
 func TestSearchStreamMatchesReferenceSmall(t *testing.T) {
 	f := newSearchCorpusFixture(t)
 	seedSearchCorpus(t, f, 140)
@@ -608,8 +590,6 @@ func TestSearchStreamMatchesReferenceSmall(t *testing.T) {
 	}
 }
 
-// ---------- equivalence + timings at production scale ----------
-
 func TestSearchStreamMatchesReferenceAtScale(t *testing.T) {
 	if testing.Short() {
 		t.Skip("scale corpus skipped in -short mode")
@@ -653,8 +633,6 @@ func TestSearchStreamMatchesReferenceAtScale(t *testing.T) {
 		}
 		t.Logf("q=%q over %d pages: reference %v, stream %v", q, len(pages), refTotal, streamTotal)
 	}
-	// The live handler must agree with the oracle at scale too, not only the
-	// prototype: spot-check the first, a deep, and a ragged page per query.
 	for _, q := range []string{"the", "invoice", "xylophone", "发票", "the invoice"} {
 		for _, p := range []pageSpec{{60, 0}, {60, 600}, {7, 70}, {200, 0}} {
 			want, err := referenceSearch(f.st.DB, q, p.limit, p.offset)
@@ -666,8 +644,6 @@ func TestSearchStreamMatchesReferenceAtScale(t *testing.T) {
 		}
 	}
 }
-
-// ---------- benchmarks ----------
 
 func benchSearchFixture(b *testing.B) *searchCorpusFixture {
 	b.Helper()

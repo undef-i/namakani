@@ -13,8 +13,6 @@ import (
 	"namakani/internal/store"
 )
 
-// A drain must not hold claims while it is still waiting for its provider
-// connection: an op may only become in_flight once the wave can execute it.
 func TestDrainDoesNotClaimWhileConnOpenBlocks(t *testing.T) {
 	f := newDrainFixture(t)
 	f.addMessage(t, 10, 1, "INBOX", 100, 0)
@@ -42,8 +40,6 @@ func TestDrainDoesNotClaimWhileConnOpenBlocks(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("drain never tried to open its connection")
 	}
-	// Give the drain every chance to claim early; the op must stay pending
-	// for as long as the connection is not there yet.
 	deadline := time.Now().Add(400 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		o, err := f.st.GetOp(opID)
@@ -92,10 +88,6 @@ func (c *hangConn) Close() {
 	c.fakeConn.Close()
 }
 
-// A wave whose executor hangs after claiming must lose its claims to the
-// watchdog: the ops return to pending, the hung goroutine's late landing is
-// fenced by its claim token, and a fresh drain applies the upstream action
-// exactly once.
 func TestStuckWaveIsKilledReclaimedAndLandsOnce(t *testing.T) {
 	f := newDrainFixture(t)
 	f.addMessage(t, 10, 1, "INBOX", 100, 0)
@@ -131,15 +123,11 @@ func TestStuckWaveIsKilledReclaimedAndLandsOnce(t *testing.T) {
 	if o.ClaimToken == 0 {
 		t.Fatal("claimed op carries no claim token")
 	}
-	// While the wave is registered as the live owner, the reaper must not
-	// touch its claims.
 	f.srv.reclaimOrphanedClaims()
 	o, _ = f.st.GetOp(opID)
 	if o.Status != store.OpInFlight {
 		t.Fatalf("reaper released a live wave's claim: status = %q, want in_flight", o.Status)
 	}
-	// The watchdog declares the wave dead after its progress budget lapses:
-	// registration is dropped and the connection is torn down.
 	f.srv.killStuckWaves(time.Now().Unix() + f.srv.claimStuckSecs + 1)
 	if hc.closed.Load() == 0 {
 		t.Fatal("watchdog did not close the stuck wave's connection")
@@ -152,8 +140,6 @@ func TestStuckWaveIsKilledReclaimedAndLandsOnce(t *testing.T) {
 	if o.ClaimToken != 0 {
 		t.Fatalf("reclaimed op still carries claim token %d, want 0", o.ClaimToken)
 	}
-	// Let the hung call return. The zombie wave's landing is fenced by the
-	// token: the op must stay pending with zero attempts recorded.
 	close(hc.release)
 	select {
 	case <-drained:
@@ -167,7 +153,6 @@ func TestStuckWaveIsKilledReclaimedAndLandsOnce(t *testing.T) {
 	if o.Attempts != 0 {
 		t.Fatalf("zombie landing recorded attempts = %d, want 0 (its FailOp must be fenced)", o.Attempts)
 	}
-	// A fresh drain executes the op exactly once upstream.
 	f.srv.drainAccount(nil, 1)
 	o, _ = f.st.GetOp(opID)
 	if o.Status != store.OpDone {
@@ -178,9 +163,6 @@ func TestStuckWaveIsKilledReclaimedAndLandsOnce(t *testing.T) {
 	}
 }
 
-// An in_flight op with no live owner anywhere (the process restarted, the
-// claiming wave is gone) is reclaimed by the sweep reaper even when the
-// account has no pending op for AccountsWithDueOps to enumerate.
 func TestReaperReclaimsOwnerlessInFlight(t *testing.T) {
 	f := newDrainFixture(t)
 	f.addMessage(t, 10, 1, "INBOX", 100, 0)

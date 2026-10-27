@@ -12,11 +12,6 @@ import (
 	"namakani/internal/store"
 )
 
-// The scheduled view is a projection of local state (pending send ops).
-// Every mutation of that state must be published on the same hub the
-// frontend reduces into its projections; otherwise the view only ever
-// learns about changes on a full reload.
-
 type rawEvent struct {
 	Type   string `json:"type"`
 	OpID   int64  `json:"op_id"`

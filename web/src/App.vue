@@ -63,7 +63,7 @@ function finishUndoRestore(restore) {
       restore,
       failures.map((f) => f.it),
     )
-    actionError.value = failures[0].err.message
+    actionError.value = t(failures[0].err.message)
   }
   settleRestoreIntent(restore)
 }
@@ -524,15 +524,6 @@ async function resumeSendCountdowns() {
   } catch {
     return
   }
-  // Restore by server state, not by the clock: every send that is
-  // still undoable gets its entry back — pending ones whose time
-  // has come without a claim and claimed ones waiting unsealed
-  // behind a bulk wave included. not_before only decides whether
-  // the bar shows a countdown or "sending", never whether the entry
-  // exists; sealed or already-sent sends are the server's terminal
-  // side and stay out. The creation-window bound is what separates
-  // an immediate send's undo window from a scheduled send, whose
-  // entry lives in the scheduled view.
   const cands = (pend || []).filter(
     (p) => p.type === 'send' && !p.sent && !p.sealed && p.not_before - p.created_at <= 120,
   )
@@ -761,11 +752,6 @@ function applySnapshot(batch, snap, startSeq, append = false, wm = null) {
 
 const scopeCache = new Map()
 let listEpoch = 0
-// snapEpoch is the listEpoch at which the currently displayed rows were
-// produced (snapshot applied, incremental event merged, or cache entry
-// adopted). stashList stamps entries with it, never with the live
-// listEpoch: an event bumps listEpoch before its reload lands, and the
-// rows visible in between still belong to the older epoch.
 let snapEpoch = 0
 function listCacheKey(snap) {
   return snapCtxKey(snap) + '|t' + (threaded.value ? '1' : '0')
@@ -845,7 +831,7 @@ async function loadAttention() {
     attentionCount.value = attentionItems.value.length
   } catch (e) {
     attentionItems.value = null
-    attentionError.value = e.message
+    attentionError.value = t(e.message)
   }
 }
 async function loadPending() {
@@ -854,7 +840,7 @@ async function loadPending() {
     pendingItems.value = await api.listPending()
   } catch (e) {
     pendingItems.value = null
-    pendingError.value = e.message
+    pendingError.value = t(e.message)
   }
 }
 function loadSyncPanel() {
@@ -879,7 +865,7 @@ async function retryAttention(it) {
   } catch (e) {
     await loadAttention()
     if (!attentionItems.value || attentionItems.value.some((x) => x.op_id === it.op_id)) {
-      actionError.value = e.message
+      actionError.value = t(e.message)
     }
   }
 }
@@ -892,7 +878,7 @@ async function discardAttention(it) {
   } catch (e) {
     await loadAttention()
     if (!attentionItems.value || attentionItems.value.some((x) => x.op_id === it.op_id)) {
-      actionError.value = e.message
+      actionError.value = t(e.message)
     }
   }
 }
@@ -904,7 +890,7 @@ async function undoPendingSend(row) {
   } catch (e) {
     await loadPending()
     if (!pendingItems.value || pendingItems.value.some((x) => x.op_id === row.op_id)) {
-      actionError.value = e.message
+      actionError.value = t(e.message)
     }
   }
 }
@@ -1127,6 +1113,14 @@ async function bulkAct(kind) {
         : bulkArchiveDest(rows)
   const rowById = new Map(rows.map((x) => [x.id, x]))
   const gestureById = new Map(rows.map((x) => [x.id, threadGestureFor(kind, x.folder_special)]))
+  const enqueuedCount = () => {
+    if (listSnap.value.scope === 'scheduled') return opIds.length
+    return opIds.reduce((n, id) => {
+      const mem = rowById.get(id)
+      return n + (mem && threadGestureAction(gestureById.get(id), mem) ? 1 : 0)
+    }, 0)
+  }
+  const bulkCount0 = enqueuedCount()
   let work = null
   const movedItems = []
   const failedIds = []
@@ -1183,10 +1177,10 @@ async function bulkAct(kind) {
         touchIntents()
         const have = new Set(rows.map((x) => x.id))
         const restItems = extraItems.filter((x) => !have.has(x.id))
-        if ((opIds.length !== ids.length || restItems.length) && toastShow.value && Date.now() < toastHideAt) {
+        if ((enqueuedCount() !== bulkCount0 || restItems.length) && toastShow.value && Date.now() < toastHideAt) {
           showCountToast(
             bulkDest,
-            opIds.length - ids.length,
+            enqueuedCount() - bulkCount0,
             restItems.length ? { items: restItems, settled: settledMoved, intentIds: [intent.id] } : null,
           )
         }
@@ -1256,7 +1250,7 @@ async function bulkAct(kind) {
     clearSelectionIds()
     if (openRemoved) clearSelection()
     const settledMoved = settledFullP
-    showCountToast(bulkDest, opIds.length, undoItems.length ? { items: undoItems, settled: settledMoved, intentIds: [intent.id], obKeys: [gestureKey] } : null)
+    showCountToast(bulkDest, bulkCount0, undoItems.length ? { items: undoItems, settled: settledMoved, intentIds: [intent.id], obKeys: [gestureKey] } : null)
   }
   const flagEntries = []
   const rollbackFlagEntries = (entries) => {
@@ -1276,7 +1270,7 @@ async function bulkAct(kind) {
           reps.map((x) => api.getThreadMessagesAll(x.account_id, x.thread_key || 'id:' + x.id)),
         )).flat()
       } catch (e) {
-        actionError.value = t('标记失败：{error}', { error: e.message })
+        actionError.value = t('标记失败：{error}', { error: t(e.message) })
         return
       }
       journalRows(members)
@@ -1362,7 +1356,7 @@ async function bulkAct(kind) {
     if (removable) {
       showRemovalFailure(bulkDest, Math.max(1, opIds.length - movedItems.length))
     } else {
-      actionError.value = err.message
+      actionError.value = t(err.message)
     }
   } finally {
     if (settleFull) settleFull(movedItems)
@@ -1865,19 +1859,19 @@ async function loadMessages(soft = false) {
   } catch (err) {
     if (gen !== loadToken) return
     if (keepReady) {
-      listErrorBar.value = err.message
+      listErrorBar.value = t(err.message)
       listStatus.value = 'ready'
       return
     }
     if (lgAndUp.value && messages.value.length > 0) {
-      listErrorBar.value = err.message
+      listErrorBar.value = t(err.message)
       listStatus.value = 'ready'
       return
     }
     baseRows.value = []
     listHasMore.value = false
     listStatus.value = 'error'
-    listError.value = err.message
+    listError.value = t(err.message)
   } finally {
     if (gen === loadToken) listBusy.value = false
   }
@@ -2093,6 +2087,7 @@ function onScrollDivider(e) {
   const settings = t.closest('.settings-content')
   if (settings && (t === settings || t === scrollEl(settings))) {
     setBarDivider(document.querySelector('.settings-topbar'), t.scrollTop > 0)
+    setBarDivider(document.querySelector('.settings-tabs'), t.scrollTop > 0)
   }
 }
 
@@ -2158,7 +2153,7 @@ function threadGestureFor(kind, anchorSpecial) {
 }
 function threadGestureAction(gesture, mem) {
   const sp = mem.folder_special
-  if (gesture === 'archive') return sp === 'inbox' ? 'archive' : null
+  if (gesture === 'archive') return sp === 'inbox' || sp === 'sent' ? 'archive' : null
   if (gesture === 'inbox') {
     if (sp === 'inbox') return null
     return sp === 'trash' ? 'restore' : 'inbox'
@@ -2579,7 +2574,7 @@ async function loadFolders() {
     foldersError.value = ''
   } catch (err) {
     foldersStatus.value = 'error'
-    foldersError.value = err.message
+    foldersError.value = t(err.message)
   }
 }
 
@@ -2927,7 +2922,7 @@ function onServerEvent(ev) {
     if (ev.undo_failed && ev.op_id) {
       const intent = intents.value.get(restoreIntentByOp.get(ev.op_id))
       if (intent && intent.kind === 'restore') failRestoreIntent(intent)
-      actionError.value = t('撤销失败：{error}', { error: ev.error || t('邮件未恢复') })
+      actionError.value = t('撤销失败：{error}', { error: ev.error ? t(ev.error) : t('邮件未恢复') })
       loadFolders()
     }
     if (ev.op_id && ev.status === 'needs_attention') {
@@ -3180,7 +3175,7 @@ async function openSchEditor(it) {
       sched_id: it.id,
       sched_send_at: it.send_at,
       fill_nonce: tk,
-      load_error: t('定时邮件加载失败，请关闭后重试') + ' (' + err.message + ')',
+      load_error: t('定时邮件加载失败，请关闭后重试') + ' (' + t(err.message) + ')',
     }
   }
 }
@@ -3307,7 +3302,7 @@ function markSeenImpl(m, seen) {
     dropIntent(intent)
     patchAuxFlags([{ id: m.id, flags: prevFlags }])
     bumpFolderUnread(m, seen ? 1 : -1)
-    actionError.value = t('操作保存失败：{error}', { error: e.message })
+    actionError.value = t('操作保存失败：{error}', { error: t(e.message) })
     return
   }
   obDrive(entry, {
@@ -3322,7 +3317,7 @@ function markSeenImpl(m, seen) {
       patchAuxFlags([{ id: m.id, flags: prevFlags }])
       bumpFolderUnread(m, seen ? 1 : -1)
       actionError.value = t(seen ? '标为已读失败：{error}' : '标为未读失败：{error}', {
-        error: out.refusal?.message || '',
+        error: t(out.refusal?.message || ''),
       })
     },
   })
@@ -3497,7 +3492,7 @@ async function openMessage(m, opts) {
         subject: m.subject || '',
         draft_id: m.id,
         fill_nonce: tk,
-        load_error: t('草稿加载失败，请关闭后重试') + ' (' + err.message + ')',
+        load_error: t('草稿加载失败，请关闭后重试') + ' (' + t(err.message) + ')',
       }
     }
     return
@@ -3534,7 +3529,7 @@ async function openMessage(m, opts) {
     afterOpen(m)
   } catch (err) {
     if (tk === detailToken) {
-      detailError.value = err.message
+      detailError.value = t(err.message)
       detailState.value = 'error'
     }
   }
@@ -3938,7 +3933,7 @@ async function actOnThread(m, kind, animate = false) {
     return
   }
   if (
-    (members.length !== (m.thread_count || 1) || restItems.length) &&
+    (reqs.length !== (m.thread_count || 1) || restItems.length) &&
     toastShow.value &&
     Date.now() < toastHideAt &&
     pendingUndo.value &&
@@ -3946,7 +3941,7 @@ async function actOnThread(m, kind, animate = false) {
   ) {
     showCountToast(
       dest,
-      members.length - (m.thread_count || 1),
+      reqs.length - (m.thread_count || 1),
       restItems.length ? { items: restItems, settled: settledAll, intentIds: [intent.id], obKeys: [entry.key] } : null,
     )
   }
@@ -4021,7 +4016,7 @@ async function moveSingle(m, dest, animate = false) {
     obAdd(entry)
   } catch (e) {
     dropIntent(intent)
-    actionError.value = t('操作保存失败：{error}', { error: e.message })
+    actionError.value = t('操作保存失败：{error}', { error: t(e.message) })
     return
   }
   let refusedOut = null
@@ -4071,10 +4066,6 @@ async function moveSingle(m, dest, animate = false) {
   }
 }
 
-// The two actions on a scheduled row: return it to Drafts (cancel the
-// pending send, the letter is filed back as a draft) or delete it for
-// real (cancel the pending send and destroy the letter). Both remove
-// the row from the scheduled projection immediately.
 async function scheduledRowAction(m, animate, purge) {
   const intent = registerHideIntent({
     ids: [m.id],
@@ -4140,7 +4131,7 @@ async function deleteFor(m, animate = false) {
     obAdd(entry)
   } catch (e) {
     dropIntent(intent)
-    actionError.value = t('操作保存失败：{error}', { error: e.message })
+    actionError.value = t('操作保存失败：{error}', { error: t(e.message) })
     return
   }
   let refusedOut = null
@@ -4244,7 +4235,7 @@ async function markAllRead() {
       }
     }
     loadFolders()
-    actionError.value = t('全部标为已读失败：{error}', { error: err.message })
+    actionError.value = t('全部标为已读失败：{error}', { error: t(err.message) })
   }
 }
 
@@ -4428,7 +4419,7 @@ async function boot() {
           st = await api.getState()
           appVersion.value = st.version || ''
         } catch (err) {
-          tgAuthError.value = err.message
+          tgAuthError.value = t(err.message)
         }
         try {
           tg.ready()
@@ -4453,7 +4444,7 @@ async function boot() {
       await enter(st, bootDeepId)
     }
   } catch (err) {
-    bootError.value = err.message
+    bootError.value = t(err.message)
     view.value = 'error'
   }
 }
@@ -5788,6 +5779,17 @@ body {
 }
 .settings-topbar.bar-scrolled {
   border-bottom-color: rgb(var(--v-theme-outline-variant));
+}
+.settings-tabs {
+  border-bottom: 1px solid transparent;
+}
+.settings-tabs.bar-scrolled {
+  border-bottom-color: rgb(var(--v-theme-outline-variant));
+}
+@media (max-width: 1279.98px) {
+  .settings-topbar.bar-scrolled {
+    border-bottom-color: transparent;
+  }
 }
 .settings-card {
   display: flex;

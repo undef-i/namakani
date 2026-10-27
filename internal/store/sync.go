@@ -333,9 +333,6 @@ func (s *Store) PendingUIDs(folderID int64) (map[uint32]bool, error) {
 
 func (s *Store) TwinRow(accountID int64, messageID string, excludeID int64) (ClaimRow, bool, error) {
 	var r ClaimRow
-	// The 'all' folder is a mirror, not a location: its row holds every
-	// message in every location, so it is never evidence of a move and
-	// must never be a claim twin.
 	err := s.DB.QueryRow(`SELECT m.id, m.folder_id, m.uid, m.message_id, m.body_state FROM messages m
 		JOIN folders f ON f.id = m.folder_id
 		WHERE m.account_id = ? AND m.message_id = ? AND m.id <> ? AND m.pending_delete = 0

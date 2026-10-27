@@ -27,6 +27,24 @@ func (s *Store) DeleteTutaSession(accountID int64) error {
 	return err
 }
 
+func (s *Store) TutaLocalFlaggedUIDs(accountID int64, folderName string) (map[uint32]bool, error) {
+	rows, err := s.DB.Query(`SELECT m.uid FROM messages m JOIN folders f ON f.id = m.folder_id
+		WHERE m.account_id = ? AND f.name = ? AND (m.flags & 2) != 0`, accountID, folderName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[uint32]bool)
+	for rows.Next() {
+		var uid uint32
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		out[uid] = true
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) TutaUIDMap(accountID int64, folderName string) (map[string]uint32, uint32, error) {
 	rows, err := s.DB.Query("SELECT tuta_id, uid FROM tuta_uids WHERE account_id = ? AND folder_name = ? ORDER BY uid",
 		accountID, folderName)

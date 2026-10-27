@@ -1,7 +1,3 @@
-// Package tuta is a native Tuta Mail driver implementing the mail.Conn
-// interface on top of Tuta's internal entity REST API and event WebSocket.
-// The protocol implementation follows the official Tuta client; see
-// THIRD-PARTY-NOTICES.TXT at the repository root.
 package tuta
 
 import (
@@ -67,8 +63,9 @@ type Session struct {
 	mailGroups     []string
 	userKeyVersion int
 
-	cur        *folderCache
-	tokenCache *tokenCache
+	cur          *folderCache
+	tokenCache   *tokenCache
+	folderCaches map[string]*folderCache
 
 	tmu     sync.Mutex
 	tcond   *sync.Cond
@@ -77,6 +74,11 @@ type Session struct {
 	folders    []tutaFolder
 	instKeys   map[string][]byte
 	details    map[string]instance
+
+	evMu         sync.Mutex
+	dirtyMails   map[string]bool
+	staleEntries map[string]bool
+	foldersStale bool
 }
 
 type groupKeyPair struct {

@@ -107,12 +107,6 @@ func Init(dataDir string) {
 	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(dataDir, "hydroxide"))
 }
 
-// clientTimeout caps a single Proton API call end to end, so a
-// half-open connection cannot hold a sync worker (and the session lock
-// it sits under) forever. The budget is the server-wide one: it matches
-// net/http's DefaultTransport IdleConnTimeout (90s) and stays below
-// the 100s Cloudflare origin timeout, so on the public path the app,
-// not Cloudflare, owns the error.
 const clientTimeout = 90 * time.Second
 
 func newHTTPClient(transport http.RoundTripper) *http.Client {

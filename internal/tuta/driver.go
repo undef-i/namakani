@@ -3,6 +3,7 @@ package tuta
 import (
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -59,15 +60,179 @@ func (s *Session) selectFolder(name string) (*mail.SelectData, error) {
 	return &mail.SelectData{UIDValidity: 1, UIDNext: fc.maxUID + 1, NumMessages: uint32(fc.total)}, nil
 }
 
+func (s *Session) markMailDirty(id string) {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	if s.dirtyMails == nil {
+		s.dirtyMails = make(map[string]bool)
+	}
+	s.dirtyMails[id] = true
+}
+
+func (s *Session) markEntriesStale(listID string) {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	if s.staleEntries == nil {
+		s.staleEntries = make(map[string]bool)
+	}
+	s.staleEntries[listID] = true
+}
+
+func (s *Session) markFoldersStale() {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	s.foldersStale = true
+}
+
+func (s *Session) peekDirtyMails() map[string]bool {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	out := make(map[string]bool, len(s.dirtyMails))
+	for id := range s.dirtyMails {
+		out[id] = true
+	}
+	return out
+}
+
+func (s *Session) clearDirtyMails(ids []string) {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	for _, id := range ids {
+		delete(s.dirtyMails, id)
+	}
+}
+
+func (s *Session) entriesStaleFor(entriesID string) bool {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	return s.staleEntries[entriesID]
+}
+
+func (s *Session) clearEntriesStale(entriesID string) {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	delete(s.staleEntries, entriesID)
+}
+
+func (s *Session) dropFolderCache(name string) {
+	delete(s.folderCaches, name)
+}
+
+func (s *Session) InvalidateCaches() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.folderCaches = nil
+	s.folders = nil
+	s.cur = nil
+	s.evMu.Lock()
+	s.dirtyMails = nil
+	s.staleEntries = nil
+	s.foldersStale = true
+	s.evMu.Unlock()
+}
+
+func (s *Session) fetchMailMetas(listID string, ids []string) (map[string]*mailMeta, error) {
+	mails, err := s.rest.loadMultiple("tutanota", "mail", modelVersionTutanota, listID, ids)
+	if err != nil {
+		return nil, err
+	}
+	type result struct {
+		meta *mailMeta
+		err  error
+	}
+	results := make(chan result, len(mails))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for _, m := range mails {
+		wg.Add(1)
+		go func(m instance) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			sk, err := s.decryptInstance(m, mailSpec)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			if sk != nil {
+				if pairs := m.idTuples("1308"); len(pairs) > 0 {
+					s.cacheInstKey(pairs[0][1], sk)
+				}
+			}
+			results <- result{meta: metaFromMail(m, listID)}
+		}(m)
+	}
+	wg.Wait()
+	close(results)
+	out := make(map[string]*mailMeta, len(mails))
+	for r := range results {
+		if r.err != nil {
+			return nil, r.err
+		}
+		out[r.meta.id] = r.meta
+	}
+	return out, nil
+}
+
+func (s *Session) refreshDirtyLocked(fc *folderCache) error {
+	dirty := s.peekDirtyMails()
+	if len(dirty) == 0 {
+		return nil
+	}
+	byList := make(map[string][]string)
+	for id := range dirty {
+		if m, ok := fc.meta[id]; ok {
+			byList[m.listID] = append(byList[m.listID], id)
+		}
+	}
+	var fresh []*mailMeta
+	var processed []string
+	for listID, ids := range byList {
+		metas, err := s.fetchMailMetas(listID, ids)
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			processed = append(processed, id)
+			meta, ok := metas[id]
+			if !ok {
+				continue
+			}
+			fc.meta[id] = meta
+			fresh = append(fresh, meta)
+		}
+	}
+	if err := s.enrichNewMail(fresh); err != nil {
+		return err
+	}
+	s.clearDirtyMails(processed)
+	return nil
+}
+
+func (s *Session) localFlaggedUIDs(fc *folderCache) (map[uint32]bool, error) {
+	if s.st == nil || s.acct.ID == 0 {
+		return nil, nil
+	}
+	return s.st.TutaLocalFlaggedUIDs(s.acct.ID, fc.name)
+}
+
 func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 	folder, err := s.folderByName(name)
 	if err != nil {
 		return nil, err
 	}
+	old := s.folderCaches[name]
+	if old != nil && old.folder.entriesID == folder.entriesID && !s.entriesStaleFor(folder.entriesID) {
+		if err := s.refreshDirtyLocked(old); err != nil {
+			return nil, err
+		}
+		return old, nil
+	}
 	uidMap, maxUID, err := s.st.TutaUIDMap(s.acct.ID, name)
 	if err != nil {
 		return nil, err
 	}
+	dirty := s.peekDirtyMails()
 	fc := &folderCache{
 		name:    name,
 		folder:  folder,
@@ -76,6 +241,7 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 		idByUID: make(map[uint32]string),
 		maxUID:  maxUID,
 	}
+	var seen []string
 	start := ""
 	for {
 		entries, err := s.rest.loadRange("tutanota", "mailsetentry", modelVersionTutanota, folder.entriesID, start, entriesPageSize, false)
@@ -95,34 +261,33 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 			}
 			entryMail[e.elemID("1452")] = pairs[0]
 			byList[pairs[0][0]] = append(byList[pairs[0][0]], pairs[0][1])
+			seen = append(seen, pairs[0][1])
 		}
 		for listID, ids := range byList {
-			mails, err := s.rest.loadMultiple("tutanota", "mail", modelVersionTutanota, listID, ids)
+			var need []string
+			for _, id := range ids {
+				if old != nil && !dirty[id] {
+					if m, ok := old.meta[id]; ok && m.listID == listID {
+						fc.meta[id] = m
+						continue
+					}
+				}
+				need = append(need, id)
+			}
+			if len(need) == 0 {
+				continue
+			}
+			metas, err := s.fetchMailMetas(listID, need)
 			if err != nil {
 				return nil, err
 			}
-			decrypted := make(map[string]instance, len(mails))
-			for _, m := range mails {
-				sk, err := s.decryptInstance(m, mailSpec)
-				if err != nil {
-					return nil, err
-				}
-				if sk != nil {
-					if pairs := m.idTuples("1308"); len(pairs) > 0 {
-						s.cacheInstKey(pairs[0][1], sk)
-					}
-				}
-				_, el, _ := m.idTuple("99")
-				decrypted[el] = m
-			}
-			for _, id := range ids {
-				m, ok := decrypted[id]
+			for _, id := range need {
+				meta, ok := metas[id]
 				if !ok {
 					continue
 				}
-				meta := metaFromMail(m, listID)
 				fc.meta[id] = meta
-				if _, known := uidMap[id]; !known {
+				if _, known := uidMap[id]; !known || dirty[id] {
 					fresh = append(fresh, meta)
 				}
 			}
@@ -162,6 +327,12 @@ func (s *Session) listFolderLocked(name string) (*folderCache, error) {
 		}
 		start = entries[len(entries)-1].elemID("1452")
 	}
+	if s.folderCaches == nil {
+		s.folderCaches = make(map[string]*folderCache)
+	}
+	s.folderCaches[name] = fc
+	s.clearEntriesStale(folder.entriesID)
+	s.clearDirtyMails(seen)
 	return fc, nil
 }
 
@@ -171,7 +342,6 @@ func metaFromMail(m instance, listID string) *mailMeta {
 	meta.id = el
 	meta.subject = m.str("105")
 	meta.unread = m.boolean("109")
-	meta.pinned = m.boolean("110")
 	meta.confid = m.boolean("426")
 	if ms := m.num("107"); ms > 0 {
 		meta.date = time.UnixMilli(ms)
@@ -254,8 +424,6 @@ func (s *Session) currentLocked() (*folderCache, error) {
 	return s.cur, nil
 }
 
-// drop removes one message from the cached listing, updating every index
-// together so the selection stays valid for the next operation.
 func (fc *folderCache) drop(id string) {
 	uid, ok := fc.uidByID[id]
 	if !ok {
@@ -280,6 +448,10 @@ func (s *Session) FetchEnvelopes(uids []uint32) ([]mail.Msg, error) {
 	if err != nil {
 		return nil, err
 	}
+	flagged, err := s.localFlaggedUIDs(fc)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]mail.Msg, 0, len(uids))
 	for _, uid := range uids {
 		id, ok := fc.idByUID[uid]
@@ -290,7 +462,11 @@ func (s *Session) FetchEnvelopes(uids []uint32) ([]mail.Msg, error) {
 		if !ok {
 			continue
 		}
-		out = append(out, m.toMsg(uid, fc.folder.kind))
+		msg := m.toMsg(uid, fc.folder.kind)
+		if flagged[uid] {
+			msg.Flags |= mail.FlagFlagged
+		}
+		out = append(out, msg)
 	}
 	return out, nil
 }
@@ -302,9 +478,18 @@ func (s *Session) FetchFlags(changedSince uint64) ([]mail.Msg, error) {
 	if err != nil {
 		return nil, err
 	}
+	flagged, err := s.localFlaggedUIDs(fc)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]mail.Msg, 0, len(fc.ids))
 	for _, id := range fc.ids {
-		out = append(out, mail.Msg{UID: fc.uidByID[id], Flags: fc.meta[id].toMsg(0, fc.folder.kind).Flags})
+		uid := fc.uidByID[id]
+		flags := fc.meta[id].toMsg(0, fc.folder.kind).Flags
+		if flagged[uid] {
+			flags |= mail.FlagFlagged
+		}
+		out = append(out, mail.Msg{UID: uid, Flags: flags})
 	}
 	return out, nil
 }
@@ -450,19 +635,6 @@ func (s *Session) setUnread(ids [][2]string, unread bool) error {
 	return nil
 }
 
-func (s *Session) setPinned(m *mailMeta, pinned bool) error {
-	raw, err := s.rest.getEntity("tutanota", "mail", modelVersionTutanota, m.listID, m.id)
-	if err != nil {
-		return err
-	}
-	val := "0"
-	if pinned {
-		val = "1"
-	}
-	raw["110"] = val
-	return s.rest.updateEntity("tutanota", "mail", modelVersionTutanota, []string{m.listID, m.id}, raw)
-}
-
 func (s *Session) StoreFlag(uid uint32, flag imap.Flag, add bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -482,10 +654,6 @@ func (s *Session) StoreFlag(uid uint32, flag imap.Flag, add bool) error {
 		}
 		m.unread = !add
 	case imap.FlagFlagged:
-		if err := s.setPinned(m, add); err != nil {
-			return err
-		}
-		m.pinned = add
 	default:
 		return fmt.Errorf("tuta: unsupported flag %v", flag)
 	}
@@ -518,12 +686,6 @@ func (s *Session) StoreFlags(uids []uint32, flag imap.Flag, add bool) error {
 			m.unread = !add
 		}
 	case imap.FlagFlagged:
-		for _, m := range metas {
-			if err := s.setPinned(m, add); err != nil {
-				return err
-			}
-			m.pinned = add
-		}
 	default:
 		return fmt.Errorf("tuta: unsupported flag %v", flag)
 	}
@@ -556,6 +718,7 @@ func (s *Session) MoveMessage(uid uint32, dest string) (uint32, error) {
 		return 0, err
 	}
 	fc.drop(id)
+	s.dropFolderCache(dest)
 	return destUID, nil
 }
 

@@ -13,12 +13,6 @@ import (
 	"namakani/internal/store"
 )
 
-// D2, adversarial: a send executor seals its op and then hangs inside
-// the provider call past the watchdog budget. The wave is retired and
-// the reaper runs. The sealed op must not return to pending, must not
-// be delivered a second time when the hung call finally returns, and
-// its books must end at "outcome unknown" — never at a cancelled or
-// retried state that asserts a delivery fact nobody knows.
 func TestSealedSendSurvivesWatchdogRetireWithoutRedelivery(t *testing.T) {
 	f := newDrainFixture(t)
 	seams := f.armSend(t)
@@ -51,7 +45,6 @@ func TestSealedSendSurvivesWatchdogRetireWithoutRedelivery(t *testing.T) {
 	if o.Status != store.OpInFlight || !o.Sealed {
 		t.Fatalf("op inside the provider call = (status %q, sealed %v), want (in_flight, true)", o.Status, o.Sealed)
 	}
-	// The watchdog retires the stuck wave and the reaper runs.
 	f.srv.killStuckWaves(time.Now().Unix() + f.srv.claimStuckSecs + 1)
 	f.srv.reclaimOrphanedClaims()
 	o, _ = f.st.GetOp(opID)
@@ -61,9 +54,6 @@ func TestSealedSendSurvivesWatchdogRetireWithoutRedelivery(t *testing.T) {
 	if o.Status != store.OpNeedsAttention || o.LastError != store.SendOutcomeUnknownError {
 		t.Fatalf("sealed orphan after reclaim = (status %q, error %q), want needs_attention with the outcome-unknown marker", o.Status, o.LastError)
 	}
-	// The hung provider call finally succeeds. The zombie executor
-	// must not land anything: no completion, no filed copy, and above
-	// all no second delivery.
 	close(deliverRelease)
 	select {
 	case <-drainDone:
@@ -80,9 +70,6 @@ func TestSealedSendSurvivesWatchdogRetireWithoutRedelivery(t *testing.T) {
 	if o.Status != store.OpNeedsAttention || o.LastError != store.SendOutcomeUnknownError {
 		t.Fatalf("op after the zombie returned = (status %q, error %q), want the parked outcome-unknown record untouched", o.Status, o.LastError)
 	}
-	// An undo now must get the terminal sealed answer, and the books
-	// must not move: claiming this letter was cancelled would assert
-	// it was never sent, which nobody knows.
 	rec := f.postUndo(t, opID)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("undo of a parked send status = %d, body %s", rec.Code, rec.Body.String())
@@ -97,7 +84,6 @@ func TestSealedSendSurvivesWatchdogRetireWithoutRedelivery(t *testing.T) {
 	if o.Status != store.OpNeedsAttention {
 		t.Fatalf("op status after the sealed undo answer = %q, want needs_attention", o.Status)
 	}
-	// A retry must be refused, and a fresh drain must deliver nothing.
 	req := f.authedReq(http.MethodPost, "/api/ops/"+strconv.FormatInt(opID, 10)+"/retry", "")
 	req.SetPathValue("id", strconv.FormatInt(opID, 10))
 	rec = httptest.NewRecorder()
@@ -111,10 +97,6 @@ func TestSealedSendSurvivesWatchdogRetireWithoutRedelivery(t *testing.T) {
 	}
 }
 
-// The other sealed orphan shape: delivery succeeded and the Sent
-// marker is on the payload, but the executor died before filing the
-// sent copy and completing. The settler finishes exactly those books
-// and never calls the provider again.
 func TestSealedSentSendIsCompletedBySettlerWithoutRedelivery(t *testing.T) {
 	f := newDrainFixture(t)
 	seams := f.armSend(t)

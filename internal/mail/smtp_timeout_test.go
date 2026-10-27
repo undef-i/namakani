@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-// A server that accepts the connection and then never speaks must not
-// hang the send path: the connection deadline has to fire.
 func TestSMTPStalledServerTimesOut(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

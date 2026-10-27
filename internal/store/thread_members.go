@@ -5,9 +5,6 @@ import (
 	"strings"
 )
 
-// threadIdentity is the grouping key of one message inside an account: its
-// Message-ID, or the row itself when the header is missing. With date_ts it
-// matches the key the search picker already dedupes on.
 func threadIdentity(alias string) string {
 	return `CASE WHEN ` + alias + `.message_id = '' THEN 'id:' || ` + alias + `.id ELSE ` + alias + `.message_id END`
 }
@@ -20,10 +17,6 @@ type threadQuerier interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
-// ThreadMembers returns the id of the single representative row of every
-// message in the thread, in date order. A message stored in several folders
-// (a Proton label row plus its All Mail row) is represented by its non-'all'
-// row; a message that only has an 'all' row is represented by that row.
 func (s *Store) ThreadMembers(accountID int64, threadKey string) ([]int64, error) {
 	return s.ThreadMembersQ(s.DB, accountID, threadKey)
 }
@@ -54,8 +47,6 @@ func (s *Store) ThreadMembersQ(q threadQuerier, accountID int64, threadKey strin
 	return out, rows.Err()
 }
 
-// ThreadUniqueCount counts the distinct messages of a thread in an account,
-// with multi-folder rows of one message merged into one.
 func (s *Store) ThreadUniqueCount(accountID int64, threadKey string) (int, error) {
 	return s.ThreadUniqueCountQ(s.DB, accountID, threadKey)
 }
@@ -75,9 +66,6 @@ type ThreadGroupCount struct {
 	Unread int
 }
 
-// ThreadGroupCounts counts, per thread key, the distinct messages of the
-// whole group in the account and how many of them are unread. Membership is
-// account-wide: members in any folder count, multi-folder rows merge.
 func (s *Store) ThreadGroupCounts(accountID int64, threadKeys []string) (map[string]ThreadGroupCount, error) {
 	return s.ThreadGroupCountsQ(s.DB, accountID, threadKeys)
 }

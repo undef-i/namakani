@@ -287,12 +287,6 @@ watch(
       return
     }
     if (ev.status === 'sealed') {
-      // The server has crossed the checkpoint: from this event on
-      // the send can no longer be undone, so the button retires.
-      // The bar itself stays as a pure status display until the
-      // terminal event lands; an in_flight event before this point
-      // changes nothing, because an unsealed in_flight send is
-      // still undoable and its entry must stay.
       stopUndoTimer()
       sendBar.value = 'sealed'
     } else if (ev.status === 'done' && ev.sent) {
@@ -697,7 +691,7 @@ function requestSave() {
           draftId.value = res.id
           lastSavedJSON = current.snap
           savedAt.value = fmtClock(new Date())
-          if (res.warning) warning.value = res.warning
+          if (res.warning) warning.value = t(res.warning)
         }
       } catch {
       }
@@ -778,7 +772,7 @@ async function doSend() {
   try {
     res = await api.sendMail(p)
   } catch (e) {
-    error.value = e.message
+    error.value = t(e.message)
     sending.value = false
     return
   }
@@ -817,11 +811,6 @@ watch(
     pendingNotBefore = v.not_before
     undoShow.value = true
     if (Math.floor(Date.now() / 1000) >= v.not_before) {
-      // The send's time has come but it is still unsealed on the
-      // server (unclaimed, or claimed and waiting behind a bulk
-      // wave): its undo entry restores in the sending state, and
-      // the sealed event retires the button when the checkpoint
-      // is crossed.
       stopUndoTimer()
       sendBar.value = 'sending'
       return
@@ -842,7 +831,7 @@ async function undoSend() {
   } catch (e) {
     pendingOpId = 0
     hideSendBar()
-    error.value = e.message
+    error.value = t(e.message)
     restoreOpen()
     return
   }
@@ -852,9 +841,6 @@ async function undoSend() {
     return
   }
   if (res && res.mode === 'deferred') {
-    // The verdict waits for the checkpoint, but if the answer says
-    // the checkpoint is already crossed, the button retires now;
-    // the terminal event will close the bar either way.
     if (res.sealed) sendBar.value = 'sealed'
     return
   }
@@ -885,9 +871,6 @@ async function scheduleAt(date) {
   clearTimeout(saveTimer)
   await drainSaves()
   try {
-    // One key per compose session, reused by every schedule attempt
-    // from it, so a retried submission converges on the first op
-    // instead of enqueueing a twin chain for the same letter.
     if (!schedClientKey) schedClientKey = api.newClientKey()
     await api.scheduleSend({ ...payload(), send_at: Math.floor(date.getTime() / 1000), client_key: schedClientKey })
     open.value = false
@@ -895,7 +878,7 @@ async function scheduleAt(date) {
     schedInfoShow.value = true
     emit('done')
   } catch (e) {
-    error.value = e.message
+    error.value = t(e.message)
   } finally {
     busy.value = false
   }
@@ -920,7 +903,7 @@ async function persistSchedEdit() {
     lastSavedJSON = snapshot()
     return true
   } catch (e) {
-    error.value = e.message
+    error.value = t(e.message)
     return false
   } finally {
     busy.value = false
@@ -934,7 +917,7 @@ async function sendSchedNow() {
   try {
     await api.cancelScheduled(schedId.value)
   } catch (e) {
-    error.value = e.message
+    error.value = t(e.message)
     busy.value = false
     return
   }
@@ -980,7 +963,7 @@ async function discardCompose() {
     try {
       await api.cancelScheduled(schedId.value)
     } catch (e) {
-      error.value = e.message
+      error.value = t(e.message)
       busy.value = false
       return
     }
@@ -997,7 +980,7 @@ async function discardCompose() {
     try {
       dres = await api.deleteMessage(draftId.value)
     } catch (e) {
-      error.value = t('删除草稿失败：{error}', { error: e.message })
+      error.value = t('删除草稿失败：{error}', { error: t(e.message) })
       busy.value = false
       return
     }

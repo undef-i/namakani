@@ -126,6 +126,9 @@ func terminalCloseCode(err error) (int, bool) {
 }
 
 func (s *Session) WatchEvents(stop <-chan struct{}, notify func(), onTerminal func(error)) {
+	if s.evState != nil {
+		s.InvalidateCaches()
+	}
 	state := &eventState{committed: make(map[string]string), pending: make(map[string]string)}
 	s.evState = state
 	var streak reconnectStreak
@@ -143,6 +146,7 @@ func (s *Session) WatchEvents(stop <-chan struct{}, notify func(), onTerminal fu
 			}
 			return
 		}
+		s.InvalidateCaches()
 		delay := streak.record(time.Since(started))
 		select {
 		case <-stop:
@@ -191,8 +195,19 @@ func (s *Session) eventLoop(stop <-chan struct{}, state *eventState, notify func
 		for _, u := range raw.aggList("1487") {
 			if u.str("464") == "tutanota" {
 				switch u.str("2556") {
-				case "97", "429", "1450":
+				case "97":
 					relevant = true
+					if id := u.str("467"); id != "" {
+						s.markMailDirty(id)
+					}
+				case "429":
+					relevant = true
+					s.markFoldersStale()
+				case "1450":
+					relevant = true
+					if id := u.str("466"); id != "" {
+						s.markEntriesStale(id)
+					}
 				}
 			}
 		}

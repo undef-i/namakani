@@ -5,19 +5,12 @@ import (
 	"strings"
 )
 
-// ListVersion returns the newest placement version: the place_log
-// triggers append one entry per message insert, folder change and
-// delete inside the same transaction, so a snapshot that reads its rows
-// and this version in one transaction can order any placement event
-// against the snapshot exactly.
 func (s *Store) ListVersion() (int64, error) {
 	var v int64
 	err := s.DB.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM place_log`).Scan(&v)
 	return v, err
 }
 
-// PlacementVersions returns the latest placement version per message
-// id, including ids whose row was deleted (their last entry stands).
 func (s *Store) PlacementVersions(ids []int64) (map[int64]int64, error) {
 	out := make(map[int64]int64, len(ids))
 	if len(ids) == 0 {

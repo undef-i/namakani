@@ -5,11 +5,6 @@ import (
 	"time"
 )
 
-// Regression: candidateRows resolved 'p:'/'t:' identities by issuing a
-// second query on the same *sql.DB from inside the iteration of the first
-// query's rows. With the store's single connection that self-deadlocks:
-// the rows hold the only connection while the inner query waits for it.
-// The resolution must finish, and the store must stay usable afterwards.
 func TestResolveProtonIdentityDoesNotDeadlock(t *testing.T) {
 	st := identityTestStore(t)
 	insertRow(t, st, 20, 2, 5, 55, "ignored@x")
@@ -50,7 +45,6 @@ func TestResolveProtonIdentityDoesNotDeadlock(t *testing.T) {
 		t.Fatal("ResolveOpTarget did not return within 15s: connection self-deadlock")
 	}
 
-	// The single connection must be back: any later store query completes.
 	probe := make(chan error, 1)
 	go func() {
 		_, _, err := st.GetSetting("no_such_key")
@@ -66,7 +60,6 @@ func TestResolveProtonIdentityDoesNotDeadlock(t *testing.T) {
 	}
 }
 
-// Same shape for the Tuta mapping table.
 func TestResolveTutaIdentityDoesNotDeadlock(t *testing.T) {
 	st := identityTestStore(t)
 	insertRow(t, st, 30, 3, 6, 77, "ignored@x")

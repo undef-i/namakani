@@ -6,12 +6,6 @@ import (
 	"time"
 )
 
-// D2: the seal is the point of no return, so it must be a durable
-// fact on the op itself, not a side effect of one claim generation's
-// token. A wave can die after sealing (its provider call hangs past
-// the watchdog budget); the reaper must never hand a sealed send back
-// to a new generation as if the checkpoint had never been crossed.
-
 func TestReleaseInFlightOpsLeavesSealedClaimsAlone(t *testing.T) {
 	st := identityTestStore(t)
 	sealedOp := claimSendForSeal(t, st)
@@ -118,10 +112,6 @@ func TestUndoSealedSendBackInPendingStillCancels(t *testing.T) {
 	if _, _, err := st.SealSendForDelivery(o.ID, 42, 43); err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	// The delivery attempt itself returned an error and FailOp landed
-	// the op back in pending for a retry: that landing is a known
-	// outcome (this attempt did not deliver), so an undo here is an
-	// honest cancel, not a bookkeeping fiction.
 	if _, err := st.FailOp(o.ID, "provider refused", false, time.Now().Unix()); err != nil {
 		t.Fatalf("fail op: %v", err)
 	}

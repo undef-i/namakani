@@ -8,9 +8,6 @@ import (
 	"namakani/internal/mail"
 )
 
-// An oversize inbound body is stored truncated, with the truncation
-// marker persisted on the message row (body_state = 2), while the
-// message metadata row itself is untouched.
 func TestSaveBodyTruncatedMarkerPersisted(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

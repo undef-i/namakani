@@ -8,13 +8,6 @@ import (
 	"namakani/internal/auth"
 )
 
-// Access tokens exist only for development: a CLI presents one to wake a
-// dev instance and debug it. They are created, listed and revoked from the
-// settings page, which requires a real login session: a token must never be
-// able to manage tokens.
-
-// sessionOnly guards handlers that require a session cookie specifically,
-// rejecting requests authenticated by an access token.
 func (s *Server) sessionOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := s.sessionKey(r); !ok {
@@ -26,10 +19,6 @@ func (s *Server) sessionOnly(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// handleRevokeAllSessions deletes every session row, the caller's
-// included, and drops the in-memory session keys with them. Access
-// tokens are a separate table and keep working. With no live session
-// left, workers stop, exactly as on the last logout.
 func (s *Server) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request) {
 	n, err := auth.DeleteAllSessions(s.st)
 	if err != nil {
@@ -91,7 +80,6 @@ func (s *Server) handleCreateAccessToken(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusInternalServerError, "创建令牌失败")
 		return
 	}
-	// The plaintext token is returned exactly once, in this response.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":    id,
 		"label": label,
@@ -127,8 +115,5 @@ func (s *Server) handleDeleteAccessToken(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusNotFound, "令牌不存在")
 		return
 	}
-	// The in-memory key and running workers are deliberately left alone,
-	// mirroring a single-session logout: the row was the token's only
-	// authority, so its next request fails on its own.
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

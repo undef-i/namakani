@@ -23,13 +23,6 @@ type deleteBatcher interface {
 	DeleteMessages(uids []uint32) error
 }
 
-// openDrainConn opens the connection a drain wave executes on. A drain
-// carries out the user's own queued intent, so for session providers it
-// takes the user turn like every other user-initiated path: registering as
-// a waiting user is also what bounds the wait, because background turns
-// (folder sync) only run while no user is waiting, so the drain's turn
-// comes at the end of the folder turn currently in progress instead of
-// behind an unbounded queue of background turns.
 func (s *Server) openDrainConn(ctx context.Context, key []byte, accountID int64) (mail.Conn, error) {
 	return s.openConn(key, accountID)
 }
@@ -129,12 +122,6 @@ func (s *Server) noteConnSuccess(accountID int64) {
 	delete(s.connFail, accountID)
 }
 
-// A drainWave is the live owner of every op one drainAccount invocation
-// claims. Claims are stamped with the wave's token; the watchdog declares a
-// wave dead when it stops making progress, tears its connection down, and
-// the reaper returns its claims to pending. A dead wave that later wakes up
-// cannot land over a new owner: every landing first checks the op has not
-// been re-claimed under a different token.
 type drainWave struct {
 	token    int64
 	progress atomic.Int64
@@ -181,8 +168,6 @@ func (s *Server) unregisterWave(accountID int64, w *drainWave) {
 	s.drainMu.Unlock()
 }
 
-// stampClaims records the wave as owner of the ops it just claimed and
-// mirrors the token onto the in-memory copies the executors land with.
 func (s *Server) stampClaims(w *drainWave, ops []*store.Op) {
 	ids := make([]int64, len(ops))
 	for i, o := range ops {
@@ -195,13 +180,6 @@ func (s *Server) stampClaims(w *drainWave, ops []*store.Op) {
 	w.bump()
 }
 
-// opStillOurs reports whether landing an outcome for the op is safe for
-// the wave that computed it. The one unsafe state is in_flight under a
-// different claim token: the op was reclaimed and re-claimed by another
-// wave, and this wave's outcome must be discarded rather than overwrite the
-// new owner's bookkeeping. Every other state is safe to attempt because
-// the store landing functions only ever write to in_flight ops, so an
-// attempt against a pending or already-landed op is a no-op.
 func (s *Server) opStillOurs(o *store.Op) bool {
 	cur, err := s.st.GetOp(o.ID)
 	if err != nil {
@@ -210,10 +188,6 @@ func (s *Server) opStillOurs(o *store.Op) bool {
 	return cur.Status != store.OpInFlight || cur.ClaimToken == o.ClaimToken
 }
 
-// claimWatchdog is the liveness loop for drain claims. It runs on its own
-// goroutine precisely because the waves it supervises execute on the drain
-// goroutine: a watchdog sharing that goroutine could never fire while a
-// wave is stuck.
 func (s *Server) claimWatchdog() {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
@@ -224,11 +198,6 @@ func (s *Server) claimWatchdog() {
 	}
 }
 
-// killStuckWaves retires every wave that has made no progress for
-// claimStuckSecs: it unregisters the wave, marks it dead so its loop exits
-// at the next wave boundary, and closes its connection, which is what
-// unblocks an executor hung inside a provider call and releases the
-// session turn it holds.
 func (s *Server) killStuckWaves(now int64) {
 	type stuck struct {
 		accountID int64
@@ -252,13 +221,6 @@ func (s *Server) killStuckWaves(now int64) {
 	}
 }
 
-// reclaimOrphanedClaims returns in_flight ops to pending for every account
-// that has in_flight ops but no registered live wave. An in_flight op is
-// only ever legitimate while its owning wave is registered, so the absence
-// of a registration is the definition of an orphaned claim; no age
-// threshold is involved. Sealed sends are the one exception: the reaper
-// never hands them back to pending (the store refuses), and they are
-// settled by their landing check instead.
 func (s *Server) reclaimOrphanedClaims() {
 	accounts, err := s.st.AccountsWithInFlightOps()
 	if err != nil {
@@ -285,16 +247,6 @@ func (s *Server) reclaimOrphanedClaims() {
 	}
 }
 
-// settleSealedSends resolves the account's sealed sends whose claim
-// generation died after the checkpoint. The landing check is the only
-// thing a new generation may do with them: a send whose payload
-// already carries the Sent marker provably reached the provider, so
-// the settler finishes its books (sent copy, completion) without ever
-// calling the provider again; a send without the marker has an
-// unproven outcome and is parked as outcome-unknown, because treating
-// it as unsent is exactly how the same letter gets delivered twice.
-// Adoption rotates the claim token first, so the dead executor waking
-// up later is fenced out of every landing path.
 func (s *Server) settleSealedSends(key []byte, accountID int64) {
 	orphans, err := s.st.ListSealedInFlightSends(accountID)
 	if err != nil {
@@ -355,9 +307,6 @@ func (s *Server) drainAccount(key []byte, accountID int64) {
 		if len(sends) > 0 {
 			s.stampClaims(wave, sends)
 			for _, o := range sends {
-				// The op has left pending: publish it on the send-state
-				// channel at claim time so clients retire the undo
-				// affordance from server state, not from a local timer.
 				s.broadcastSendState(o.ID, store.OpInFlight, false, false)
 			}
 			done, failed := s.executeSendWave(key, wave, sends)
@@ -466,10 +415,6 @@ func (s *Server) executeWave(conn mail.Conn, wave *drainWave, accountID int64, o
 		outcomes[i] = &opOutcome{op: o}
 		byID[o.ID] = outcomes[i]
 	}
-	// Every message-bound op resolves its durable identity to the message's
-	// current incarnation before anything touches the provider. An op whose
-	// identity no longer resolves is landed as gone without any provider
-	// call and without touching whatever row its stale coordinate names.
 	var execOps []*store.Op
 	for _, o := range ops {
 		oc := byID[o.ID]
@@ -534,9 +479,6 @@ func (s *Server) executeWave(conn mail.Conn, wave *drainWave, accountID int64, o
 	for _, oc := range outcomes {
 		wave.bump()
 		if !s.opStillOurs(oc.op) {
-			// The wave lost this claim while executing (watchdog retire plus
-			// reaper). The computed outcome is discarded: landing it could
-			// overwrite the state of the op's current owner.
 			continue
 		}
 		counted := false
@@ -638,7 +580,7 @@ func (s *Server) executeWave(conn mail.Conn, wave *drainWave, accountID int64, o
 		s.broadcastOps()
 	}
 	for _, id := range voidedUndo {
-		s.hub.broadcast(map[string]any{"type": "ops", "op_id": id, "undo_failed": true, "error": "the operation failed before its pending undo could run"})
+		s.hub.broadcast(map[string]any{"type": "ops", "op_id": id, "undo_failed": true, "error": "这条操作在撤销执行前已经失败"})
 	}
 	for _, oc := range outcomes {
 		if oc.failed != nil && !oc.gone {
@@ -651,8 +593,12 @@ func (s *Server) executeWave(conn mail.Conn, wave *drainWave, accountID int64, o
 		res, err := s.st.UndoOp(cur.ID)
 		if err != nil {
 			log.Printf("namakani: deferred undo op %d: %v", cur.ID, err)
-			_ = s.st.RecordUndoFailure(cur.ID, err.Error())
-			s.hub.broadcast(map[string]any{"type": "ops", "op_id": cur.ID, "undo_failed": true, "error": err.Error()})
+			msg, ok := undoErrText(cur, err)
+			if !ok {
+				msg = "撤销失败"
+			}
+			_ = s.st.RecordUndoFailure(cur.ID, msg)
+			s.hub.broadcast(map[string]any{"type": "ops", "op_id": cur.ID, "undo_failed": true, "error": msg})
 			s.broadcastOps()
 			continue
 		}

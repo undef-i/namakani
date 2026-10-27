@@ -8,15 +8,6 @@ import (
 	"time"
 )
 
-// D1: restoring the send bar after a reload decides from this list
-// alone which sends still have a live undo entry. The list must
-// therefore carry the two facts the decision turns on — whether the
-// op is already sealed and whether its payload already landed the
-// Sent marker — across every still-active state, including a send
-// whose not_before has passed without a claim and a claimed send
-// waiting behind a bulk wave. Before the fix neither fact was in the
-// payload, and the frontend filtered the rest away by time.
-
 type pendingResumeItem struct {
 	OpID   int64  `json:"op_id"`
 	Type   string `json:"type"`
@@ -51,9 +42,6 @@ func TestListPendingExposesSealedAndSentForResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue waiting send: %v", err)
 	}
-	// A send whose time has come but that no wave has claimed yet:
-	// still pending, still undoable, and dropped by the old resume
-	// filter for the sole reason that not_before <= now.
 	overdueID, err := f.st.EnqueueSend(1, payload, now-10, "resume-overdue")
 	if err != nil {
 		t.Fatalf("enqueue overdue send: %v", err)

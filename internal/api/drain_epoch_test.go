@@ -16,8 +16,6 @@ func (f *drainFixture) setValidity(t *testing.T, folderID int64, v uint32) {
 	}
 }
 
-// rebuild replaces a folder's local rows the way a UIDVALIDITY rebuild
-// does: wipe, then the same messages return under new row ids and new uids.
 func (f *drainFixture) rebuildRow(t *testing.T, folderID, newRowID int64, uid uint32, mid, folderName string) {
 	t.Helper()
 	if err := f.st.WipeFolder(folderID); err != nil {
@@ -38,8 +36,6 @@ func TestRebuiltFolderMoveExecutesAgainstNewIncarnation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue move: %v", err)
 	}
-	// The destination rebuild kills the enqueue-time phantom row; the
-	// source rebuild brings the true message back under a new row and uid.
 	if err := f.st.WipeFolder(2); err != nil {
 		t.Fatalf("wipe dest: %v", err)
 	}
@@ -133,7 +129,6 @@ func TestRebuiltFolderUIDReuseByStrangerUntouched(t *testing.T) {
 	if err := f.st.WipeFolder(3); err != nil {
 		t.Fatalf("wipe: %v", err)
 	}
-	// A stranger's message now sits at the old uid; the target never returned.
 	if _, err := f.st.DB.Exec(`INSERT INTO messages(id, account_id, folder_id, uid, message_id, flags)
 		VALUES(80, 1, 3, 103, 'stranger@x', 0)`); err != nil {
 		t.Fatalf("insert stranger: %v", err)
@@ -179,8 +174,6 @@ func TestEpochChangeAloneDoesNotKillOp(t *testing.T) {
 	}
 }
 
-// The production incident shape: a parked expunge whose folder was rebuilt
-// underneath it must, on retry, delete the message's new incarnation.
 func TestParkedExpungeRetryDeletesRebuiltIncarnation(t *testing.T) {
 	f := newDrainFixture(t)
 	f.armSend(t)

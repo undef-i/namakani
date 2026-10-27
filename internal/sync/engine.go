@@ -661,11 +661,6 @@ func (m *Manager) syncFolder(cl mail.Conn, acct mail.Account, folderID int64, na
 	m.mu.Unlock()
 	change := Change{AccountID: acct.ID, FolderID: folderID, Initial: !live}
 	defer func() {
-		// Rows may have been wiped and relisted under new ids during this
-		// pass. Ops bind messages by durable identity, so nothing about
-		// them changes here; only their cached row coordinates and this
-		// folder's unread counter are refreshed before the change is
-		// broadcast, keeping both honest against the new incarnations.
 		if _, err := m.st.RefreshOpHints(acct.ID); err != nil {
 			log.Printf("sync account %d: refresh op hints: %v", acct.ID, err)
 		}

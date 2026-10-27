@@ -26,10 +26,6 @@ func (s *Server) broadcastSendState(opID int64, status string, sent bool, undoIg
 	})
 }
 
-// broadcastScheduled publishes a change to the scheduled-send state: a
-// pending send op was created, rescheduled, cancelled or landed. The
-// scheduled view is a projection of local state only, so this event is
-// what keeps it current without a full reload.
 func (s *Server) broadcastScheduled() {
 	s.hub.broadcast(map[string]any{"type": "scheduled"})
 }
@@ -80,6 +76,18 @@ func cannotUndoText(o *store.Op) string {
 	return "这条操作已经完成，无法撤销"
 }
 
+func undoErrText(o *store.Op, err error) (string, bool) {
+	switch {
+	case errors.Is(err, store.ErrUndoTargetGone):
+		return "这封邮件已不存在，无法撤销", true
+	case errors.Is(err, store.ErrOpCannotUndo):
+		return cannotUndoText(o), true
+	case errors.Is(err, store.ErrOpSuperseded):
+		return "这条操作后面还有更新的操作，请先撤销最新的一条", true
+	}
+	return "", false
+}
+
 func (s *Server) writeOpStateErr(w http.ResponseWriter, code int, msg string, opID int64) {
 	status := "gone"
 	if o, err := s.st.GetOp(opID); err == nil && o != nil {
@@ -109,14 +117,9 @@ func (s *Server) handleUndoOp(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.st.UndoOp(opID)
 	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrUndoTargetGone):
-			s.writeOpStateErr(w, http.StatusConflict, "这封邮件已不存在，无法撤销", opID)
-		case errors.Is(err, store.ErrOpCannotUndo):
-			s.writeOpStateErr(w, http.StatusConflict, cannotUndoText(before), opID)
-		case errors.Is(err, store.ErrOpSuperseded):
-			s.writeOpStateErr(w, http.StatusConflict, "这条操作后面还有更新的操作，请先撤销最新的一条", opID)
-		default:
+		if msg, ok := undoErrText(before, err); ok {
+			s.writeOpStateErr(w, http.StatusConflict, msg, opID)
+		} else {
 			writeErr(w, http.StatusInternalServerError, "撤销失败")
 		}
 		return
@@ -138,10 +141,6 @@ func (s *Server) handleUndoOp(w http.ResponseWriter, r *http.Request) {
 	s.kickDrain()
 	resp := map[string]any{"ok": true, "mode": res.Mode}
 	if res.Mode == "deferred" && before.Type == store.OpSend {
-		// A deferred answer means the checkpoint will decide. Whether
-		// it has already been crossed is part of the answer: the
-		// client retires its undo button on the sealed fact instead
-		// of presenting the click as a fully open verdict.
 		if cur, gerr := s.st.GetOp(opID); gerr == nil {
 			resp["sealed"] = cur.Sealed
 		}
@@ -162,9 +161,6 @@ type attentionOut struct {
 	Attempts     int    `json:"attempts"`
 }
 
-// resolveDisplayTarget fills a listed op's message coordinate and subject
-// from the message's current incarnation, resolved by durable identity, so
-// a folder rebuild never leaves the panel pointing at a dead row.
 func (s *Server) resolveDisplayTarget(o *store.Op) (int64, string) {
 	t, ok, err := s.st.ResolveOpTarget(o)
 	if err != nil || !ok {

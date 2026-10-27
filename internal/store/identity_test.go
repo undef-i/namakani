@@ -176,19 +176,16 @@ func TestResolveAmbiguityRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get op: %v", err)
 	}
-	// Copies in two other folders, none in the anchor folder: no safe pick.
 	insertRow(t, st, 80, 1, 2, 200, "dup@x")
 	insertRow(t, st, 81, 1, 4, 300, "dup@x")
 	if _, ok, err := st.ResolveOpTarget(o); err != nil || ok {
 		t.Fatalf("resolve across two foreign copies = %v, %v; want unresolved (no guessing)", ok, err)
 	}
-	// The anchor-folder incarnation returns: it is the copy the user acted on.
 	insertRow(t, st, 82, 1, 1, 150, "dup@x")
 	target, ok, err := st.ResolveOpTarget(o)
 	if err != nil || !ok || target.RowID != 82 {
 		t.Fatalf("resolve with anchor copy present = %+v, %v, %v; want row 82", target, ok, err)
 	}
-	// A second copy inside the anchor folder makes it ambiguous again.
 	insertRow(t, st, 83, 1, 1, 151, "dup@x")
 	if _, ok, err := st.ResolveOpTarget(o); err != nil || ok {
 		t.Fatalf("resolve with two anchor-folder copies = %v, %v; want unresolved", ok, err)

@@ -577,6 +577,8 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 		return "", err
 	}
 	sentDone = true
+	s.dropFolderCache("Sent")
+	s.dropFolderCache("Drafts")
 	if _, el, ok := ret.idTuple("562"); ok {
 		return el, nil
 	}
@@ -668,6 +670,7 @@ func (s *Session) AppendMessage(folder string, raw []byte, flags ...imap.Flag) (
 	if err != nil {
 		return 0, err
 	}
+	s.dropFolderCache(folder)
 	s.cur = nil
 	return s.st.AssignTutaUID(s.acct.ID, folder, draftID)
 }

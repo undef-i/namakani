@@ -13,9 +13,6 @@ import (
 	"namakani/internal/store"
 )
 
-// noDestUIDConn simulates a provider whose MOVE succeeds on the server but
-// whose response carries no destination UID (no COPYUID), for a message that
-// has no Message-ID to search by afterwards.
 type noDestUIDConn struct {
 	mail.Conn
 }

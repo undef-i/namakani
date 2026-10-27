@@ -33,10 +33,6 @@ type sendOpPayload struct {
 	SentID      string             `json:"sent_id"`
 	RawB64      string             `json:"raw_b64,omitempty"`
 	MessageID   string             `json:"message_id,omitempty"`
-	// DraftIdentity is the durable identity of the draft this send
-	// supersedes, captured at enqueue time. The post-send draft cleanup
-	// resolves it to the draft's current incarnation; the row id in
-	// Req.DraftID is only the capture-time coordinate.
 	DraftIdentity string `json:"draft_identity,omitempty"`
 }
 
@@ -52,14 +48,6 @@ type scheduleReq struct {
 	ClientKey string `json:"client_key"`
 }
 
-// draftIdentity resolves the durable identity of the draft a send is
-// taken from. The row is the primary source. Once an earlier
-// submission of the same intent has been scheduled, the draft is
-// consumed and the row is gone; the identity then survives only in
-// that submission's op, which recorded it at enqueue time. Both the
-// schedule key derivation and the payload capture resolve through
-// here, so a resubmission reconstructs the identical key and payload
-// and converges on the first op instead of enqueueing a twin.
 func (s *Server) draftIdentity(accountID, draftID int64) string {
 	if identity, err := s.st.IdentityForRow(accountID, draftID); err == nil && identity != "" {
 		return identity
@@ -267,9 +255,6 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 			return false
 		}
 		if !applied {
-			// The op left the states this executor may write to
-			// (a settler parked or adopted it); its landing belongs
-			// to whoever owns it now.
 			return false
 		}
 	} else {
@@ -295,10 +280,6 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 					cerr = s.st.CancelOp(o.ID)
 				}
 				if cerr == nil {
-					// A return-to-drafts that was accepted against
-					// this claimed send materializes here, at the
-					// checkpoint where its undo won: the letter goes
-					// back to Drafts before its payload is destroyed.
 					if cur, gerr := s.st.GetOp(o.ID); gerr == nil && cur.ReturnToDraft {
 						if _, merr := s.materializeScheduledDraft(key, o, &sp); merr != nil {
 							log.Printf("namakani: send op %d: return cancelled letter to drafts: %v", o.ID, merr)
@@ -313,10 +294,6 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 			return false
 		}
 		o.ClaimToken = newToken
-		// The checkpoint is crossed: publish it the moment it
-		// happens. This event is what retires the undo affordance
-		// on every client; without it the interface keeps offering
-		// a click whose verdict is already decided.
 		s.broadcastSendState(o.ID, "sealed", false, false)
 	}
 	if !sp.Sent {
@@ -340,11 +317,6 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 			return false
 		}
 		if !applied {
-			// The provider accepted the letter, but the op was
-			// parked as outcome-unknown while this executor was
-			// inside the call. The parked record stands: landing a
-			// completion now would overwrite the one honest account
-			// of what happened.
 			return false
 		}
 	}
@@ -378,12 +350,6 @@ func (s *Server) executeSend(key []byte, o *store.Op) bool {
 	return true
 }
 
-// consumeSendDraft expunges the draft a send op was created from. The
-// letter's content lives in the send op from the moment it is enqueued,
-// so the draft incarnation is consumed at scheduling time already; a
-// completed send runs the same cleanup for sends that never went
-// through scheduling with a draft (the identity is gone by then and
-// this is a no-op).
 func (s *Server) consumeSendDraft(accountID int64, draftIdentity string, draftIDHint int64) {
 	if draftIdentity == "" {
 		return
@@ -418,11 +384,6 @@ func (s *Server) handleScheduleSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请填写发送时间")
 		return
 	}
-	// A schedule submission converges on one op per intent, exactly
-	// like an immediate send: the client key dedupes retries, and a
-	// schedule taken from a draft derives its key from the draft's
-	// durable identity instead, so resubmitting the same draft from
-	// any session or device lands on the same op.
 	clientKey := req.ClientKey
 	if req.DraftID > 0 {
 		if identity := s.draftIdentity(req.AccountID, req.DraftID); identity != "" {
@@ -481,9 +442,6 @@ func (s *Server) handleListScheduled(w http.ResponseWriter, r *http.Request) {
 		case "needs_attention":
 			o.Status = "failed"
 		case "in_flight":
-			// Report the state as it is: folding a claimed send into
-			// "pending" hides that its send time has come and that
-			// its cancel now resolves at the checkpoint.
 			o.Status = "in_flight"
 		default:
 			o.Status = "pending"
@@ -508,11 +466,6 @@ func (s *Server) scheduledOpID(w http.ResponseWriter, r *http.Request) (int64, b
 	return -id, true
 }
 
-// materializeScheduledDraft files the letter a send op holds back
-// into Drafts: the op's compose request plus its spilled attachment
-// files, appended as a draft copy. It serves the checkpoint path,
-// where a deferred return-to-drafts wins inside executeSend and the
-// handler that accepted it is long gone.
 func (s *Server) materializeScheduledDraft(key []byte, o *store.Op, sp *sendOpPayload) (int64, error) {
 	req := sp.Req
 	req.DraftID = 0
@@ -569,12 +522,6 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if o.Status == store.OpInFlight {
-		// A claimed send is cancelled through the undo state machine,
-		// never through CancelOp (which refuses in_flight outright):
-		// before the checkpoint the undo is accepted as deferred and
-		// wins there; past it, the refusal must say the send is
-		// already decided instead of pretending it was never
-		// cancellable.
 		purge := r.URL.Query().Get("purge") == "1"
 		verb := "取消"
 		if purge {
@@ -604,8 +551,6 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 			s.broadcastScheduled()
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "op_id": opID, "deferred": true})
 		case "cancelled":
-			// The op fell back to pending and the undo cancelled it
-			// outright in the race; land the outcome here.
 			if purge {
 				_ = os.RemoveAll(outgoingDir(s.st.DataDir(), opID))
 				s.broadcastScheduled()
@@ -630,8 +575,6 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Query().Get("purge") == "1" {
-		// True delete: cancel the pending send and destroy the letter.
-		// No draft copy is made, so the letter exists nowhere afterwards.
 		if err := s.st.CancelOp(opID); err != nil {
 			writeErr(w, http.StatusConflict, "这封定时邮件已经不能删除了")
 			return

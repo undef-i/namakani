@@ -21,8 +21,6 @@ func loginCookie(t *testing.T, f *tokenFixture) *http.Cookie {
 	return nil
 }
 
-// Revoke-all kills every session row including the caller's own, while
-// access tokens (a separate table) keep working.
 func TestRevokeAllSessions(t *testing.T) {
 	f := newTokenFixture(t)
 	second := loginCookie(t, f)

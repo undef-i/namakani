@@ -67,11 +67,8 @@ type Msg struct {
 }
 
 type Client struct {
-	c    *imapclient.Client
-	Caps imap.CapSet
-	// RawLimit caps FetchRaw's result in bytes (see InboundRawLimit).
-	// Zero disables the cap. Set by the owning layer, which is the one
-	// holding the app settings.
+	c        *imapclient.Client
+	Caps     imap.CapSet
 	RawLimit int64
 }
 

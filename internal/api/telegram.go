@@ -53,9 +53,6 @@ func (s *Server) tgLoadConfig() tgConfig {
 	return cfg
 }
 
-// tgNormalizePublicBase validates a user-entered public base URL and returns
-// its canonical form (no trailing slash). Empty input is allowed and means
-// notifications carry no jump link.
 func tgNormalizePublicBase(v string) (string, bool) {
 	v = strings.TrimRight(strings.TrimSpace(v), "/")
 	if v == "" {
@@ -423,9 +420,6 @@ type tgItem struct {
 	Snippet string
 }
 
-// tgDeepLink builds the jump link for one message from the configured
-// public base. It returns "" when no public base is configured, in which
-// case notifications carry no jump link.
 func tgDeepLink(base string, id int64) string {
 	if base == "" {
 		return ""

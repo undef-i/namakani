@@ -18,8 +18,6 @@ import (
 	syncmgr "namakani/internal/sync"
 )
 
-// fakeIMAP is a scripted single-mailbox IMAP server holding exactly one
-// message, just complete enough for one real sync round of the sync engine.
 type fakeIMAP struct {
 	ln  net.Listener
 	raw string
@@ -118,8 +116,6 @@ func (f *fakeIMAP) serve(conn net.Conn) {
 	}
 }
 
-// fetch answers one FETCH/UID FETCH for the single stored message. Only the
-// items actually requested on the command line are emitted.
 func (f *fakeIMAP) fetch(w *bufio.Writer, line string) {
 	upper := strings.ToUpper(line)
 	var b strings.Builder
@@ -140,8 +136,6 @@ func (f *fakeIMAP) fetch(w *bufio.Writer, line string) {
 		b.WriteString(` BODYSTRUCTURE ("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" ` +
 			strconv.Itoa(len(f.raw)) + ` 8 NIL NIL NIL)`)
 	}
-	// Body sections: echo each requested BODY.PEEK[...] back as BODY[...]
-	// with the matching literal payload.
 	rest := line
 	for {
 		i := strings.Index(strings.ToUpper(rest), "BODY")
@@ -178,9 +172,6 @@ func (f *fakeIMAP) fetch(w *bufio.Writer, line string) {
 	_ = w.Flush()
 }
 
-// tokenFixture wires a store with a set-up master password and a first
-// server whose operator logs in through the real handler. The mail account
-// is inserted only at wake time so the first server never syncs it.
 type tokenFixture struct {
 	st       *store.Store
 	srv      *Server
@@ -271,8 +262,6 @@ func (f *tokenFixture) insertAccount(t *testing.T) {
 	}
 }
 
-// restart builds a fresh server (empty in-memory key table, fresh sync
-// manager) over the same store, standing in for a process restart.
 func (f *tokenFixture) restart() *Server {
 	return New(f.st, nil, syncmgr.NewManager(f.st))
 }
@@ -300,7 +289,6 @@ func TestAccessTokenColdRecoveryWakesSync(t *testing.T) {
 	if got := srv2.mgr.Status(1).State; got != "stopped" {
 		t.Fatalf("fresh server must not have a worker running before any request, got %q", got)
 	}
-	// Zero cookies, bearer only: must authenticate fully and cold-recover K.
 	rec := f.do(srv2, http.MethodGet, "/api/accounts", "", nil, token)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bearer request after restart: status %d body %s", rec.Code, rec.Body.String())

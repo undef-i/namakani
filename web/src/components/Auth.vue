@@ -23,7 +23,7 @@ async function submit() {
     else await api.login(password.value)
     emit('authed')
   } catch (err) {
-    error.value = err.message
+    error.value = t(err.message)
   } finally {
     busy.value = false
   }

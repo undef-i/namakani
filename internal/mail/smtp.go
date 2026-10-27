@@ -12,22 +12,10 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
-// smtpTimeout is the connection-level budget for one SMTP session: no
-// single command, submission wait, or I/O stall may exceed it. It is
-// the same budget used for the provider HTTP clients (90s, net/http's
-// DefaultTransport IdleConnTimeout), instead of go-smtp's RFC 5321
-// defaults of 5 minutes per command and 12 minutes per submission.
-// It is a var so tests can shrink it.
 var smtpTimeout = 90 * time.Second
 
-// smtpDialTimeout bounds connection establishment. It matches the
-// dialer go-smtp itself uses by default (30s).
 const smtpDialTimeout = 30 * time.Second
 
-// deadlineConn re-arms the connection deadline before every Read and
-// Write. go-smtp sets and clears deadlines around its own command
-// phases; without this, a peer that stalls mid-DATA (outside any
-// command phase) would block the send path indefinitely.
 type deadlineConn struct {
 	net.Conn
 	timeout time.Duration

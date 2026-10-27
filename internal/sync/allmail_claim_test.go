@@ -8,14 +8,6 @@ import (
 	"namakani/internal/store"
 )
 
-// A Proton-shaped account: one message incarnated as a location row
-// (Trash) and as an All Mail mirror row. The provider Trash listing
-// does not contain the message. The mirror contains every message in
-// every location, so its presence is not evidence the message moved
-// anywhere: a reconcile pass must treat the Trash row's absence the
-// same way it treats any twinless row's absence — first pass marks it
-// pending, only a confirmed second absence may delete it, and the
-// mirror row itself is never the claim's business.
 type allTwinFixture struct {
 	m    *Manager
 	st   *store.Store

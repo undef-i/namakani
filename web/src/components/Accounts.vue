@@ -10,6 +10,12 @@ const display = useDisplay()
 const lgAndUp = computed(() => display.lgAndUp.value)
 const activeSection = ref('accounts')
 
+const FIRST_RELEASE_YEAR = 2026
+const copyrightYears = computed(() => {
+  const y = new Date().getFullYear()
+  return y > FIRST_RELEASE_YEAR ? `${FIRST_RELEASE_YEAR}–${y}` : `${FIRST_RELEASE_YEAR}`
+})
+
 function showSection(s) {
   return activeSection.value === s
 }
@@ -112,7 +118,7 @@ async function runTest(a) {
       text: testSuccessText((res.folders || []).length, res.capabilities || []),
     }
   } catch (err) {
-    testState[a.id] = { busy: false, ok: false, text: t('连接失败：{error}', { error: err.message }) }
+    testState[a.id] = { busy: false, ok: false, text: t('连接失败：{error}', { error: t(err.message) }) }
   }
 }
 
@@ -146,7 +152,7 @@ async function reconnect(a) {
     showSnack(t('已发起重新连接'))
     emit('changed')
   } catch (err) {
-    showSnack(t('重新连接失败：{error}', { error: err.message }))
+    showSnack(t('重新连接失败：{error}', { error: t(err.message) }))
   } finally {
     reconnecting.value = null
   }
@@ -183,7 +189,7 @@ async function rcSubmit() {
     if (sentToken && rcForm.value.captcha_token === sentToken) {
       rcForm.value.captcha_token = ''
     }
-    rcError.value = err.message
+    rcError.value = t(err.message)
   } finally {
     rcBusy.value = false
   }
@@ -361,9 +367,9 @@ async function submit(mode) {
     consumeCaptcha(sentToken)
     if (isTest && run !== testRun) return
     if (isTest) {
-      formError.value = t('连接失败：{error}', { error: err.message })
+      formError.value = t('连接失败：{error}', { error: t(err.message) })
     } else {
-      formError.value = err.message
+      formError.value = t(err.message)
     }
   } finally {
     if (isTest && run === testRun) testBusy.value = false
@@ -414,8 +420,8 @@ function reportTestResult(res) {
   }
   if (!res) return
   const parts = []
-  if (!res.imap.ok) parts.push(t('IMAP 连接失败：{error}', { error: res.imap.error }))
-  if (!res.smtp.ok) parts.push(t('SMTP 连接失败：{error}', { error: res.smtp.error }))
+  if (!res.imap.ok) parts.push(t('IMAP 连接失败：{error}', { error: t(res.imap.error) }))
+  if (!res.smtp.ok) parts.push(t('SMTP 连接失败：{error}', { error: t(res.smtp.error) }))
   if (parts.length) {
     formError.value = parts.join('；')
   } else {
@@ -479,7 +485,7 @@ async function loadTG() {
     tgStatus.value = 'ready'
   } catch (err) {
     tgStatus.value = 'error'
-    tgMsg.value = err.message
+    tgMsg.value = t(err.message)
   }
 }
 
@@ -497,7 +503,7 @@ async function saveTG() {
     tg.value.public_base = s.public_base || ''
     showSnack(t('已保存'))
   } catch (err) {
-    showSnack(t('保存失败：{error}', { error: err.message }))
+    showSnack(t('保存失败：{error}', { error: t(err.message) }))
   } finally {
     tgBusy.value = ''
   }
@@ -509,7 +515,7 @@ async function testTG() {
     await api.testTelegram({ bot_token: tg.value.bot_token, chat_id: tg.value.chat_id })
     showSnack(t('测试消息已发送'))
   } catch (err) {
-    showSnack(t('发送失败：{error}', { error: err.message }))
+    showSnack(t('发送失败：{error}', { error: t(err.message) }))
   } finally {
     tgBusy.value = ''
   }
@@ -572,7 +578,7 @@ async function loadWP() {
     await checkThisBrowser()
   } catch (err) {
     wpStatus.value = 'error'
-    wpMsg.value = err.message
+    wpMsg.value = t(err.message)
   }
 }
 
@@ -619,7 +625,7 @@ async function toggleThisBrowser(v) {
     const s = await api.getWebPush()
     wp.value.subscriptions = s.subscriptions || 0
   } catch (err) {
-    showSnack(t('保存失败：{error}', { error: err.message }))
+    showSnack(t('保存失败：{error}', { error: t(err.message) }))
     try {
       const s = await api.getWebPush()
       wp.value.subscriptions = s.subscriptions || 0
@@ -639,7 +645,7 @@ async function testWP() {
     wp.value.subscriptions = res.subscriptions || 0
     showSnack(t('测试推送已发出（送达 {n} 个订阅）', { n: res.sent }))
   } catch (err) {
-    showSnack(t('发送失败：{error}', { error: err.message }))
+    showSnack(t('发送失败：{error}', { error: t(err.message) }))
   } finally {
     wpBusy.value = false
   }
@@ -690,10 +696,10 @@ const trTargetItems = computed(() => {
 })
 
 const visiblePairs = computed(() => modelsData.value?.pairs || [])
-const trFormatItems = [
-  { title: 'OpenAI 兼容', value: 'openai' },
-  { title: 'Anthropic 兼容', value: 'anthropic' },
-]
+const trFormatItems = computed(() => [
+  { title: t('OpenAI 兼容'), value: 'openai' },
+  { title: t('Anthropic 兼容'), value: 'anthropic' },
+])
 
 const trModelList = ref([])
 const trModelsBusy = ref(false)
@@ -715,7 +721,7 @@ async function fetchLLMModels() {
     })
     trModelList.value = res.models || []
   } catch (err) {
-    trModelsError.value = t('获取模型失败：{error}', { error: err.message })
+    trModelsError.value = t('获取模型失败：{error}', { error: t(err.message) })
   } finally {
     trModelsBusy.value = false
   }
@@ -730,7 +736,7 @@ async function loadTranslate() {
     loadModels()
   } catch (err) {
     trStatus.value = 'error'
-    trMsg.value = err.message
+    trMsg.value = t(err.message)
   }
 }
 
@@ -748,7 +754,7 @@ async function saveTranslate() {
     Object.assign(tr, res.settings, { llm_api_key: '' })
     showSnack(t('已保存'))
   } catch (err) {
-    showSnack(t('保存失败：{error}', { error: err.message }))
+    showSnack(t('保存失败：{error}', { error: t(err.message) }))
   } finally {
     trBusy.value = false
   }
@@ -763,7 +769,7 @@ async function loadModels() {
     modelsData.value = res
     modelsError.value = ''
   } catch (err) {
-    modelsError.value = err.message
+    modelsError.value = t(err.message)
   }
 }
 
@@ -801,7 +807,7 @@ async function loadAppSet() {
     appSetBudgetBytes.value = res.cache_budget_bytes
     appSetState.value = 'ready'
   } catch (err) {
-    appSetError.value = err.message
+    appSetError.value = t(err.message)
     appSetState.value = 'error'
   }
 }
@@ -820,7 +826,7 @@ async function saveAppSet() {
     showSnack(t('已保存'))
     loadAppSet()
   } catch (err) {
-    showSnack(t('保存失败：{error}', { error: err.message }))
+    showSnack(t('保存失败：{error}', { error: t(err.message) }))
   } finally {
     appSetBusy.value = false
   }
@@ -842,7 +848,7 @@ async function loadTokens() {
     tokens.value = res.tokens || []
     tokensState.value = 'ready'
   } catch (err) {
-    tokensError.value = err.message
+    tokensError.value = t(err.message)
     tokensState.value = 'error'
   }
 }
@@ -855,7 +861,7 @@ async function createToken() {
     tokenLabel.value = ''
     loadTokens()
   } catch (err) {
-    showSnack(t('创建失败：{error}', { error: err.message }))
+    showSnack(t('创建失败：{error}', { error: t(err.message) }))
   } finally {
     tokenBusy.value = false
   }
@@ -877,7 +883,7 @@ async function confirmRevokeToken() {
     revokeTarget.value = null
     loadTokens()
   } catch (err) {
-    showSnack(t('吊销失败：{error}', { error: err.message }))
+    showSnack(t('吊销失败：{error}', { error: t(err.message) }))
   } finally {
     revokeBusy.value = false
   }
@@ -901,7 +907,7 @@ async function confirmRevokeAllSessions() {
     revokeAllOpen.value = false
     emit('revoked')
   } catch (err) {
-    revokeAllError.value = err.message
+    revokeAllError.value = t(err.message)
   } finally {
     revokeAllBusy.value = false
   }
@@ -930,7 +936,7 @@ onMounted(() => {
         </v-tab>
       </v-tabs>
     </nav>
-    <v-tabs v-if="!lgAndUp" v-model="activeSection">
+    <v-tabs v-if="!lgAndUp" v-model="activeSection" class="settings-tabs">
       <v-tab
         v-for="s in SECTIONS"
         :key="s.key"
@@ -1192,7 +1198,7 @@ onMounted(() => {
         </div>
         <v-text-field
           v-model="tr.llm_api_key"
-          label="API Key"
+          :label="t('API Key')"
           type="password"
           variant="filled"
           density="comfortable"
@@ -1246,10 +1252,10 @@ onMounted(() => {
       </v-alert>
     </template>
     <div v-else style="max-width: 640px">
-      <v-switch v-model="tg.enabled" :label="t('开始推送')" color="primary" hide-details class="mb-2" />
+      <v-switch v-model="tg.enabled" :label="t('开启推送')" color="primary" hide-details class="mb-2" />
       <v-text-field
         v-model="tg.bot_token"
-        label="Bot Token"
+        :label="t('Bot Token')"
         type="password"
         variant="filled"
         density="comfortable"
@@ -1259,7 +1265,7 @@ onMounted(() => {
       />
       <v-text-field
         v-model="tg.chat_id"
-        label="Chat ID"
+        :label="t('Chat ID')"
         variant="filled"
         density="comfortable"
         autocomplete="off"
@@ -1378,7 +1384,7 @@ onMounted(() => {
     <div class="text-center text-caption text-medium-emphasis pb-10 mt-8">
       <div>Namakani</div>
       <div v-if="version" class="mt-1">{{ t('版本 {version}', { version }) }}</div>
-      <div class="mt-1">© 2026 Namakani</div>
+      <div class="mt-1">© {{ copyrightYears }} undef-i</div>
     </div>
     </div>
   </div>

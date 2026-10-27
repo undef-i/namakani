@@ -2,8 +2,6 @@ package store
 
 import "testing"
 
-// A pending expunge from a previous incarnation must block a move issued
-// against the rebuilt row: the chain follows the message, not the row.
 func TestCrossIncarnationExpungeBlocksMove(t *testing.T) {
 	st := identityTestStore(t)
 	insertRow(t, st, 10, 1, 1, 100, "m10@x")
@@ -19,8 +17,6 @@ func TestCrossIncarnationExpungeBlocksMove(t *testing.T) {
 	}
 }
 
-// A second expunge against the rebuilt row, same folder, dedupes onto the
-// op from the previous incarnation instead of creating a second delete.
 func TestCrossIncarnationExpungeDedupesSameFolder(t *testing.T) {
 	st := identityTestStore(t)
 	insertRow(t, st, 10, 1, 1, 100, "m10@x")
@@ -41,8 +37,6 @@ func TestCrossIncarnationExpungeDedupesSameFolder(t *testing.T) {
 	}
 }
 
-// The same Message-ID in another folder is a different physical copy: its
-// expunge must not dedupe onto the first folder's op.
 func TestCrossFolderTwinExpungeDoesNotDedupe(t *testing.T) {
 	st := identityTestStore(t)
 	insertRow(t, st, 10, 1, 1, 100, "dup@x")
@@ -60,8 +54,6 @@ func TestCrossFolderTwinExpungeDoesNotDedupe(t *testing.T) {
 	}
 }
 
-// Flags intents coalesce only within one incarnation: a flags op against
-// the rebuilt row must not merge into the dead incarnation's op.
 func TestFlagsDoNotMergeAcrossIncarnations(t *testing.T) {
 	st := identityTestStore(t)
 	insertRow(t, st, 10, 1, 1, 100, "m10@x")
@@ -87,8 +79,6 @@ func TestFlagsDoNotMergeAcrossIncarnations(t *testing.T) {
 	}
 }
 
-// ClaimDueOps serializes by identity: a fresh op on the rebuilt row waits
-// behind the still-pending op from the previous incarnation.
 func TestClaimDueOpsSerializesByIdentity(t *testing.T) {
 	st := identityTestStore(t)
 	insertRow(t, st, 10, 1, 1, 100, "m10@x")
@@ -119,8 +109,6 @@ func TestClaimDueOpsSerializesByIdentity(t *testing.T) {
 	}
 }
 
-// Undo of a completed op resolves the message's current incarnation even
-// after the acted row was replaced.
 func TestUndoResolvesCurrentIncarnation(t *testing.T) {
 	st := identityTestStore(t)
 	insertRow(t, st, 10, 1, 1, 100, "m10@x")

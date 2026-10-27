@@ -9,13 +9,6 @@ import (
 	"time"
 )
 
-// D5: scheduling a send must carry the same idempotency discipline as
-// an immediate send. The schedule endpoint used to enqueue with an
-// empty client key, so the same scheduling intent submitted twice (a
-// retry after a timeout, a second tab, a second device) produced two
-// independent send chains for one letter, and only a provider-side
-// race kept the duplicate from being delivered twice.
-
 func (f *drainFixture) scheduleWithKey(t *testing.T, body string) (int64, int) {
 	t.Helper()
 	req := f.authedReq(http.MethodPost, "/api/send/schedule", body)
@@ -77,9 +70,6 @@ func TestScheduleFromDraftDedupesByDraftIdentity(t *testing.T) {
 	f.armSend(t)
 	f.addMessage(t, 50, 4, "Drafts", 500, 0)
 	sendAt := time.Now().Add(2 * time.Hour).Unix()
-	// No client key at all: the intent's durable identity is the draft
-	// it schedules, so the server derives the key from that identity
-	// and a resubmission of the same draft converges.
 	body := fmt.Sprintf(`{"account_id":1,"to":"b@x.test","subject":"sched","text":"body","send_at":%d,"draft_id":50}`, sendAt)
 	id1, code1 := f.scheduleWithKey(t, body)
 	if code1 != http.StatusCreated || id1 >= 0 {

@@ -231,8 +231,6 @@ func TestSendDraftCleanupFollowsRebuiltDraft(t *testing.T) {
 		t.Fatalf("send handler status = %d, body %s", rec.Code, rec.Body.String())
 	}
 	opID := opIDOf(t, rec)
-	// The drafts folder is rebuilt before the send executes: the draft row
-	// the request named is gone, the draft itself returns under a new row.
 	if err := f.st.WipeFolder(1); err != nil {
 		t.Fatalf("wipe: %v", err)
 	}
