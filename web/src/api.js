@@ -97,6 +97,10 @@ export const testAccountForm = (a) => post('/api/accounts/test', a)
 export const testAccount = (id) => post('/api/accounts/' + id + '/test', {})
 export const getSyncStatus = (id) => req('/api/accounts/' + id + '/sync')
 export const reconnectAccount = (id, payload) => post('/api/accounts/' + id + '/reconnect', payload)
+export const gmailStart = (a) => post('/api/accounts/gmail/start', a)
+export const getGmailOAuth = () => req('/api/settings/gmail-oauth')
+export const saveGmailOAuth = (b) =>
+  req('/api/settings/gmail-oauth', { method: 'PUT', body: JSON.stringify(b) })
 export const getAppSettings = () => req('/api/settings/app')
 export const saveAppSettings = (b) =>
   req('/api/settings/app', { method: 'PUT', body: JSON.stringify(b) })
@@ -116,25 +120,23 @@ export const subscribePush = (sub) => post('/api/push/subscribe', sub)
 export const unsubscribePush = (endpoint) => post('/api/push/unsubscribe', { endpoint })
 export const getFolders = () => req('/api/folders')
 export const purgeFolder = (id) => post('/api/folders/' + id + '/purge')
-export const getMessages = (special, offset = 0, limit = 60, threaded = false) =>
+export const getMessages = (special, offset = 0, limit = 60) =>
   reqList(
     '/api/messages?special=' +
       encodeURIComponent(special) +
       '&limit=' +
       limit +
       '&offset=' +
-      offset +
-      (threaded ? '&threaded=1' : ''),
+      offset,
   )
-export const getFolderMessages = (folderId, offset = 0, limit = 60, threaded = false) =>
+export const getFolderMessages = (folderId, offset = 0, limit = 60) =>
   reqList(
     '/api/messages?folder_id=' +
       folderId +
       '&limit=' +
       limit +
       '&offset=' +
-      offset +
-      (threaded ? '&threaded=1' : ''),
+      offset,
   )
 export const getThreadMessagesAll = (accountId, threadKey) =>
   req(
@@ -180,6 +182,7 @@ export const discardOp = (opId) => req('/api/ops/' + opId, { method: 'DELETE' })
 export const sendNowOp = (opId) => post('/api/ops/' + opId + '/send-now')
 export const listAttention = () => req('/api/ops/attention')
 export const listPending = () => req('/api/ops/pending')
+export const getOp = (opId) => req('/api/ops/' + opId)
 export const opsByKeys = (keys) => post('/api/ops/by-keys', { keys })
 export const attachmentURL = (id, attId) => '/api/messages/' + id + '/attachments/' + attId
 export const sendMail = (body) => post('/api/send', body)

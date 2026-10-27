@@ -50,6 +50,12 @@ func identityForRow(q idQuerier, accountID, rowID int64) (string, error) {
 			WHERE account_id = ? AND folder_name = ? AND uid = ?`, accountID, folderName, uid).Scan(&tid); err == nil && tid != "" {
 			return "t:" + tid, nil
 		}
+	case "gmail":
+		var gid string
+		if err := q.QueryRow(`SELECT gmail_id FROM gmail_uids
+			WHERE account_id = ? AND folder_name = ? AND uid = ?`, accountID, folderName, uid).Scan(&gid); err == nil && gid != "" {
+			return "g:" + gid, nil
+		}
 	}
 	if mid != "" {
 		return "m:" + mid, nil
@@ -89,10 +95,13 @@ func candidateRows(q idQuerier, accountID int64, identity string) ([]int64, erro
 	}
 	val := identity[2:]
 	switch identity[0] {
-	case 'p', 't':
+	case 'p', 't', 'g':
 		table, col := "proton_uids", "proton_id"
 		if identity[0] == 't' {
 			table, col = "tuta_uids", "tuta_id"
+		}
+		if identity[0] == 'g' {
+			table, col = "gmail_uids", "gmail_id"
 		}
 		rows, err := q.Query(`SELECT folder_name, uid FROM `+table+` WHERE account_id = ? AND `+col+` = ?`, accountID, val)
 		if err != nil {

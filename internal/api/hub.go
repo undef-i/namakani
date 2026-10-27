@@ -47,6 +47,8 @@ func (h *hub) broadcast(v any) {
 		select {
 		case ch <- data:
 		default:
+			delete(h.subs, ch)
+			close(ch)
 		}
 	}
 }
@@ -70,7 +72,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case data := <-ch:
+		case data, ok := <-ch:
+			if !ok {
+				return
+			}
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		case <-heartbeat.C:

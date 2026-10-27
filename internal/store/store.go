@@ -180,6 +180,18 @@ CREATE TABLE IF NOT EXISTS tuta_sessions (
 	user_id      TEXT NOT NULL DEFAULT '',
 	access_token TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS gmail_uids (
+	account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	folder_name TEXT NOT NULL,
+	uid        INTEGER NOT NULL,
+	gmail_id   TEXT NOT NULL,
+	PRIMARY KEY (account_id, folder_name, gmail_id),
+	UNIQUE (account_id, folder_name, uid)
+);
+CREATE TABLE IF NOT EXISTS gmail_state (
+	account_id INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+	history_id TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS translations (
 	message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
 	target     TEXT NOT NULL,
@@ -245,6 +257,12 @@ func Open(path string) (*Store, error) {
 	}
 	if _, err := db.Exec(`UPDATE ops SET status = 'pending' WHERE status = 'in_flight'`); err != nil {
 		return nil, fmt.Errorf("reset in-flight ops: %w", err)
+	}
+	if _, err := db.Exec(`INSERT INTO settings(key, value) SELECT 'base_url', value FROM settings WHERE key = 'tg_public_base' ON CONFLICT(key) DO NOTHING`); err != nil {
+		return nil, fmt.Errorf("migrate base url: %w", err)
+	}
+	if _, err := db.Exec(`DELETE FROM settings WHERE key = 'tg_public_base'`); err != nil {
+		return nil, fmt.Errorf("migrate base url drop old key: %w", err)
 	}
 	var firstSeenCount int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM first_seen`).Scan(&firstSeenCount); err != nil {

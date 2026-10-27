@@ -516,6 +516,7 @@ function obVoid(key) {
 
 const resumeSend = ref(null)
 let resumeSendSeq = 0
+const trackedSend = ref(null)
 
 async function resumeSendCountdowns() {
   let pend
@@ -530,6 +531,37 @@ async function resumeSendCountdowns() {
   if (!cands.length) return
   const p = cands[cands.length - 1]
   resumeSend.value = { op_id: p.op_id, not_before: p.not_before, seq: ++resumeSendSeq }
+  trackedSend.value = { op_id: p.op_id, not_before: p.not_before }
+}
+
+async function rebuildSendState() {
+  await resumeSendCountdowns()
+  const tracked = trackedSend.value
+  if (!tracked) return
+  let pend
+  try {
+    pend = await api.listPending()
+  } catch {
+    return
+  }
+  if ((pend || []).some((p) => p.op_id === tracked.op_id)) return
+  let st
+  try {
+    st = await api.getOp(tracked.op_id)
+  } catch {
+    return
+  }
+  if (!st || st.type !== 'send') return
+  if (st.status === 'pending' || st.status === 'in_flight') return
+  trackedSend.value = null
+  lastOpEvent.value = {
+    op_id: tracked.op_id,
+    status: st.status,
+    sent: !!st.sent,
+    undo_ignored: false,
+    undo_failed: false,
+    seq: ++opEventSeq,
+  }
 }
 
 function obRecover() {
@@ -622,7 +654,7 @@ const messages = computed(() => {
   }
   let out = rows
   if (hide.size) out = out.filter((r) => !hide.has(r.id))
-  if (threaded.value && !searching.value) {
+  if (!searching.value) {
     out = out.filter((r) => {
       const cov = threadHideIntent(r)
       return !cov || cov.exiting.has(r.id)
@@ -698,7 +730,7 @@ function applySnapshot(batch, snap, startSeq, append = false, wm = null) {
   } else {
     rows = [...batch]
   }
-  const threadedSnap = threaded.value && snap.kind === 'folder'
+  const groupedSnap = snap.kind === 'folder'
   const prevAppendReplay = appendReplay
   appendReplay = append
   const placed = !append && wm != null
@@ -708,7 +740,7 @@ function applySnapshot(batch, snap, startSeq, append = false, wm = null) {
       if (!placed && d.seq <= startSeq) continue
       const items = placed ? d.items.filter((it) => (it.pv ?? 0) > wm) : d.items
       for (const item of items) {
-        rows = threadedSnap
+        rows = groupedSnap
           ? rowsInsertThreaded(rows, item, snapBelongs(snap))
           : rowsInsertFlat(rows, item, snapBelongs(snap))
       }
@@ -754,7 +786,7 @@ const scopeCache = new Map()
 let listEpoch = 0
 let snapEpoch = 0
 function listCacheKey(snap) {
-  return snapCtxKey(snap) + '|t' + (threaded.value ? '1' : '0')
+  return snapCtxKey(snap)
 }
 function stashList() {
   const snap = listSnap.value
@@ -1038,7 +1070,6 @@ const composeInit = ref({})
 const searching = ref(false)
 const searchQuery = ref('')
 let searchTimer = null
-const threaded = ref(false)
 const undoSeconds = ref(5)
 const maxAttachmentMB = ref(20)
 const convo = ref(null)
@@ -1101,7 +1132,7 @@ async function bulkAct(kind) {
   const openRemoved = !!(selected.value && ids.includes(selected.value.id))
   let opIds = ids
   const needsExpansion =
-    removable && threaded.value && !searching.value && rows.some((x) => x.thread_count > 1)
+    removable && !searching.value && rows.some((x) => x.thread_count > 1)
   const bulkDest = !removable
     ? null
     : listSnap.value.scope === 'scheduled'
@@ -1285,7 +1316,7 @@ async function bulkAct(kind) {
   }
   let flagIds = ids
   const flagRowById = new Map()
-  if (!removable && threaded.value && !searching.value) {
+  if (!removable && !searching.value) {
     const reps = displayMessages.value.filter((x) => selectedIds.value.has(x.id) && (x.thread_count ?? 1) > 1)
     if (reps.length) {
       let members
@@ -1871,11 +1902,11 @@ async function loadMessages(soft = false) {
     if (target.kind === 'search') {
       batch = await api.searchMessages(target.query)
     } else if (target.folderId) {
-      const r = await api.getFolderMessages(target.folderId, 0, PAGE_SIZE, threaded.value)
+      const r = await api.getFolderMessages(target.folderId, 0, PAGE_SIZE)
       batch = r.items
       wm = r.wm
     } else {
-      const r = await api.getMessages(target.scope, 0, PAGE_SIZE, threaded.value)
+      const r = await api.getMessages(target.scope, 0, PAGE_SIZE)
       batch = r.items
       wm = r.wm
     }
@@ -1917,8 +1948,8 @@ async function loadMore() {
       listSnap.value.kind === 'search'
         ? await api.searchMessages(listSnap.value.query, listOffset, PAGE_SIZE)
         : listSnap.value.folderId
-          ? (await api.getFolderMessages(listSnap.value.folderId, listOffset, PAGE_SIZE, threaded.value)).items
-          : (await api.getMessages(scope.value, listOffset, PAGE_SIZE, threaded.value)).items
+          ? (await api.getFolderMessages(listSnap.value.folderId, listOffset, PAGE_SIZE)).items
+          : (await api.getMessages(scope.value, listOffset, PAGE_SIZE)).items
     if (gen !== loadToken) return
     applySnapshot(batch, listSnap.value, startSeq, true)
     listOffset += batch.length
@@ -1937,8 +1968,8 @@ async function rebuildList() {
     const n = Math.max(PAGE_SIZE, baseRows.value.length)
     const folderId = rangeId.value ? (activeFolder.value?.id ?? -1) : 0
     const r = folderId
-      ? await api.getFolderMessages(folderId, 0, n, threaded.value)
-      : await api.getMessages(scope.value, 0, n, threaded.value)
+      ? await api.getFolderMessages(folderId, 0, n)
+      : await api.getMessages(scope.value, 0, n)
     const batch = r.items
     if (gen !== loadToken) return
     const snap = { kind: 'folder', scope: scope.value, folderId }
@@ -2658,7 +2689,10 @@ function onDiscarded({ row_id, kind, op_id }) {
   })
 }
 
-async function onComposeDone() {
+async function onComposeDone(info) {
+  if (info && info.op_id) {
+    trackedSend.value = { op_id: info.op_id, not_before: info.not_before }
+  }
   const jobs = [loadFolders(), loadStatuses(), refreshScheduledCount()]
   if ((scope.value === 'drafts' || scope.value === 'sent' || scope.value === 'scheduled') && !discardRowId) jobs.push(loadMessages(true))
   await Promise.all(jobs)
@@ -2766,7 +2800,7 @@ function intentCoversThread(rep) {
 function rowsApplyRemoved(rows, ev) {
   const ids = new Set(ev.ids ?? [])
   if (!ids.size) return { rows, gap: false }
-  if (!threaded.value || searching.value) {
+  if (searching.value) {
     return {
       rows: rows.filter(
         (r) => !(ids.has(r.id) && (ev.folder_id == null || r.folder_id === ev.folder_id)),
@@ -2849,9 +2883,9 @@ function applyMessagesInput(items) {
   journalDelta({ type: 'msg', items })
   journalRows(items)
   let rows = baseRows.value
-  const threadedView = threaded.value && !searching.value
+  const groupedView = !searching.value
   for (const item of items) {
-    rows = threadedView
+    rows = groupedView
       ? rowsInsertThreaded(rows, item, rowMatchesScope)
       : rowsInsertFlat(rows, item, rowMatchesScope)
     if (
@@ -2894,7 +2928,7 @@ function applyRemovedInput(ev) {
   if (convo.value && ids.size) {
     convo.value = { ...convo.value, msgs: convo.value.msgs.filter((m) => !ids.has(m.id)) }
   }
-  if (gap && threaded.value && !searching.value) rebuildList()
+  if (gap && !searching.value) rebuildList()
 }
 
 function applyFolderEvent(folder) {
@@ -2917,6 +2951,7 @@ function onServerEvent(ev) {
       loadFolders()
       rebuildList()
       loadStatuses()
+      void rebuildSendState()
     }
     lastEventSeq = ev.seq
   }
@@ -2951,6 +2986,13 @@ function onServerEvent(ev) {
         undo_ignored: !!ev.undo_ignored,
         undo_failed: !!ev.undo_failed,
         seq: ++opEventSeq,
+      }
+      if (
+        trackedSend.value &&
+        ev.op_id === trackedSend.value.op_id &&
+        (ev.status === 'done' || ev.status === 'cancelled' || ev.status === 'needs_attention')
+      ) {
+        trackedSend.value = null
       }
     }
     if (ev.undo_failed && ev.op_id) {
@@ -3001,6 +3043,7 @@ function connectEvents() {
       loadStatuses()
       obFlush()
       void flushUndoKeyWaiters()
+      void rebuildSendState()
     }
   }
   es.onmessage = (e) => {
@@ -3750,7 +3793,7 @@ function rowClick(m, idx) {
   }
   cursorIdx.value = idx
   cursorActive.value = false
-  if ((threaded.value || searching.value) && (m.thread_count ?? 1) > 1) {
+  if ((m.thread_count ?? 1) > 1) {
     openConversation(m)
     return
   }
@@ -4049,13 +4092,13 @@ async function actOnThread(m, kind, animate = false, deferSend = false) {
 async function archiveFor(m, animate = false, deferSend = false) {
   if (!m) return
   if (m.folder_special === 'trash' || m.folder_special === 'junk') return inboxFor(m, animate, deferSend)
-  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'archive', animate, deferSend)
+  if (!searching.value && m.thread_count > 1) return actOnThread(m, 'archive', animate, deferSend)
   if (m.folder_special === 'scheduled') return toDraftsFor(m, animate)
   return moveSingle(m, 'archive', animate, deferSend)
 }
 
 function inboxFor(m, animate = false, deferSend = false) {
-  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'inbox', animate, deferSend)
+  if (!searching.value && m.thread_count > 1) return actOnThread(m, 'inbox', animate, deferSend)
   return moveSingle(m, 'inbox', animate, deferSend)
 }
 
@@ -4211,7 +4254,7 @@ function toDraftsFor(m, animate = false) {
 
 async function deleteFor(m, animate = false, deferSend = false) {
   if (!m) return
-  if (threaded.value && !searching.value && m.thread_count > 1) return actOnThread(m, 'delete', animate, deferSend)
+  if (!searching.value && m.thread_count > 1) return actOnThread(m, 'delete', animate, deferSend)
   if (m.folder_special === 'scheduled') return scheduledRowAction(m, animate, true)
   const intent = registerHideIntent({
     ids: [m.id],
@@ -4518,7 +4561,7 @@ async function enter(st, deepId = 0) {
   const did = deepId || initialDeepId
   if (st && st.app_settings) maxAttachmentMB.value = st.app_settings.max_attachment_mb
   if (st && typeof st.attention === 'number') attentionCount.value = st.attention
-  threaded.value = localStorage.getItem('namakani_threaded') === '1'
+  localStorage.removeItem('namakani_threaded')
   const storedUndo = parseInt(localStorage.getItem('namakani_undo_seconds') ?? '', 10)
   if ([0, 5, 10, 20, 30].includes(storedUndo)) undoSeconds.value = storedUndo
   const loaded = refreshAccounts()
@@ -4533,7 +4576,7 @@ async function enter(st, deepId = 0) {
   connectEvents()
   refreshScheduledCount()
   obRecover()
-  resumeSendCountdowns()
+  void rebuildSendState()
   loadPending()
   if (!did) {
     booted = true
@@ -4614,12 +4657,6 @@ function onSessionsRevoked() {
   booted = false
   disconnectEvents()
   resetToAuth()
-}
-
-function onThreadedChange(v) {
-  threaded.value = v
-  localStorage.setItem('namakani_threaded', v ? '1' : '0')
-  if (!searching.value) loadMessages()
 }
 
 function onAppSettings(s) {
@@ -5094,7 +5131,7 @@ onBeforeUnmount(() => {
                 </p>
               </template>
               <template v-else>
-                <template v-for="(m, idx) in displayMessages" :key="threaded && listSnap.kind !== 'search' && m.thread_key ? 't' + m.account_id + ':' + m.thread_key : m.id">
+                <template v-for="(m, idx) in displayMessages" :key="listSnap.kind !== 'search' && m.thread_key ? 't' + m.account_id + ':' + m.thread_key : m.id">
                   <div class="mail-row-wrap" :style="rowWrapStyle(m)">
                     <div
                       class="swipe-bg swipe-bg-left swipe-bg-delete"
@@ -5137,7 +5174,7 @@ onBeforeUnmount(() => {
                           {{ m.from_name || m.from_email || t('(未知发件人)') }}
                         </span>
                         <span
-                          v-if="threaded && !searching && (m.thread_count ?? 1) > 1"
+                          v-if="!searching && (m.thread_count ?? 1) > 1"
                           class="row-thread"
                         >
                           {{ t('共 {n} 封', { n: m.thread_count }) }}<template v-if="m.thread_unread">{{ t('，{n} 未读', { n: m.thread_unread }) }}</template>
@@ -5192,7 +5229,7 @@ onBeforeUnmount(() => {
                           {{ m.from_name || m.from_email || t('(未知发件人)') }}
                         </span>
                         <span
-                          v-if="threaded && !searching && (m.thread_count ?? 1) > 1"
+                          v-if="!searching && (m.thread_count ?? 1) > 1"
                           class="text-caption text-medium-emphasis text-no-wrap"
                         >
                           {{ t('共 {n} 封', { n: m.thread_count }) }}<template v-if="m.thread_unread">{{ t('，{n} 未读', { n: m.thread_unread }) }}</template>
@@ -5756,12 +5793,10 @@ onBeforeUnmount(() => {
               :accounts-status="accountsStatus"
               :statuses="statuses"
               :theme-mode="themeMode"
-              :threaded="threaded"
               :undo-seconds="undoSeconds"
               :version="appVersion"
               @changed="refreshAccounts"
               @update:theme-mode="setThemeMode"
-              @update:threaded="onThreadedChange"
               @update:undo-seconds="onUndoSecondsChange"
               @app-settings="onAppSettings"
               @revoked="onSessionsRevoked"

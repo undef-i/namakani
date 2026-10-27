@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"namakani/internal/mail"
+	"namakani/internal/gmail"
 	"namakani/internal/proton"
 	"namakani/internal/store"
 	"namakani/internal/tuta"
@@ -154,6 +155,12 @@ func (s *Server) deliverOutgoing(key []byte, out *outgoing) (string, error) {
 			return "", err
 		}
 		return sess.SendRaw(out.raw)
+	case "gmail":
+		sess, err := gmail.Connect(s.st, out.acct)
+		if err != nil {
+			return "", err
+		}
+		return sess.SendRaw(out.raw)
 	}
 	if err := mail.SendSMTP(out.acct, out.acct.Email, out.rcpts, out.raw); err != nil {
 		return "", err
@@ -179,6 +186,12 @@ func (s *Server) fileOutgoingCopy(key []byte, out *outgoing, sentID string) (int
 		return s.fileSentCopy(out.acct, sess, sentID, out)
 	case "tuta":
 		sess, err := tuta.Connect(s.st, out.acct)
+		if err != nil {
+			return 0, err
+		}
+		return s.fileSentCopy(out.acct, sess, sentID, out)
+	case "gmail":
+		sess, err := gmail.Connect(s.st, out.acct)
 		if err != nil {
 			return 0, err
 		}
@@ -881,13 +894,9 @@ func (s *Server) listScheduledAsMessages(w http.ResponseWriter, q url.Values, li
 	if wm, err := s.st.ListVersion(); err == nil {
 		w.Header().Set("X-WM-Ver", strconv.FormatInt(wm, 10))
 	}
-	if q.Get("threaded") == "1" {
-		out := []threadOut{}
-		for _, mo := range page {
-			out = append(out, threadOut{messageOut: mo, ThreadCount: 1})
-		}
-		writeJSON(w, http.StatusOK, out)
-		return
+	out := []threadOut{}
+	for _, mo := range page {
+		out = append(out, threadOut{messageOut: mo, ThreadCount: 1})
 	}
-	writeJSON(w, http.StatusOK, page)
+	writeJSON(w, http.StatusOK, out)
 }

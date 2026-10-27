@@ -148,6 +148,30 @@ func (s *Server) handleUndoOp(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) handleGetOp(w http.ResponseWriter, r *http.Request) {
+	opID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "操作编号不对")
+		return
+	}
+	o, err := s.st.GetOp(opID)
+	if err != nil {
+		s.writeOpStateErr(w, http.StatusNotFound, "操作不存在", opID)
+		return
+	}
+	out := map[string]any{
+		"op_id": o.ID, "type": o.Type, "status": o.Status,
+		"not_before": o.NotBefore, "sealed": o.Sealed, "sent": false,
+	}
+	if o.Type == store.OpSend {
+		var sp sendOpPayload
+		if err := json.Unmarshal([]byte(o.Payload), &sp); err == nil {
+			out["sent"] = sp.Sent
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 type attentionOut struct {
 	OpID         int64  `json:"op_id"`
 	AccountID    int64  `json:"account_id"`

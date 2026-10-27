@@ -780,7 +780,7 @@ async function doSend() {
   pendingOpId = res.op_id
   pendingNotBefore = res.not_before
   open.value = false
-  emit('done')
+  emit('done', { op_id: res.op_id, not_before: res.not_before })
   if (!props.undoSeconds || props.undoSeconds <= 0) {
     pendingOpId = 0
     return
@@ -1529,7 +1529,7 @@ function onKeydown(e) {
     <template v-if="sendBar === 'countdown'">{{ t('正在发送，{n} 秒后发出', { n: undoLeft }) }}</template>
     <template v-else-if="sendBar === 'failed'">{{ t('发送失败') }}</template>
     <template v-else>{{ t('正在发送') }}</template>
-    <template v-if="sendBar === 'countdown' || sendBar === 'sending'" #actions>
+    <template v-if="sendBar === 'countdown'" #actions>
       <v-btn color="warning" variant="text" @click="undoSend">{{ t('撤销') }}</v-btn>
     </template>
   </v-snackbar>

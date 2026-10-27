@@ -22,8 +22,8 @@ func TestListMessagesCarriesPlacementWatermark(t *testing.T) {
 	f := newDrainFixture(t)
 	f.addMessage(t, 10, 1, "INBOX", 110, 0)
 	f.addMessage(t, 11, 1, "INBOX", 111, 0)
-	if got := listHeaderVer(t, f, "/api/messages?special=inbox&limit=60&offset=0&threaded=1"); got != "2" {
-		t.Fatalf("threaded watermark = %q, want 2 (two inserts are two placements)", got)
+	if got := listHeaderVer(t, f, "/api/messages?special=inbox&limit=60&offset=0"); got != "2" {
+		t.Fatalf("list watermark = %q, want 2 (two inserts are two placements)", got)
 	}
 	if _, err := f.st.DB.Exec(`UPDATE messages SET flags = 1 WHERE id = 10`); err != nil {
 		t.Fatalf("flags update: %v", err)

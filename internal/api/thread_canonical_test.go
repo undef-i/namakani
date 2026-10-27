@@ -177,7 +177,7 @@ func TestThreadMembersAllOnlyRowStandsIn(t *testing.T) {
 func TestThreadedListCountsWholeGroupInEveryScope(t *testing.T) {
 	f := newThreadFixture(t)
 	for _, special := range []string{"inbox", "trash", "all"} {
-		out := f.listThreads(t, "threaded=1&special="+special)
+		out := f.listThreads(t, "special="+special)
 		var hit *threadOut
 		for i := range out {
 			if out[i].AccountID == 1 && out[i].ThreadKey == "root@x" {

@@ -15,6 +15,7 @@ import (
 	"namakani/internal/mail"
 	"namakani/internal/proton"
 	"namakani/internal/store"
+	"namakani/internal/gmail"
 	"namakani/internal/tuta"
 
 	"github.com/emersion/go-imap/v2"
@@ -248,6 +249,10 @@ func classifySessionError(acct mail.Account, err error) (bool, string) {
 		if errors.As(err, &re) && (re.StatusCode == 401 || re.StatusCode == 403) {
 			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。"
 		}
+	case "gmail":
+		if gmail.IsAuthError(err) {
+			return true, "保存的登录凭据已被拒绝，请点「重新连接」重新授权。"
+		}
 	default:
 		var ie *imap.Error
 		if errors.As(err, &ie) && ie.Code == imap.ResponseCodeAuthenticationFailed {
@@ -358,6 +363,9 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 	}
 	if acct.Kind == "tuta" {
 		return m.tutaSession(ctx, acct, release)
+	}
+	if acct.Kind == "gmail" {
+		return m.gmailSession(ctx, acct, release)
 	}
 	wake := make(chan struct{}, 1)
 	notify := func() {

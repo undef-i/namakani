@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"namakani/internal/auth"
+	"namakani/internal/gmail"
 	"namakani/internal/mail"
 	"namakani/internal/proton"
 	"namakani/internal/store"
@@ -394,6 +395,10 @@ func classifyOpError(err error) (permanent, gone bool) {
 		default:
 			return true, false
 		}
+	}
+	var ge *gmail.APIError
+	if errors.As(err, &ge) {
+		return gmail.ClassifyError(err)
 	}
 	if term, _ := proton.ClassifyError(err); term {
 		return true, false

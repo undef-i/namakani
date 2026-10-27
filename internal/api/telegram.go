@@ -17,10 +17,9 @@ import (
 )
 
 const (
-	settingTGEnabled    = "tg_enabled"
-	settingTGChatID     = "tg_chat_id"
-	settingTGTokenEnc   = "tg_token_enc"
-	settingTGPublicBase = "tg_public_base"
+	settingTGEnabled  = "tg_enabled"
+	settingTGChatID   = "tg_chat_id"
+	settingTGTokenEnc = "tg_token_enc"
 )
 
 type tgConfig struct {
@@ -47,13 +46,11 @@ func (s *Server) tgLoadConfig() tgConfig {
 			}
 		}
 	}
-	if v, ok, _ := s.st.GetSetting(settingTGPublicBase); ok {
-		cfg.PublicBase = strings.TrimRight(strings.TrimSpace(v), "/")
-	}
+	cfg.PublicBase = s.st.BaseURL()
 	return cfg
 }
 
-func tgNormalizePublicBase(v string) (string, bool) {
+func normalizeBaseURL(v string) (string, bool) {
 	v = strings.TrimRight(strings.TrimSpace(v), "/")
 	if v == "" {
 		return "", true
@@ -302,19 +299,17 @@ func tgCallCtx(ctx context.Context, token, method string, payload any) (json.Raw
 func (s *Server) handleGetTelegram(w http.ResponseWriter, r *http.Request) {
 	cfg := s.tgLoadConfig()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":     cfg.Enabled,
-		"chat_id":     cfg.ChatID,
-		"has_token":   cfg.HasTok,
-		"public_base": cfg.PublicBase,
+		"enabled":   cfg.Enabled,
+		"chat_id":   cfg.ChatID,
+		"has_token": cfg.HasTok,
 	})
 }
 
 func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Enabled    bool   `json:"enabled"`
-		ChatID     string `json:"chat_id"`
-		BotToken   string `json:"bot_token"`
-		PublicBase string `json:"public_base"`
+		Enabled  bool   `json:"enabled"`
+		ChatID   string `json:"chat_id"`
+		BotToken string `json:"bot_token"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求格式不对")
@@ -322,11 +317,6 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ChatID = strings.TrimSpace(req.ChatID)
 	req.BotToken = strings.TrimSpace(req.BotToken)
-	publicBase, ok := tgNormalizePublicBase(req.PublicBase)
-	if !ok {
-		writeErr(w, http.StatusBadRequest, "公开地址格式不对，应以 http:// 或 https:// 开头，例如 https://mail.example.com")
-		return
-	}
 
 	if req.BotToken != "" {
 		if s.serverKey == nil {
@@ -345,10 +335,6 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.st.SetSetting(settingTGChatID, req.ChatID); err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存聊天编号失败")
-		return
-	}
-	if err := s.st.SetSetting(settingTGPublicBase, publicBase); err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存公开地址失败")
 		return
 	}
 	enabled := "0"

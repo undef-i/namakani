@@ -3,13 +3,15 @@ package store
 import (
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 type AppSettings struct {
-	CacheBudgetGB     int64 `json:"cache_budget_gb"`
-	SyncBatch         int   `json:"sync_batch"`
-	MaxAttachmentMB   int64 `json:"max_attachment_mb"`
-	PushWindowMinutes int64 `json:"push_window_minutes"`
+	CacheBudgetGB     int64  `json:"cache_budget_gb"`
+	SyncBatch         int    `json:"sync_batch"`
+	MaxAttachmentMB   int64  `json:"max_attachment_mb"`
+	PushWindowMinutes int64  `json:"push_window_minutes"`
+	BaseURL           string `json:"base_url"`
 }
 
 func DefaultAppSettings() AppSettings {
@@ -26,6 +28,7 @@ const (
 	settingSyncBatch     = "app_sync_batch"
 	settingMaxAttachMB   = "app_max_attachment_mb"
 	settingPushWindowMin = "app_push_window_minutes"
+	settingBaseURL       = "base_url"
 )
 
 func (s *Store) loadAppSettings() {
@@ -44,6 +47,9 @@ func (s *Store) loadAppSettings() {
 	read(settingSyncBatch, &batch)
 	if batch > 0 {
 		cfg.SyncBatch = int(batch)
+	}
+	if v, ok, err := s.GetSetting(settingBaseURL); err == nil && ok {
+		cfg.BaseURL = v
 	}
 	s.appMu.Lock()
 	s.app = cfg
@@ -67,10 +73,17 @@ func (s *Store) SaveAppSettings(cfg AppSettings) error {
 			return fmt.Errorf("save setting %s: %w", key, err)
 		}
 	}
+	if err := s.SetSetting(settingBaseURL, cfg.BaseURL); err != nil {
+		return fmt.Errorf("save setting %s: %w", settingBaseURL, err)
+	}
 	s.appMu.Lock()
 	s.app = cfg
 	s.appMu.Unlock()
 	return nil
+}
+
+func (s *Store) BaseURL() string {
+	return strings.TrimRight(strings.TrimSpace(s.AppSettings().BaseURL), "/")
 }
 
 func (s *Store) CacheBudgetBytes() int64 {

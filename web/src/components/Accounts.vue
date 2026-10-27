@@ -8,7 +8,7 @@ import RawError from './RawError.vue'
 
 const display = useDisplay()
 const lgAndUp = computed(() => display.lgAndUp.value)
-const activeSection = ref('accounts')
+const activeSection = ref('general')
 
 const FIRST_RELEASE_YEAR = 2026
 const copyrightYears = computed(() => {
@@ -21,14 +21,13 @@ function showSection(s) {
 }
 
 const SECTIONS = computed(() => [
-  { key: 'accounts', label: t('账号'), icon: 'mdi-account-multiple' },
-  { key: 'appearance', label: t('外观'), icon: 'mdi-palette' },
+  { key: 'general', label: t('通用'), icon: 'mdi-palette' },
+  { key: 'accounts', label: t('账号与认证'), icon: 'mdi-account-multiple' },
   { key: 'compose', label: t('写信与发送'), icon: 'mdi-email-edit' },
+  { key: 'push', label: t('通知'), icon: 'mdi-bell' },
   { key: 'translate', label: t('翻译'), icon: 'mdi-translate' },
-  { key: 'push', label: t('推送'), icon: 'mdi-bell' },
-  { key: 'advanced', label: t('高级'), icon: 'mdi-cog' },
-  { key: 'tokens', label: t('访问令牌'), icon: 'mdi-key' },
-  { key: 'sessions', label: t('会话'), icon: 'mdi-lock-outline' },
+  { key: 'advanced', label: t('同步与存储'), icon: 'mdi-cog' },
+  { key: 'security', label: t('安全与访问'), icon: 'mdi-lock-outline' },
 ])
 
 const props = defineProps({
@@ -36,15 +35,15 @@ const props = defineProps({
   accountsStatus: { type: String, default: 'ready' },
   statuses: { type: Object, default: () => ({}) },
   themeMode: { type: String, default: 'system' },
-  threaded: { type: Boolean, default: false },
   undoSeconds: { type: Number, default: 5 },
   version: { type: String, default: '' },
 })
-const emit = defineEmits(['changed', 'update:themeMode', 'update:threaded', 'update:undoSeconds', 'appSettings', 'revoked'])
+const emit = defineEmits(['changed', 'update:themeMode', 'update:undoSeconds', 'appSettings', 'revoked'])
 
 function kindText(a) {
   if (a.kind === 'proton') return 'Proton Mail'
   if (a.kind === 'tuta') return 'Tuta Mail'
+  if (a.kind === 'gmail') return 'Gmail'
   return (
     'IMAP ' + a.imap_host + ':' + a.imap_port + ' (' + a.imap_tls + ')' + t('，') +
     'SMTP ' + a.smtp_host + ':' + a.smtp_port + ' (' + a.smtp_tls + ')'
@@ -135,6 +134,15 @@ const rcError = ref('')
 const rcBusy = ref(false)
 
 async function reconnect(a) {
+  if (a.kind === 'gmail') {
+    try {
+      const res = await api.gmailStart({ account_id: a.id })
+      window.location.assign(res.auth_url)
+    } catch (err) {
+      showSnack(t('重新授权失败：{error}', { error: t(err.message) }))
+    }
+    return
+  }
   if (a.kind === 'proton') {
     rcTarget.value = a
     rcForm.value = { password: '', mailbox_password: '', totp: '', captcha_token: '' }
@@ -314,9 +322,28 @@ watch(
   { deep: true },
 )
 
+async function gmailAuthorize() {
+  formError.value = ''
+  try {
+    const res = await api.gmailStart({
+      label: form.value.label,
+      email: form.value.email,
+      from_name: form.value.from_name,
+      signature: form.value.signature,
+    })
+    window.location.assign(res.auth_url)
+  } catch (err) {
+    formError.value = t(err.message)
+  }
+}
+
 async function submit(mode) {
   pendingMode.value = mode
   formError.value = ''
+  if (form.value.kind === 'gmail' && !editing.value) {
+    if (mode !== 'test') await gmailAuthorize()
+    return
+  }
   const payload = {
     ...form.value,
     imap_port: Number(form.value.imap_port),
@@ -461,7 +488,7 @@ async function confirmDelete() {
 }
 
 
-const tg = ref({ enabled: false, chat_id: '', bot_token: '', has_token: false, public_base: '' })
+const tg = ref({ enabled: false, chat_id: '', bot_token: '', has_token: false })
 const tgStatus = ref('loading')
 const tgMsg = ref('')
 const tgBusy = ref('')
@@ -480,7 +507,6 @@ async function loadTG() {
       chat_id: s.chat_id || '',
       bot_token: '',
       has_token: !!s.has_token,
-      public_base: s.public_base || '',
     }
     tgStatus.value = 'ready'
   } catch (err) {
@@ -496,11 +522,9 @@ async function saveTG() {
       enabled: tg.value.enabled,
       chat_id: tg.value.chat_id,
       bot_token: tg.value.bot_token,
-      public_base: tg.value.public_base,
     })
     tg.value.has_token = !!s.has_token
     tg.value.bot_token = ''
-    tg.value.public_base = s.public_base || ''
     showSnack(t('已保存'))
   } catch (err) {
     showSnack(t('保存失败：{error}', { error: t(err.message) }))
@@ -655,7 +679,7 @@ async function testWP() {
 const appSetState = ref('loading')
 const appSetError = ref('')
 const appSetBusy = ref(false)
-const appSet = ref({ cache_budget_gb: 4, sync_batch: 100, max_attachment_mb: 20, push_window_minutes: 15 })
+const appSet = ref({ cache_budget_gb: 4, sync_batch: 100, max_attachment_mb: 20, push_window_minutes: 15, base_url: '' })
 const appSetUsed = ref(0)
 const appSetBudgetBytes = ref(0)
 const appSetLeft = computed(() => Math.max(0, appSetBudgetBytes.value - appSetUsed.value))
@@ -820,6 +844,7 @@ async function saveAppSet() {
       sync_batch: Number(appSet.value.sync_batch),
       max_attachment_mb: Number(appSet.value.max_attachment_mb),
       push_window_minutes: Number(appSet.value.push_window_minutes),
+      base_url: appSet.value.base_url || '',
     }
     await api.saveAppSettings(payload)
     emit('appSettings', payload)
@@ -829,6 +854,39 @@ async function saveAppSet() {
     showSnack(t('保存失败：{error}', { error: t(err.message) }))
   } finally {
     appSetBusy.value = false
+  }
+}
+
+const oauthState = ref('loading')
+const oauthError = ref('')
+const oauth = ref({ client_id: '', client_secret: '', has_secret: false })
+const oauthBusy = ref(false)
+
+async function loadOAuth() {
+  oauthState.value = 'loading'
+  try {
+    const res = await api.getGmailOAuth()
+    oauth.value = { client_id: res.client_id || '', client_secret: '', has_secret: !!res.has_secret }
+    oauthState.value = 'ready'
+  } catch (err) {
+    oauthError.value = t(err.message)
+    oauthState.value = 'error'
+  }
+}
+
+async function saveOAuth() {
+  oauthBusy.value = true
+  try {
+    const res = await api.saveGmailOAuth({
+      client_id: oauth.value.client_id.trim(),
+      client_secret: oauth.value.client_secret,
+    })
+    oauth.value = { client_id: res.client_id || '', client_secret: '', has_secret: !!res.has_secret }
+    showSnack(t('已保存'))
+  } catch (err) {
+    showSnack(t('保存失败：{error}', { error: t(err.message) }))
+  } finally {
+    oauthBusy.value = false
   }
 }
 
@@ -915,6 +973,7 @@ async function confirmRevokeAllSessions() {
 
 onMounted(() => {
   loadAppSet()
+  loadOAuth()
   loadTG()
   loadWP()
   loadTranslate()
@@ -1023,10 +1082,42 @@ onMounted(() => {
         </v-card-text>
       </v-card>
     </div>
+
+    <div class="text-subtitle-1 font-weight-medium mb-3 mt-8">Google OAuth 客户端</div>
+    <template v-if="oauthState === 'loading'">
+      <v-skeleton-loader type="article" max-width="640" class="skel-clip" />
+    </template>
+    <template v-else-if="oauthState === 'error'">
+      <v-alert type="error" variant="tonal" density="compact" max-width="640">
+        {{ t('设置加载失败：{error}', { error: oauthError }) }}
+        <v-btn variant="text" size="small" @click="loadOAuth">{{ t('重试') }}</v-btn>
+      </v-alert>
+    </template>
+    <div v-else style="max-width: 640px">
+      <v-text-field
+        v-model="oauth.client_id"
+        :label="t('Google OAuth 客户端 ID')"
+        variant="filled"
+        density="comfortable"
+        autocomplete="off"
+        class="mb-2"
+      />
+      <v-text-field
+        v-model="oauth.client_secret"
+        :label="t('Google OAuth 客户端密钥')"
+        type="password"
+        variant="filled"
+        density="comfortable"
+        autocomplete="off"
+        :placeholder="oauth.has_secret ? t('已保存，留空不改') : ''"
+        class="mb-2"
+      />
+      <v-btn color="primary" :loading="oauthBusy" @click="saveOAuth">{{ t('保存') }}</v-btn>
+    </div>
     </section>
 
-    <section v-if="showSection('appearance')">
-    <h2 class="text-h6 mb-3">{{ t('外观') }}</h2>
+    <section v-if="showSection('general')">
+    <h2 class="text-h6 mb-3">{{ t('通用') }}</h2>
     <div style="max-width: 640px">
       <div class="text-body-2 mb-2">{{ t('深色模式') }}</div>
       <v-btn-toggle
@@ -1042,14 +1133,6 @@ onMounted(() => {
         <v-btn value="light" prepend-icon="mdi-weather-sunny">{{ t('浅色') }}</v-btn>
         <v-btn value="dark" prepend-icon="mdi-weather-night">{{ t('深色') }}</v-btn>
       </v-btn-toggle>
-      <v-switch
-        :model-value="threaded"
-        :label="t('按线程显示邮件')"
-        color="primary"
-        hide-details
-        class="mb-2"
-        @update:model-value="emit('update:threaded', $event)"
-      />
       <v-select
         :model-value="lang"
         :items="[
@@ -1064,12 +1147,31 @@ onMounted(() => {
         class="mt-4"
         @update:model-value="setLang"
       />
+      <v-skeleton-loader v-if="appSetState === 'loading'" type="text" class="skel-clip mt-4" style="max-width: 480px" />
+      <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" density="compact" class="mt-4" style="max-width: 480px">
+        {{ t('设置加载失败：{error}', { error: appSetError }) }}
+        <v-btn variant="text" size="small" @click="loadAppSet">{{ t('重试') }}</v-btn>
+      </v-alert>
+      <template v-else>
+        <v-text-field
+          v-model="appSet.base_url"
+          :label="t('Base URL')"
+          variant="filled"
+          density="comfortable"
+          hide-details
+          autocomplete="off"
+          :placeholder="t('如 https://mail.example.com')"
+          class="mt-4"
+          style="max-width: 480px"
+        />
+        <v-btn color="primary" class="mt-3" :loading="appSetBusy" @click="saveAppSet">{{ t('保存') }}</v-btn>
+      </template>
     </div>
 
     </section>
 
     <section v-if="showSection('advanced')">
-    <h2 class="text-h6 mb-3">{{ t('同步与缓存') }}</h2>
+    <h2 class="text-h6 mb-3">{{ t('同步与存储') }}</h2>
     <v-skeleton-loader v-if="appSetState === 'loading'" type="article" class="skel-clip" />
     <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" class="mb-3">
       {{ t('设置加载失败：{error}', { error: appSetError }) }}
@@ -1102,15 +1204,6 @@ onMounted(() => {
           v-model.number="appSet.max_attachment_mb"
           type="number"
           :label="t('附件上限 (MB)')"
-          variant="filled"
-          density="comfortable"
-          hide-details
-          style="max-width: 200px"
-        />
-        <v-text-field
-          v-model.number="appSet.push_window_minutes"
-          type="number"
-          :label="t('推送窗口 (分钟)')"
           variant="filled"
           density="comfortable"
           hide-details
@@ -1240,7 +1333,7 @@ onMounted(() => {
     </section>
 
     <section v-if="showSection('push')">
-    <h2 class="text-h6 mb-3">{{ t('推送') }}</h2>
+    <h2 class="text-h6 mb-3">{{ t('通知') }}</h2>
     <div class="text-subtitle-1 font-weight-medium mb-3">Telegram</div>
     <template v-if="tgStatus === 'loading'">
       <v-skeleton-loader type="article" max-width="640" class="skel-clip" />
@@ -1270,15 +1363,6 @@ onMounted(() => {
         density="comfortable"
         autocomplete="off"
         :placeholder="t('如 123456789')"
-        class="mb-2"
-      />
-      <v-text-field
-        v-model="tg.public_base"
-        :label="t('公开地址')"
-        variant="filled"
-        density="comfortable"
-        autocomplete="off"
-        :placeholder="t('如 https://mail.example.com')"
         class="mb-2"
       />
       <div class="d-flex align-center ga-2">
@@ -1322,10 +1406,31 @@ onMounted(() => {
       </div>
     </div>
 
+    <div class="text-subtitle-1 font-weight-medium mb-3 mt-8">{{ t('推送窗口') }}</div>
+    <v-skeleton-loader v-if="appSetState === 'loading'" type="text" class="skel-clip" style="max-width: 480px" />
+    <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" density="compact" style="max-width: 640px">
+      {{ t('设置加载失败：{error}', { error: appSetError }) }}
+      <v-btn variant="text" size="small" @click="loadAppSet">{{ t('重试') }}</v-btn>
+    </v-alert>
+    <div v-else style="max-width: 640px">
+      <v-text-field
+        v-model.number="appSet.push_window_minutes"
+        type="number"
+        :label="t('推送窗口 (分钟)')"
+        variant="filled"
+        density="comfortable"
+        hide-details
+        style="max-width: 200px"
+        class="mb-3"
+      />
+      <v-btn color="primary" :loading="appSetBusy" @click="saveAppSet">{{ t('保存') }}</v-btn>
+    </div>
+
     </section>
 
-    <section v-if="showSection('tokens')">
-    <h2 class="text-h6 mb-3">{{ t('访问令牌') }}</h2>
+    <section v-if="showSection('security')">
+    <h2 class="text-h6 mb-3">{{ t('安全与访问') }}</h2>
+    <div class="text-subtitle-1 font-weight-medium mb-3">{{ t('访问令牌') }}</div>
     <template v-if="tokensState === 'loading'">
       <v-skeleton-loader type="article" max-width="640" class="skel-clip" />
     </template>
@@ -1372,10 +1477,8 @@ onMounted(() => {
         </v-card-text>
       </v-card>
     </div>
-    </section>
 
-    <section v-if="showSection('sessions')">
-    <h2 class="text-h6 mb-3">{{ t('会话') }}</h2>
+    <div class="text-subtitle-1 font-weight-medium mb-3 mt-8">{{ t('会话') }}</div>
     <div style="max-width: 640px">
       <v-btn color="error" @click="askRevokeAllSessions">{{ t('吊销全部会话') }}</v-btn>
     </div>
@@ -1401,6 +1504,7 @@ onMounted(() => {
               { title: t('IMAP/SMTP'), value: 'imap' },
               { title: 'Proton Mail', value: 'proton' },
               { title: 'Tuta Mail', value: 'tuta' },
+              { title: 'Gmail', value: 'gmail' },
             ]"
             :disabled="!!editing"
             variant="filled"
@@ -1408,7 +1512,7 @@ onMounted(() => {
             class="mb-2"
           />
           <v-text-field v-model="form.label" :label="t('名称')" variant="filled" density="comfortable" :placeholder="t('如 工作邮箱')" required class="mb-2" />
-          <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="filled" density="comfortable" required class="mb-2" />
+          <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="filled" density="comfortable" required class="mb-2" :disabled="form.kind === 'gmail' && !!editing" />
           <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="filled" density="comfortable" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
           <v-textarea
             v-model="form.signature"
@@ -1452,6 +1556,11 @@ onMounted(() => {
               <v-btn block color="primary" variant="tonal" prepend-icon="mdi-open-in-new" @click="captchaStep">
                 {{ captchaOpened ? t('完成验证并继续') : t('打开人机验证') }}
               </v-btn>
+            </div>
+          </template>
+          <template v-else-if="form.kind === 'gmail'">
+            <div v-if="editing" class="mb-2">
+              <v-btn size="small" variant="outlined" color="primary" @click="reconnect({ id: editing, kind: 'gmail' })">{{ t('重新连接') }}</v-btn>
             </div>
           </template>
           <template v-else-if="form.kind === 'tuta'">
@@ -1508,7 +1617,7 @@ onMounted(() => {
             </v-row>
             <v-switch v-model="form.tls_skip_verify" :label="t('跳过证书校验')" color="primary" hide-details class="mb-2" />
           </template>
-          <div class="d-flex align-center ga-2 mb-2">
+          <div v-if="form.kind !== 'gmail'" class="d-flex align-center ga-2 mb-2">
             <v-btn
               variant="tonal"
               :prepend-icon="testOk ? 'mdi-check' : 'mdi-connection'"
@@ -1526,7 +1635,7 @@ onMounted(() => {
       <v-card-actions>
         <v-spacer />
         <v-btn variant="text" @click="dialogOpen = false">{{ t('取消') }}</v-btn>
-        <v-btn color="primary" @click="save">{{ t('保存') }}</v-btn>
+        <v-btn color="primary" @click="save">{{ form.kind === 'gmail' && !editing ? t('授权') : t('保存') }}</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>

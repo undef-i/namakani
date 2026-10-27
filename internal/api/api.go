@@ -26,6 +26,7 @@ import (
 
 	"namakani/internal/auth"
 	"namakani/internal/mail"
+	"namakani/internal/gmail"
 	"namakani/internal/proton"
 	"namakani/internal/store"
 	syncmgr "namakani/internal/sync"
@@ -64,6 +65,8 @@ type Server struct {
 	tgRunning     string
 	protonAuthMu  sync.Mutex
 	protonAuth    map[string]protonAuthEntry
+	gmailAuthMu   sync.Mutex
+	gmailAuth     map[string]gmailAuthEntry
 	trMgr         *translate.Manager
 	translateBuild func(cfg translateSettings) (translate.Engine, error)
 	avatarResolve func(ctx context.Context, email string) (string, string, []byte)
@@ -75,7 +78,7 @@ type protonAuthEntry struct {
 }
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
-	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry), drainWake: make(chan struct{}, 1), drainWaves: make(map[int64]*drainWave), connFail: make(map[int64]*connFailState), trMgr: translate.NewManager(filepath.Join(st.DataDir(), "models"))}
+	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry), gmailAuth: make(map[string]gmailAuthEntry), drainWake: make(chan struct{}, 1), drainWaves: make(map[int64]*drainWave), connFail: make(map[int64]*connFailState), trMgr: translate.NewManager(filepath.Join(st.DataDir(), "models"))}
 	s.claimStuckSecs = store.BackoffSeconds(1 << 30)
 	s.drainOpen = s.openDrainConn
 	s.appendOpen = s.openConn
@@ -100,6 +103,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/logout", s.authOnly(s.handleLogout))
 	mux.HandleFunc("GET /api/accounts", s.authOnly(s.handleListAccounts))
 	mux.HandleFunc("POST /api/accounts", s.authOnly(s.handleCreateAccount))
+	mux.HandleFunc("POST /api/accounts/gmail/start", s.authOnly(s.handleGmailStart))
+	mux.HandleFunc("GET /api/gmail/callback", s.handleGmailCallback)
 	mux.HandleFunc("POST /api/accounts/test", s.authOnly(s.handleTestAccountForm))
 	mux.HandleFunc("PUT /api/accounts/{id}", s.authOnly(s.handleUpdateAccount))
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.authOnly(s.handleDeleteAccount))
@@ -132,6 +137,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/settings/access-tokens", s.sessionOnly(s.handleCreateAccessToken))
 	mux.HandleFunc("DELETE /api/settings/access-tokens/{id}", s.sessionOnly(s.handleDeleteAccessToken))
 	mux.HandleFunc("POST /api/settings/sessions/revoke-all", s.sessionOnly(s.handleRevokeAllSessions))
+	mux.HandleFunc("GET /api/settings/gmail-oauth", s.authOnly(s.handleGetGmailOAuth))
+	mux.HandleFunc("PUT /api/settings/gmail-oauth", s.authOnly(s.handlePutGmailOAuth))
 	mux.HandleFunc("GET /api/settings/telegram", s.authOnly(s.handleGetTelegram))
 	mux.HandleFunc("PUT /api/settings/telegram", s.authOnly(s.handlePutTelegram))
 	mux.HandleFunc("POST /api/settings/telegram/discover", s.authOnly(s.handleTelegramDiscover))
@@ -149,6 +156,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/push/subscribe", s.authOnly(s.handlePushSubscribe))
 	mux.HandleFunc("POST /api/push/unsubscribe", s.authOnly(s.handlePushUnsubscribe))
 	mux.HandleFunc("POST /api/messages/mark-all-read", s.authOnly(s.handleMarkAllRead))
+	mux.HandleFunc("GET /api/ops/{id}", s.authOnly(s.handleGetOp))
 	mux.HandleFunc("POST /api/ops/{id}/undo", s.authOnly(s.handleUndoOp))
 	mux.HandleFunc("POST /api/ops/{id}/retry", s.authOnly(s.handleRetryOp))
 	mux.HandleFunc("DELETE /api/ops/{id}", s.authOnly(s.handleDiscardOp))
@@ -510,6 +518,8 @@ type accountIn struct {
 	TOTP            string `json:"totp"`
 	MailboxPassword string `json:"mailbox_password"`
 	CaptchaToken    string `json:"captcha_token"`
+	ClientID        string `json:"client_id"`
+	ClientSecret    string `json:"client_secret"`
 }
 
 type accountOut struct {
@@ -588,6 +598,10 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		s.createTutaAccount(w, key, &in)
 		return
 	}
+	if in.Kind == "gmail" {
+		writeErr(w, http.StatusBadRequest, "Gmail 账号请通过 Google 授权添加")
+		return
+	}
 	imapPort, smtpPort, err := validateAccount(&in, true)
 	if err != nil {
 		writeUserErr(w, http.StatusBadRequest, "账号信息不完整，请检查后重试", err)
@@ -625,6 +639,10 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Kind == "tuta" {
 		s.updateTutaAccount(w, r, key, &in)
+		return
+	}
+	if in.Kind == "gmail" {
+		s.updateGmailAccount(w, r, &in)
 		return
 	}
 	imapPort, smtpPort, err := validateAccount(&in, false)
@@ -922,6 +940,13 @@ func (s *Server) loadMailAccount(id int64, key []byte) (mail.Account, error) {
 	if err != nil {
 		return a, err
 	}
+	if a.Kind == "gmail" {
+		merged, err := s.gmailAccountPassword(id, key, pw)
+		if err != nil {
+			return a, err
+		}
+		pw = merged
+	}
 	a.Password = pw
 	return a, nil
 }
@@ -1213,6 +1238,8 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 		cl, err = proton.Connect(s.st, acct)
 	} else if acct.Kind == "tuta" {
 		cl, err = tuta.Connect(s.st, acct)
+	} else if acct.Kind == "gmail" {
+		cl, err = gmail.Connect(s.st, acct)
 	} else {
 		cl, err = mail.Connect(acct, nil)
 	}
@@ -1555,169 +1582,132 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	if q.Get("threaded") == "1" {
-		type pageThread struct {
-			acct   int64
-			tk     string
-			cnt    int
-			unread int
-			lastTS int64
-			tieID  int64
-			repID  int64
-		}
-		var threads []pageThread
-		kRows, err := tx.Query(`SELECT m.account_id, m.thread_key,
-				MAX(m.date_ts), MAX(m.id)
-			FROM messages m JOIN folders f ON f.id = m.folder_id
-			WHERE `+where+` AND m.thread_key <> ''
-			GROUP BY m.account_id, m.thread_key
-			ORDER BY MAX(m.date_ts) DESC, MAX(m.id) DESC`, args...)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
-			return
-		}
-		for kRows.Next() {
-			var t pageThread
-			if err := kRows.Scan(&t.acct, &t.tk, &t.lastTS, &t.tieID); err != nil {
-				kRows.Close()
-				writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
-				return
-			}
-			threads = append(threads, t)
-		}
-		kRows.Close()
-		if err := kRows.Err(); err != nil {
-			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
-			return
-		}
-		sRows, err := tx.Query(`SELECT m.id, m.account_id, m.date_ts,
-				CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END
-			`+messageJoins+`
-			WHERE `+where+` AND m.thread_key = ''
-			ORDER BY m.date_ts DESC, m.id DESC`, args...)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
-			return
-		}
-		for sRows.Next() {
-			var t pageThread
-			if err := sRows.Scan(&t.repID, &t.acct, &t.lastTS, &t.unread); err != nil {
-				sRows.Close()
-				writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
-				return
-			}
-			t.tk = "id:" + strconv.FormatInt(t.repID, 10)
-			t.cnt = 1
-			t.tieID = t.repID
-			threads = append(threads, t)
-		}
-		sRows.Close()
-		if err := sRows.Err(); err != nil {
-			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
-			return
-		}
-		sort.Slice(threads, func(i, j int) bool {
-			if threads[i].lastTS != threads[j].lastTS {
-				return threads[i].lastTS > threads[j].lastTS
-			}
-			return threads[i].tieID > threads[j].tieID
-		})
-		if offset > len(threads) {
-			offset = len(threads)
-		}
-		end := offset + limit
-		if end > len(threads) {
-			end = len(threads)
-		}
-		page := threads[offset:end]
-		keysByAcct := make(map[int64][]string)
-		for i := range page {
-			if page[i].repID == 0 {
-				keysByAcct[page[i].acct] = append(keysByAcct[page[i].acct], page[i].tk)
-			}
-		}
-		for acct, keys := range keysByAcct {
-			counts, err := s.st.ThreadGroupCountsQ(tx, acct, keys)
-			if err != nil {
-				writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
-				return
-			}
-			for i := range page {
-				if page[i].acct == acct {
-					if gc, ok := counts[page[i].tk]; ok {
-						page[i].cnt = gc.Count
-						page[i].unread = gc.Unread
-					}
-				}
-			}
-		}
-		repIDs := make([]int64, 0, len(page))
-		for i := range page {
-			if page[i].repID == 0 {
-				var id int64
-				repArgs := append(append([]any{}, args...), page[i].acct, page[i].tk)
-				if err := tx.QueryRow(`SELECT m.id
-					FROM messages m JOIN folders f ON f.id = m.folder_id
-					WHERE `+where+` AND m.account_id = ? AND m.thread_key = ?
-					ORDER BY m.date_ts DESC, m.id DESC LIMIT 1`, repArgs...).Scan(&id); err != nil {
-					writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
-					return
-				}
-				page[i].repID = id
-			}
-			repIDs = append(repIDs, page[i].repID)
-		}
-		byID := make(map[int64]messageOut, len(repIDs))
-		for _, mo := range s.messageRowsByIDsQ(tx, repIDs) {
-			byID[mo.ID] = mo
-		}
-		out := []threadOut{}
-		for _, t := range page {
-			mo, ok := byID[t.repID]
-			if !ok {
-				continue
-			}
-			to := threadOut{messageOut: mo, ThreadCount: t.cnt, ThreadUnread: t.unread}
-			if to.ThreadKey == "" {
-				to.ThreadKey = "id:" + strconv.FormatInt(to.ID, 10)
-			}
-			out = append(out, to)
-		}
-		wm, err := listVersionTx(tx)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
-			return
-		}
-		w.Header().Set("X-WM-Ver", strconv.FormatInt(wm, 10))
-		writeJSON(w, http.StatusOK, out)
-		return
+	type pageThread struct {
+		acct   int64
+		tk     string
+		cnt    int
+		unread int
+		lastTS int64
+		tieID  int64
+		repID  int64
 	}
-
-	dbRows, err := tx.Query(`SELECT `+messageCols+` `+messageJoins+
-		` WHERE `+where+` ORDER BY m.date_ts DESC, m.id DESC LIMIT ? OFFSET ?`,
-		append(args, limit, offset)...)
+	var threads []pageThread
+	kRows, err := tx.Query(`SELECT m.account_id, m.thread_key,
+			MAX(m.date_ts), MAX(m.id)
+		FROM messages m JOIN folders f ON f.id = m.folder_id
+		WHERE `+where+` AND m.thread_key <> ''
+		GROUP BY m.account_id, m.thread_key
+		ORDER BY MAX(m.date_ts) DESC, MAX(m.id) DESC`, args...)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 		return
 	}
-	out := []messageOut{}
-	for dbRows.Next() {
-		var mo messageOut
-		if err := scanMessage(dbRows, &mo); err != nil {
-			dbRows.Close()
-			writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+	for kRows.Next() {
+		var t pageThread
+		if err := kRows.Scan(&t.acct, &t.tk, &t.lastTS, &t.tieID); err != nil {
+			kRows.Close()
+			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 			return
 		}
-		out = append(out, mo)
+		threads = append(threads, t)
 	}
-	dbRows.Close()
-	if err := dbRows.Err(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+	kRows.Close()
+	if err := kRows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
 		return
+	}
+	sRows, err := tx.Query(`SELECT m.id, m.account_id, m.date_ts,
+			CASE WHEN (m.flags & 1) = 0 THEN 1 ELSE 0 END
+		`+messageJoins+`
+		WHERE `+where+` AND m.thread_key = ''
+		ORDER BY m.date_ts DESC, m.id DESC`, args...)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+		return
+	}
+	for sRows.Next() {
+		var t pageThread
+		if err := sRows.Scan(&t.repID, &t.acct, &t.lastTS, &t.unread); err != nil {
+			sRows.Close()
+			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+			return
+		}
+		t.tk = "id:" + strconv.FormatInt(t.repID, 10)
+		t.cnt = 1
+		t.tieID = t.repID
+		threads = append(threads, t)
+	}
+	sRows.Close()
+	if err := sRows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+		return
+	}
+	sort.Slice(threads, func(i, j int) bool {
+		if threads[i].lastTS != threads[j].lastTS {
+			return threads[i].lastTS > threads[j].lastTS
+		}
+		return threads[i].tieID > threads[j].tieID
+	})
+	if offset > len(threads) {
+		offset = len(threads)
+	}
+	end := offset + limit
+	if end > len(threads) {
+		end = len(threads)
+	}
+	page := threads[offset:end]
+	keysByAcct := make(map[int64][]string)
+	for i := range page {
+		if page[i].repID == 0 {
+			keysByAcct[page[i].acct] = append(keysByAcct[page[i].acct], page[i].tk)
+		}
+	}
+	for acct, keys := range keysByAcct {
+		counts, err := s.st.ThreadGroupCountsQ(tx, acct, keys)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+			return
+		}
+		for i := range page {
+			if page[i].acct == acct {
+				if gc, ok := counts[page[i].tk]; ok {
+					page[i].cnt = gc.Count
+					page[i].unread = gc.Unread
+				}
+			}
+		}
+	}
+	repIDs := make([]int64, 0, len(page))
+	for i := range page {
+		if page[i].repID == 0 {
+			var id int64
+			repArgs := append(append([]any{}, args...), page[i].acct, page[i].tk)
+			if err := tx.QueryRow(`SELECT m.id
+				FROM messages m JOIN folders f ON f.id = m.folder_id
+				WHERE `+where+` AND m.account_id = ? AND m.thread_key = ?
+				ORDER BY m.date_ts DESC, m.id DESC LIMIT 1`, repArgs...).Scan(&id); err != nil {
+				writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+				return
+			}
+			page[i].repID = id
+		}
+		repIDs = append(repIDs, page[i].repID)
+	}
+	byID := make(map[int64]messageOut, len(repIDs))
+	for _, mo := range s.messageRowsByIDsQ(tx, repIDs) {
+		byID[mo.ID] = mo
+	}
+	out := []threadOut{}
+	for _, t := range page {
+		mo, ok := byID[t.repID]
+		if !ok {
+			continue
+		}
+		to := threadOut{messageOut: mo, ThreadCount: t.cnt, ThreadUnread: t.unread}
+		if to.ThreadKey == "" {
+			to.ThreadKey = "id:" + strconv.FormatInt(to.ID, 10)
+		}
+		out = append(out, to)
 	}
 	wm, err := listVersionTx(tx)
 	if err != nil {
@@ -1730,6 +1720,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-WM-Ver", strconv.FormatInt(wm, 10))
 	writeJSON(w, http.StatusOK, out)
+	return
 }
 
 func listVersionTx(tx *sql.Tx) (int64, error) {
@@ -1765,6 +1756,13 @@ func (s *Server) openConn(key []byte, accountID int64) (mail.Conn, error) {
 	}
 	if acct.Kind == "tuta" {
 		sess, err := tuta.Connect(s.st, acct)
+		if err != nil {
+			return nil, err
+		}
+		return &turnConn{Conn: sess, end: sess.UserTurn()}, nil
+	}
+	if acct.Kind == "gmail" {
+		sess, err := gmail.Connect(s.st, acct)
 		if err != nil {
 			return nil, err
 		}
@@ -3078,6 +3076,12 @@ func (s *Server) handlePutAppSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "设置超出允许范围")
 		return
 	}
+	baseURL, ok := normalizeBaseURL(req.BaseURL)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "Base URL 格式不对，应以 http:// 或 https:// 开头，例如 https://mail.example.com")
+		return
+	}
+	req.BaseURL = baseURL
 	if err := s.st.SaveAppSettings(req); err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存设置失败")
 		return
