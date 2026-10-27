@@ -4521,19 +4521,24 @@ async function enter(st, deepId = 0) {
   threaded.value = localStorage.getItem('namakani_threaded') === '1'
   const storedUndo = parseInt(localStorage.getItem('namakani_undo_seconds') ?? '', 10)
   if ([0, 5, 10, 20, 30].includes(storedUndo)) undoSeconds.value = storedUndo
-  await refreshAccounts()
+  const loaded = refreshAccounts()
+  if (did) {
+    readerNoAnim.value = true
+    history.replaceState(null, '', '#/' + scope.value + (rangeId.value ? '/' + rangeId.value : ''))
+    history.pushState(null, '', '#/mail/' + did)
+    booted = true
+    onHashChange()
+  }
+  await loaded
   connectEvents()
   refreshScheduledCount()
   obRecover()
   resumeSendCountdowns()
   loadPending()
-  if (did) {
-    readerNoAnim.value = true
-    history.replaceState(null, '', '#/' + scope.value + (rangeId.value ? '/' + rangeId.value : ''))
-    history.pushState(null, '', '#/mail/' + did)
+  if (!did) {
+    booted = true
+    onHashChange()
   }
-  booted = true
-  onHashChange()
 }
 
 async function boot() {
