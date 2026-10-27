@@ -11,7 +11,7 @@ func midlessRow() *MessageRow {
 		UID:       21,
 		MessageID: "",
 		Subject:   "测试",
-		FromJSON:  `[{"name":"","email":"admin@example.com"}]`,
+		FromJSON:  `[{"name":"","email":"a@x.test"}]`,
 		ToJSON:    `[{"name":"","email":"b@tuta.test"}]`,
 		CcJSON:    "[]",
 		DateTS:    1761000000,

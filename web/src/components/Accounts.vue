@@ -1378,7 +1378,7 @@ onMounted(() => {
     <div class="text-center text-caption text-medium-emphasis pb-10 mt-8">
       <div>Namakani</div>
       <div v-if="version" class="mt-1">{{ t('版本 {version}', { version }) }}</div>
-      <div class="mt-1">© 2026 namakani</div>
+      <div class="mt-1">© 2026 Namakani</div>
     </div>
     </div>
   </div>
