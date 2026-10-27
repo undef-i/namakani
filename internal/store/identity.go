@@ -20,6 +20,15 @@ func identityForRow(q idQuerier, accountID, rowID int64) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if uid >= provisionalUIDBase {
+		var opAcct int64
+		var opType, opIdentity string
+		if err := q.QueryRow("SELECT account_id, type, identity FROM ops WHERE id = ?",
+			uid-provisionalUIDBase).Scan(&opAcct, &opType, &opIdentity); err == nil &&
+			opAcct == accountID && opType == OpMove && opIdentity != "" {
+			return opIdentity, nil
+		}
+	}
 	var kind string
 	if err := q.QueryRow("SELECT kind FROM accounts WHERE id = ?", accountID).Scan(&kind); err != nil {
 		return "", err
@@ -117,7 +126,22 @@ func candidateRows(q idQuerier, accountID int64, identity string) ([]int64, erro
 				return nil, err
 			}
 		}
-		return out, nil
+		provRows, err := q.Query(`SELECT m.id FROM messages m JOIN ops o
+			ON o.id = m.uid - ? AND o.type = ? AND o.account_id = m.account_id
+			WHERE m.account_id = ? AND m.uid >= ? AND o.identity = ?`,
+			provisionalUIDBase, OpMove, accountID, provisionalUIDBase, identity)
+		if err != nil {
+			return nil, err
+		}
+		defer provRows.Close()
+		for provRows.Next() {
+			var id int64
+			if err := provRows.Scan(&id); err != nil {
+				return nil, err
+			}
+			out = append(out, id)
+		}
+		return out, provRows.Err()
 	case 'm':
 		rows, err := q.Query("SELECT id FROM messages WHERE account_id = ? AND message_id = ?", accountID, val)
 		if err != nil {
