@@ -98,6 +98,10 @@ export const testAccount = (id) => post('/api/accounts/' + id + '/test', {})
 export const getSyncStatus = (id) => req('/api/accounts/' + id + '/sync')
 export const reconnectAccount = (id, payload) => post('/api/accounts/' + id + '/reconnect', payload)
 export const gmailStart = (a) => post('/api/accounts/gmail/start', a)
+export const getGmailPending = (id) => req('/api/accounts/gmail/pending/' + encodeURIComponent(id))
+export const deleteGmailPending = (id) =>
+  req('/api/accounts/gmail/pending/' + encodeURIComponent(id), { method: 'DELETE' })
+export const getGmailReauthed = (id) => req('/api/accounts/gmail/reauth/' + encodeURIComponent(id))
 export const getGmailOAuth = () => req('/api/settings/gmail-oauth')
 export const saveGmailOAuth = (b) =>
   req('/api/settings/gmail-oauth', { method: 'PUT', body: JSON.stringify(b) })
@@ -199,6 +203,7 @@ export const saveTranslateSettings = (b) =>
 export const translateMessage = (id, target) => post('/api/messages/' + id + '/translate', { target })
 export const fetchLLMModels = (b) => post('/api/translate/llm/models', b)
 export const getTranslateModels = () => req('/api/translate/models')
+export const getTranslateLanguages = () => req('/api/translate/languages')
 export const resolveAvatars = (emails) => post('/api/avatars', { emails })
 export const avatarImgURL = (email) => '/api/avatar/img?e=' + encodeURIComponent(email)
 export const getContacts = () => req('/api/contacts')

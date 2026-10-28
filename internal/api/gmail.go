@@ -5,11 +5,13 @@ import (
 	"encoding/hex"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"namakani/internal/auth"
 	"namakani/internal/gmail"
+	"namakani/internal/mail"
 )
 
 const gmailAuthTTL = 10 * time.Minute
@@ -36,6 +38,30 @@ type gmailStartIn struct {
 	AccountID int64  `json:"account_id"`
 }
 
+type gmailPendingEntry struct {
+	label        string
+	email        string
+	fromName     string
+	signature    string
+	enc          string
+	folders      int
+	capabilities []string
+	keyFP        string
+	at           time.Time
+}
+
+type gmailReauthEntry struct {
+	accountID    int64
+	label        string
+	email        string
+	fromName     string
+	signature    string
+	folders      int
+	capabilities []string
+	keyFP        string
+	at           time.Time
+}
+
 func keyFingerprint(key []byte) string {
 	sum := sha256.Sum256(key)
 	return hex.EncodeToString(sum[:])
@@ -47,6 +73,121 @@ func (s *Server) pruneGmailAuthLocked() {
 			delete(s.gmailAuth, state)
 		}
 	}
+}
+
+func (s *Server) pruneGmailPendingLocked() {
+	for id, e := range s.gmailPending {
+		if time.Since(e.at) > gmailAuthTTL {
+			delete(s.gmailPending, id)
+		}
+	}
+}
+
+func (s *Server) gmailPendingFor(id string, key []byte, consume bool) (gmailPendingEntry, bool) {
+	if id == "" {
+		return gmailPendingEntry{}, false
+	}
+	s.gmailPendingMu.Lock()
+	defer s.gmailPendingMu.Unlock()
+	s.pruneGmailPendingLocked()
+	e, ok := s.gmailPending[id]
+	if !ok || e.keyFP != keyFingerprint(key) {
+		return gmailPendingEntry{}, false
+	}
+	if consume {
+		delete(s.gmailPending, id)
+	}
+	return e, true
+}
+
+func (s *Server) handleGetGmailPending(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.credentialKey(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		return
+	}
+	id := r.PathValue("id")
+	e, ok := s.gmailPendingFor(id, key, false)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "授权已过期，请重新发起授权")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pending_id":   id,
+		"label":        e.label,
+		"email":        e.email,
+		"from_name":    e.fromName,
+		"signature":    e.signature,
+		"folders":      e.folders,
+		"capabilities": e.capabilities,
+	})
+}
+
+func (s *Server) handleDeleteGmailPending(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.credentialKey(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		return
+	}
+	if _, ok := s.gmailPendingFor(r.PathValue("id"), key, true); !ok {
+		writeErr(w, http.StatusNotFound, "授权已过期，请重新发起授权")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) pruneGmailReauthLocked() {
+	for id, e := range s.gmailReauth {
+		if time.Since(e.at) > gmailAuthTTL {
+			delete(s.gmailReauth, id)
+		}
+	}
+}
+
+func (s *Server) handleGetGmailReauth(w http.ResponseWriter, r *http.Request) {
+	key, ok := s.credentialKey(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		return
+	}
+	id := r.PathValue("id")
+	s.gmailReauthMu.Lock()
+	s.pruneGmailReauthLocked()
+	e, ok := s.gmailReauth[id]
+	s.gmailReauthMu.Unlock()
+	if !ok || e.keyFP != keyFingerprint(key) {
+		writeErr(w, http.StatusNotFound, "授权已过期，请重新发起授权")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account_id":   e.accountID,
+		"label":        e.label,
+		"email":        e.email,
+		"from_name":    e.fromName,
+		"signature":    e.signature,
+		"folders":      e.folders,
+		"capabilities": e.capabilities,
+	})
+}
+
+func (s *Server) createGmailAccount(w http.ResponseWriter, key []byte, in *accountIn) {
+	e, ok := s.gmailPendingFor(in.GmailPendingID, key, true)
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "请先点测试连接")
+		return
+	}
+	res, err := s.st.DB.Exec(`INSERT INTO accounts(label, email, imap_host, imap_port, imap_tls,
+		smtp_host, smtp_port, smtp_tls, username, enc_password, signature, from_name, tls_skip_verify, kind, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.label, e.email, "", 0, "none",
+		"", 0, "none", e.email, e.enc, e.signature, e.fromName, false, "gmail", time.Now().Unix())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "保存账号失败")
+		return
+	}
+	id, _ := res.LastInsertId()
+	s.startWorkerFor(id, key)
+	writeJSON(w, http.StatusCreated, map[string]int64{"id": id})
 }
 
 func (s *Server) handleGmailStart(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +322,27 @@ func (s *Server) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 		gmailAuthFail(w, http.StatusInternalServerError, "加密凭据失败。")
 		return
 	}
+	acct := mail.Account{Kind: "gmail", Email: profile.EmailAddress, Username: profile.EmailAddress, Password: creds.JSON()}
+	cl, err := gmail.Connect(s.st, acct)
+	if err != nil {
+		log.Printf("gmail: callback connect failed: %v", err)
+		gmailAuthFail(w, http.StatusBadGateway, "连接失败，请返回设置页重新发起授权。")
+		return
+	}
+	folders, err := cl.ListFolders()
+	capabilities := cl.Capabilities()
+	cl.Close()
+	if err != nil {
+		log.Printf("gmail: callback list folders failed: %v", err)
+		gmailAuthFail(w, http.StatusBadGateway, "读取文件夹列表失败，请返回设置页重新发起授权。")
+		return
+	}
 	if entry.accountID > 0 {
+		var label, email, fromName, signature string
+		if err := s.st.DB.QueryRow(`SELECT label, email, from_name, signature FROM accounts WHERE id = ? AND kind = 'gmail'`, entry.accountID).Scan(&label, &email, &fromName, &signature); err != nil {
+			gmailAuthFail(w, http.StatusInternalServerError, "读取账号失败。")
+			return
+		}
 		if _, err := s.st.DB.Exec(`UPDATE accounts SET enc_password = ? WHERE id = ? AND kind = 'gmail'`, enc, entry.accountID); err != nil {
 			gmailAuthFail(w, http.StatusInternalServerError, "保存凭据失败。")
 			return
@@ -189,19 +350,52 @@ func (s *Server) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 		if acct, err := s.loadMailAccount(entry.accountID, key); err == nil {
 			s.mgr.Restart(acct)
 		}
-		http.Redirect(w, r, "/#/settings", http.StatusFound)
+		reauthID, err := gmail.RandomState()
+		if err != nil {
+			gmailAuthFail(w, http.StatusInternalServerError, "生成授权状态失败。")
+			return
+		}
+		s.gmailReauthMu.Lock()
+		if s.gmailReauth == nil {
+			s.gmailReauth = make(map[string]gmailReauthEntry)
+		}
+		s.pruneGmailReauthLocked()
+		s.gmailReauth[reauthID] = gmailReauthEntry{
+			accountID:    entry.accountID,
+			label:        label,
+			email:        email,
+			fromName:     fromName,
+			signature:    signature,
+			folders:      len(folders),
+			capabilities: capabilities,
+			keyFP:        keyFingerprint(key),
+			at:           time.Now(),
+		}
+		s.gmailReauthMu.Unlock()
+		http.Redirect(w, r, "/?gmail_reauthed="+url.QueryEscape(reauthID)+"#/settings", http.StatusFound)
 		return
 	}
-	res, err := s.st.DB.Exec(`INSERT INTO accounts(label, email, imap_host, imap_port, imap_tls,
-		smtp_host, smtp_port, smtp_tls, username, enc_password, signature, from_name, tls_skip_verify, kind, created_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		entry.label, profile.EmailAddress, "", 0, "none",
-		"", 0, "none", profile.EmailAddress, enc, entry.signature, entry.fromName, false, "gmail", time.Now().Unix())
+	pendingID, err := gmail.RandomState()
 	if err != nil {
-		gmailAuthFail(w, http.StatusInternalServerError, "保存账号失败。")
+		gmailAuthFail(w, http.StatusInternalServerError, "生成授权状态失败。")
 		return
 	}
-	id, _ := res.LastInsertId()
-	s.startWorkerFor(id, key)
-	http.Redirect(w, r, "/#/settings", http.StatusFound)
+	s.gmailPendingMu.Lock()
+	if s.gmailPending == nil {
+		s.gmailPending = make(map[string]gmailPendingEntry)
+	}
+	s.pruneGmailPendingLocked()
+	s.gmailPending[pendingID] = gmailPendingEntry{
+		label:        entry.label,
+		email:        profile.EmailAddress,
+		fromName:     entry.fromName,
+		signature:    entry.signature,
+		enc:          enc,
+		folders:      len(folders),
+		capabilities: capabilities,
+		keyFP:        keyFingerprint(key),
+		at:           time.Now(),
+	}
+	s.gmailPendingMu.Unlock()
+	http.Redirect(w, r, "/?gmail_pending="+url.QueryEscape(pendingID)+"#/settings", http.StatusFound)
 }

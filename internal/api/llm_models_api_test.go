@@ -82,6 +82,27 @@ func TestLLMModelsEndpointAnthropicShape(t *testing.T) {
 	}
 }
 
+func TestLLMModelsEndpointResponsesShape(t *testing.T) {
+	f := newDrainFixture(t)
+	var capReq llmModelsCapture
+	up := llmModelsUpstream(t, &capReq, http.StatusOK, `{"data":[{"id":"m-resp"}]}`)
+	defer up.Close()
+	rec := postLLMModels(t, f, `{"llm_format":"responses","llm_endpoint":"`+up.URL+`","llm_api_key":"resp-key"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", rec.Code, rec.Body.String())
+	}
+	ids := decodeModelIDs(t, rec)
+	if len(ids) != 1 || ids[0] != "m-resp" {
+		t.Fatalf("models = %v", ids)
+	}
+	if capReq.path != "/v1/models" {
+		t.Fatalf("path = %q, want /v1/models", capReq.path)
+	}
+	if got := capReq.header.Get("Authorization"); got != "Bearer resp-key" {
+		t.Fatalf("authorization = %q", got)
+	}
+}
+
 func TestLLMModelsEndpointUsesSavedKeyWhenFormKeyEmpty(t *testing.T) {
 	f := newDrainFixture(t)
 	f.srv.serverKey = []byte("0123456789abcdef0123456789abcdef")

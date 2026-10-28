@@ -3,11 +3,13 @@ package main
 import (
 	"embed"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"namakani/internal/api"
@@ -34,9 +36,21 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 var uiEmbed embed.FS
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	dataDir := flag.String("data", "./data", "data directory (sqlite db lives here)")
+	addr := flag.String("addr", "", "listen address (required)")
+	dataDir := flag.String("data", "", "data directory (required)")
 	flag.Parse()
+
+	var missing []string
+	if *addr == "" {
+		missing = append(missing, "-addr")
+	}
+	if *dataDir == "" {
+		missing = append(missing, "-data")
+	}
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "missing required flag(s): %s\n", strings.Join(missing, ", "))
+		os.Exit(2)
+	}
 
 	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
 		log.Fatalf("create data dir: %v", err)

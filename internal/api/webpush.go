@@ -210,7 +210,7 @@ func (s *Server) handleWebPushTest(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"title": "namakani",
-		"body":  "测试推送",
+		"body":  "测试消息",
 		"url":   testURL,
 	})
 	sent := s.wpSend(pub, priv, subs, payload)

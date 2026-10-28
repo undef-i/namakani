@@ -1,6 +1,6 @@
 import { createApp } from 'vue'
 import { createVuetify } from 'vuetify'
-import { en, zhHans } from 'vuetify/locale'
+import { en, zhHans, zhHant } from 'vuetify/locale'
 import 'vuetify/styles'
 import './styles.css'
 import '@mdi/font/css/materialdesignicons.css'
@@ -20,9 +20,9 @@ const vuetify = createVuetify({
     VCombobox: { variant: 'filled' },
   },
   locale: {
-    locale: lang.value === 'zh' ? 'zhHans' : 'en',
+    locale: lang.value === 'zh-Hant' ? 'zhHant' : lang.value === 'zh-Hans' ? 'zhHans' : 'en',
     fallback: 'en',
-    messages: { zhHans, en },
+    messages: { zhHans, zhHant, en },
   },
   theme: {
     defaultTheme: 'light',

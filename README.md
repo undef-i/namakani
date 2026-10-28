@@ -9,10 +9,8 @@ Requires Go 1.26 and Node 22.
 ```sh
 cd web && npm install && npm run build && cd ..
 go build -o namakani .
-./namakani
+./namakani -addr <address>:<port> -data <directory>
 ```
-
-Listens on 127.0.0.1:8080 by default, with data in ./data. Both can be changed with -addr and -data.
 
 ## License
 

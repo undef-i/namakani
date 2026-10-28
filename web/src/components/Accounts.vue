@@ -1,8 +1,8 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useDisplay } from 'vuetify'
 import { intlLocale, lang, setLang, t } from '../i18n'
-import { LANGUAGE_CODES } from '../languages'
+import { LANGUAGE_NAMES } from '../language-names'
 import * as api from '../api.js'
 import RawError from './RawError.vue'
 
@@ -245,6 +245,8 @@ const tlsItems = computed(() => [
 
 const dialogOpen = ref(false)
 const editing = ref(null)
+const gmailPendingID = ref('')
+let gmailPendingRestore = false
 const form = ref(emptyForm())
 const formError = ref('')
 const needsTotp = ref(false)
@@ -255,6 +257,7 @@ const deleteTarget = ref(null)
 const deleteOpen = ref(false)
 
 function openCreate() {
+  void discardGmailPending()
   editing.value = null
   form.value = emptyForm()
   formError.value = ''
@@ -267,6 +270,7 @@ function openCreate() {
 }
 
 function openEdit(a) {
+  void discardGmailPending()
   editing.value = a.id
   form.value = { ...emptyForm(), ...a, password: '' }
   formError.value = ''
@@ -312,6 +316,7 @@ watch(
   () => {
     testOk.value = false
     testResult.value = ''
+    if (gmailPendingID.value && !gmailPendingRestore) void discardGmailPending()
     if (form.value.captcha_token && captchaCtx && captchaFingerprint() !== captchaCtx) {
       form.value.captcha_token = ''
       captchaUrl.value = ''
@@ -337,17 +342,88 @@ async function gmailAuthorize() {
   }
 }
 
+async function discardGmailPending() {
+  const id = gmailPendingID.value
+  gmailPendingID.value = ''
+  if (!id) return
+  try {
+    await api.deleteGmailPending(id)
+  } catch {}
+}
+
+function closeAccountDialog() {
+  void discardGmailPending()
+  dialogOpen.value = false
+}
+
+async function restoreGmailPending() {
+  const id = new URLSearchParams(location.search).get('gmail_pending')
+  if (!id) return
+  history.replaceState(null, '', '/' + location.hash)
+  try {
+    const p = await api.getGmailPending(id)
+    activeSection.value = 'accounts'
+    editing.value = null
+    gmailPendingRestore = true
+    form.value = {
+      ...emptyForm(),
+      kind: 'gmail',
+      label: p.label || '',
+      email: p.email || '',
+      from_name: p.from_name || '',
+      signature: p.signature || '',
+    }
+    gmailPendingID.value = id
+    await nextTick()
+    gmailPendingRestore = false
+    resetTestState()
+    testOk.value = true
+    showTestSuccess(p.folders, p.capabilities)
+    dialogOpen.value = true
+  } catch (err) {
+    gmailPendingRestore = false
+    showSnack(t(err.message))
+  }
+}
+
+async function restoreGmailReauthed() {
+  const id = new URLSearchParams(location.search).get('gmail_reauthed')
+  if (!id) return
+  history.replaceState(null, '', '/' + location.hash)
+  try {
+    const p = await api.getGmailReauthed(id)
+    activeSection.value = 'accounts'
+    editing.value = p.account_id
+    form.value = {
+      ...emptyForm(),
+      kind: 'gmail',
+      label: p.label || '',
+      email: p.email || '',
+      from_name: p.from_name || '',
+      signature: p.signature || '',
+    }
+    await nextTick()
+    resetTestState()
+    testOk.value = true
+    showTestSuccess(p.folders, p.capabilities)
+    dialogOpen.value = true
+  } catch (err) {
+    showSnack(t(err.message))
+  }
+}
+
 async function submit(mode) {
   pendingMode.value = mode
   formError.value = ''
-  if (form.value.kind === 'gmail' && !editing.value) {
-    if (mode !== 'test') await gmailAuthorize()
+  if (form.value.kind === 'gmail' && !editing.value && mode === 'test') {
+    await gmailAuthorize()
     return
   }
   const payload = {
     ...form.value,
     imap_port: Number(form.value.imap_port),
     smtp_port: Number(form.value.smtp_port),
+    gmail_pending_id: gmailPendingID.value,
   }
   delete payload.id
   const isTest = mode === 'test'
@@ -388,12 +464,21 @@ async function submit(mode) {
       reportTestResult(res)
       return
     }
+    if (form.value.kind === 'gmail' && !editing.value) gmailPendingID.value = ''
     dialogOpen.value = false
     emit('changed')
   } catch (err) {
     consumeCaptcha(sentToken)
     if (isTest && run !== testRun) return
     if (isTest) {
+      if (
+        form.value.kind === 'gmail' &&
+        editing.value &&
+        err.message === '连接失败，请检查服务器设置和账号密码'
+      ) {
+        void reconnect({ id: editing.value, kind: 'gmail' })
+        return
+      }
       formError.value = t('连接失败：{error}', { error: t(err.message) })
     } else {
       formError.value = t(err.message)
@@ -438,7 +523,7 @@ function reportTestResult(res) {
   needsTotp.value = false
   formError.value = ''
   testResult.value = ''
-  if (form.value.kind === 'proton' || form.value.kind === 'tuta') {
+  if (form.value.kind === 'proton' || form.value.kind === 'tuta' || form.value.kind === 'gmail') {
     testOk.value = true
     if (res && res.folders != null) {
       showTestSuccess(res.folders, res.capabilities)
@@ -667,7 +752,7 @@ async function testWP() {
   try {
     const res = await api.testWebPush()
     wp.value.subscriptions = res.subscriptions || 0
-    showSnack(t('测试推送已发出（送达 {n} 个订阅）', { n: res.sent }))
+    showSnack(t('测试消息已发送（送达 {n} 个订阅）', { n: res.sent }))
   } catch (err) {
     showSnack(t('发送失败：{error}', { error: t(err.message) }))
   } finally {
@@ -706,24 +791,50 @@ const tr = reactive({
 
 const trEngineItems = computed(() => [
   { title: t('谷歌翻译'), value: 'google' },
-  { title: 'LLM', value: 'llm' },
+  { title: t('OpenAI 兼容'), value: 'openai' },
+  { title: t('OpenAI Responses'), value: 'responses' },
+  { title: t('Anthropic 兼容'), value: 'anthropic' },
 ])
+const trEngineSel = computed({
+  get: () => (tr.engine === 'llm' ? tr.llm_format : 'google'),
+  set: (v) => {
+    if (v === 'google') {
+      tr.engine = 'google'
+    } else {
+      tr.engine = 'llm'
+      tr.llm_format = v
+    }
+  },
+})
+const trLangs = ref([])
+const trLangsStatus = ref('loading')
+const trLangsMsg = ref('')
+
+async function loadTranslateLanguages() {
+  trLangsStatus.value = 'loading'
+  try {
+    const res = await api.getTranslateLanguages()
+    trLangs.value = res.languages || []
+    trLangsStatus.value = 'ready'
+  } catch (err) {
+    trLangsStatus.value = 'error'
+    trLangsMsg.value = t(err.message)
+  }
+}
+
 const trTargetItems = computed(() => {
   const items = [{ title: t('跟随界面语言'), value: 'auto' }]
-  for (const code of LANGUAGE_CODES) {
-    items.push({ title: langName(code), value: code })
+  const zh = intlLocale().startsWith('zh')
+  for (const e of trLangs.value) {
+    items.push({ title: (zh ? e.zh || e.en : e.en || e.zh) || e.code, value: e.code })
   }
-  if (tr.target && tr.target !== 'auto' && !LANGUAGE_CODES.includes(tr.target)) {
-    items.push({ title: langName(tr.target), value: tr.target })
+  if (tr.target && tr.target !== 'auto' && !items.some((i) => i.value === tr.target)) {
+    items.push({ title: tr.target, value: tr.target })
   }
   return items
 })
 
 const visiblePairs = computed(() => modelsData.value?.pairs || [])
-const trFormatItems = computed(() => [
-  { title: t('OpenAI 兼容'), value: 'openai' },
-  { title: t('Anthropic 兼容'), value: 'anthropic' },
-])
 
 const trModelList = ref([])
 const trModelsBusy = ref(false)
@@ -758,6 +869,7 @@ async function loadTranslate() {
     Object.assign(tr, res.settings, { llm_api_key: '' })
     trStatus.value = 'ready'
     loadModels()
+    loadTranslateLanguages()
   } catch (err) {
     trStatus.value = 'error'
     trMsg.value = t(err.message)
@@ -797,25 +909,11 @@ async function loadModels() {
   }
 }
 
-let dnCache = { locale: '', dn: null }
-
 function langName(code) {
-  const loc = intlLocale()
-  if (dnCache.locale !== loc) {
-    let dn = null
-    try {
-      dn = new Intl.DisplayNames([loc], { type: 'language' })
-    } catch {
-      dn = null
-    }
-    dnCache = { locale: loc, dn }
-  }
-  if (!dnCache.dn) return code
-  try {
-    return dnCache.dn.of(code) || code
-  } catch {
-    return code
-  }
+  const row = LANGUAGE_NAMES[code]
+  if (!row) return code
+  const ui = intlLocale().startsWith('zh') ? row[0] : row[1]
+  return ui || row[2] || code
 }
 
 function pairTitle(p) {
@@ -978,6 +1076,8 @@ onMounted(() => {
   loadWP()
   loadTranslate()
   loadTokens()
+  restoreGmailPending()
+  restoreGmailReauthed()
 })
 </script>
 
@@ -1097,8 +1197,8 @@ onMounted(() => {
       <v-text-field
         v-model="oauth.client_id"
         :label="t('Google OAuth 客户端 ID')"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
         autocomplete="off"
         class="mb-2"
       />
@@ -1106,8 +1206,8 @@ onMounted(() => {
         v-model="oauth.client_secret"
         :label="t('Google OAuth 客户端密钥')"
         type="password"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
         autocomplete="off"
         :placeholder="oauth.has_secret ? t('已保存，留空不改') : ''"
         class="mb-2"
@@ -1118,8 +1218,12 @@ onMounted(() => {
 
     <section v-if="showSection('general')">
     <h2 class="text-h6 mb-3">{{ t('通用') }}</h2>
-    <div style="max-width: 640px">
-      <div class="text-body-2 mb-2">{{ t('深色模式') }}</div>
+    <v-skeleton-loader v-if="appSetState === 'loading'" type="article" class="skel-clip" style="max-width: 640px" />
+    <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" density="compact" style="max-width: 640px">
+      {{ t('设置加载失败：{error}', { error: appSetError }) }}
+      <v-btn variant="text" size="small" @click="loadAppSet">{{ t('重试') }}</v-btn>
+    </v-alert>
+    <div v-else style="max-width: 640px">
       <v-btn-toggle
         :model-value="themeMode"
         mandatory
@@ -1136,36 +1240,30 @@ onMounted(() => {
       <v-select
         :model-value="lang"
         :items="[
-          { title: '中文', value: 'zh' },
+          { title: '简体中文', value: 'zh-Hans' },
+          { title: '繁體中文', value: 'zh-Hant' },
           { title: 'English', value: 'en' },
         ]"
         :label="t('语言')"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
         hide-details
         style="max-width: 260px"
         class="mt-4"
         @update:model-value="setLang"
       />
-      <v-skeleton-loader v-if="appSetState === 'loading'" type="text" class="skel-clip mt-4" style="max-width: 480px" />
-      <v-alert v-else-if="appSetState === 'error'" type="error" variant="tonal" density="compact" class="mt-4" style="max-width: 480px">
-        {{ t('设置加载失败：{error}', { error: appSetError }) }}
-        <v-btn variant="text" size="small" @click="loadAppSet">{{ t('重试') }}</v-btn>
-      </v-alert>
-      <template v-else>
-        <v-text-field
-          v-model="appSet.base_url"
-          :label="t('Base URL')"
-          variant="filled"
-          density="comfortable"
-          hide-details
-          autocomplete="off"
-          :placeholder="t('如 https://mail.example.com')"
-          class="mt-4"
-          style="max-width: 480px"
-        />
-        <v-btn color="primary" class="mt-3" :loading="appSetBusy" @click="saveAppSet">{{ t('保存') }}</v-btn>
-      </template>
+      <v-text-field
+        v-model="appSet.base_url"
+        :label="t('Base URL')"
+        variant="outlined"
+        density="compact"
+        hide-details
+        autocomplete="off"
+        :placeholder="t('如 https://mail.example.com')"
+        class="mt-4"
+        style="max-width: 480px"
+      />
+      <v-btn color="primary" class="mt-3" :loading="appSetBusy" @click="saveAppSet">{{ t('保存') }}</v-btn>
     </div>
 
     </section>
@@ -1186,8 +1284,8 @@ onMounted(() => {
           v-model.number="appSet.cache_budget_gb"
           type="number"
           :label="t('缓存预算 (GB)')"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           hide-details
           style="max-width: 200px"
         />
@@ -1195,8 +1293,8 @@ onMounted(() => {
           v-model.number="appSet.sync_batch"
           type="number"
           :label="t('同步批量')"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           hide-details
           style="max-width: 200px"
         />
@@ -1204,8 +1302,8 @@ onMounted(() => {
           v-model.number="appSet.max_attachment_mb"
           type="number"
           :label="t('附件上限 (MB)')"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           hide-details
           style="max-width: 200px"
         />
@@ -1222,8 +1320,8 @@ onMounted(() => {
         :model-value="undoSeconds"
         :items="undoItems"
         :label="t('撤销发送等待')"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
         hide-details
         style="max-width: 260px"
         @update:model-value="emit('update:undoSeconds', $event)"
@@ -1244,35 +1342,45 @@ onMounted(() => {
     </template>
     <div v-else style="max-width: 640px">
       <v-select
-        v-model="tr.engine"
+        v-model="trEngineSel"
         :items="trEngineItems"
         :label="t('翻译引擎')"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
         class="mb-2"
       />
-      <v-select
+      <template v-if="tr.engine === 'google'">
+        <v-alert v-if="trLangsStatus === 'error'" type="error" variant="tonal" density="compact" class="mb-2">
+          {{ t('语言名单加载失败：{error}', { error: trLangsMsg }) }}
+          <v-btn variant="text" size="small" @click="loadTranslateLanguages">{{ t('重试') }}</v-btn>
+        </v-alert>
+        <v-select
+          v-else
+          v-model="tr.target"
+          :items="trTargetItems"
+          :label="t('目标语言')"
+          :loading="trLangsStatus === 'loading'"
+          :disabled="trLangsStatus !== 'ready'"
+          variant="outlined"
+          density="compact"
+          class="mb-2"
+        />
+      </template>
+      <v-text-field
+        v-else
         v-model="tr.target"
-        :items="trTargetItems"
         :label="t('目标语言')"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
+        autocomplete="off"
         class="mb-2"
       />
       <template v-if="tr.engine === 'llm'">
-        <v-select
-          v-model="tr.llm_format"
-          :items="trFormatItems"
-          :label="t('接口格式')"
-          variant="filled"
-          density="comfortable"
-          class="mb-2"
-        />
         <v-text-field
           v-model="tr.llm_endpoint"
           :label="t('端点地址')"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           autocomplete="off"
           placeholder="https://api.example.com"
           class="mb-2"
@@ -1281,8 +1389,8 @@ onMounted(() => {
           v-model="tr.llm_model"
           :items="trModelItems"
           :label="t('模型名')"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           class="mb-2"
         />
         <div class="mb-2">
@@ -1293,8 +1401,8 @@ onMounted(() => {
           v-model="tr.llm_api_key"
           :label="t('API Key')"
           type="password"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           autocomplete="off"
           :placeholder="tr.has_key ? t('已保存，留空不改') : ''"
           class="mb-2"
@@ -1350,8 +1458,8 @@ onMounted(() => {
         v-model="tg.bot_token"
         :label="t('Bot Token')"
         type="password"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
         autocomplete="off"
         :placeholder="tg.has_token ? t('已保存，留空不改') : t('如 123456:ABC-DEF...')"
         class="mb-2"
@@ -1359,8 +1467,8 @@ onMounted(() => {
       <v-text-field
         v-model="tg.chat_id"
         :label="t('Chat ID')"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
         autocomplete="off"
         :placeholder="t('如 123456789')"
         class="mb-2"
@@ -1402,7 +1510,7 @@ onMounted(() => {
         {{ t('当前浏览器不支持 Web Push。') }}
       </v-alert>
       <div class="d-flex align-center ga-2">
-        <v-btn variant="outlined" :disabled="wpBusy || !wpSupported" @click="testWP">{{ t('发送测试推送') }}</v-btn>
+        <v-btn variant="outlined" :disabled="wpBusy || !wpSupported" @click="testWP">{{ t('发送测试消息') }}</v-btn>
       </div>
     </div>
 
@@ -1417,8 +1525,8 @@ onMounted(() => {
         v-model.number="appSet.push_window_minutes"
         type="number"
         :label="t('推送窗口 (分钟)')"
-        variant="filled"
-        density="comfortable"
+        variant="outlined"
+        density="compact"
         hide-details
         style="max-width: 200px"
         class="mb-3"
@@ -1445,8 +1553,8 @@ onMounted(() => {
         <v-text-field
           v-model="tokenLabel"
           :label="t('令牌名称')"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           hide-details
           style="max-width: 320px"
           class="mb-3"
@@ -1492,7 +1600,7 @@ onMounted(() => {
     </div>
   </div>
 
-  <v-dialog v-model="dialogOpen" max-width="560">
+  <v-dialog v-model="dialogOpen" max-width="560" @update:model-value="(v) => { if (!v) void discardGmailPending() }">
     <v-card>
       <v-card-title>{{ editing ? t('编辑账号') : t('添加账号') }}</v-card-title>
       <v-card-text>
@@ -1507,18 +1615,18 @@ onMounted(() => {
               { title: 'Gmail', value: 'gmail' },
             ]"
             :disabled="!!editing"
-            variant="filled"
-            density="comfortable"
+            variant="outlined"
+            density="compact"
             class="mb-2"
           />
-          <v-text-field v-model="form.label" :label="t('名称')" variant="filled" density="comfortable" :placeholder="t('如 工作邮箱')" required class="mb-2" />
-          <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="filled" density="comfortable" required class="mb-2" :disabled="form.kind === 'gmail' && !!editing" />
-          <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="filled" density="comfortable" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
+          <v-text-field v-model="form.label" :label="t('名称')" variant="outlined" density="compact" :placeholder="t('如 工作邮箱')" required class="mb-2" />
+          <v-text-field v-model="form.email" :label="t('邮箱')" type="email" variant="outlined" density="compact" required class="mb-2" :disabled="form.kind === 'gmail' && !!editing" />
+          <v-text-field v-model="form.from_name" :label="t('发件人名称')" variant="outlined" density="compact" :placeholder="t('对方收件箱里显示的名字')" class="mb-2" />
           <v-textarea
             v-model="form.signature"
             :label="t('签名')"
-            variant="filled"
-            density="comfortable"
+            variant="outlined"
+            density="compact"
             rows="3"
             class="mb-2"
           />
@@ -1529,8 +1637,8 @@ onMounted(() => {
               v-model="form.password"
               :label="t('登录密码')"
               type="password"
-              variant="filled"
-              density="comfortable"
+              variant="outlined"
+              density="compact"
               :placeholder="editing ? t('留空 = 不修改') : ''"
               :required="!editing"
               class="mb-2"
@@ -1539,8 +1647,8 @@ onMounted(() => {
               v-model="form.mailbox_password"
               :label="t('邮箱密码（可选）')"
               type="password"
-              variant="filled"
-              density="comfortable"
+              variant="outlined"
+              density="compact"
               :placeholder="t('留空 = 与登录密码相同')"
               class="mb-2"
             />
@@ -1548,8 +1656,8 @@ onMounted(() => {
               v-if="needsTotp"
               v-model="form.totp"
               :label="t('两步验证码')"
-              variant="filled"
-              density="comfortable"
+              variant="outlined"
+              density="compact"
               class="mb-2"
             />
             <div v-if="needsCaptcha" class="mb-2">
@@ -1558,18 +1666,13 @@ onMounted(() => {
               </v-btn>
             </div>
           </template>
-          <template v-else-if="form.kind === 'gmail'">
-            <div v-if="editing" class="mb-2">
-              <v-btn size="small" variant="outlined" color="primary" @click="reconnect({ id: editing, kind: 'gmail' })">{{ t('重新连接') }}</v-btn>
-            </div>
-          </template>
           <template v-else-if="form.kind === 'tuta'">
             <v-text-field
               v-model="form.password"
               :label="t('登录密码')"
               type="password"
-              variant="filled"
-              density="comfortable"
+              variant="outlined"
+              density="compact"
               :placeholder="editing ? t('留空 = 不修改') : ''"
               :required="!editing"
               class="mb-2"
@@ -1578,46 +1681,46 @@ onMounted(() => {
               v-if="needsTotp"
               v-model="form.totp"
               :label="t('两步验证码')"
-              variant="filled"
-              density="comfortable"
+              variant="outlined"
+              density="compact"
               class="mb-2"
             />
           </template>
           <template v-else>
-            <v-text-field v-model="form.username" :label="t('用户名')" variant="filled" density="comfortable" required class="mb-2" />
+            <v-text-field v-model="form.username" :label="t('用户名')" variant="outlined" density="compact" required class="mb-2" />
             <v-text-field
               v-model="form.password"
               :label="t('密码')"
               type="password"
-              variant="filled"
-              density="comfortable"
+              variant="outlined"
+              density="compact"
               :placeholder="editing ? t('留空 = 不修改') : ''"
               :required="!editing"
               class="mb-2"
             />
             <v-row dense class="mb-2">
               <v-col cols="12" sm="6">
-                <v-text-field v-model="form.imap_host" :label="t('IMAP 服务器')" variant="filled" density="comfortable" placeholder="imap.example.com" required hide-details />
+                <v-text-field v-model="form.imap_host" :label="t('IMAP 服务器')" variant="outlined" density="compact" placeholder="imap.example.com" required hide-details />
               </v-col>
               <v-col cols="6" sm="3">
-                <v-text-field v-model.number="form.imap_port" :label="t('端口')" type="number" variant="filled" density="comfortable" required hide-details />
+                <v-text-field v-model.number="form.imap_port" :label="t('端口')" type="number" variant="outlined" density="compact" required hide-details />
               </v-col>
               <v-col cols="6" sm="3">
-                <v-select v-model="form.imap_tls" :items="tlsItems" :label="t('加密')" variant="filled" density="comfortable" hide-details />
+                <v-select v-model="form.imap_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="compact" hide-details />
               </v-col>
               <v-col cols="12" sm="6">
-                <v-text-field v-model="form.smtp_host" :label="t('SMTP 服务器')" variant="filled" density="comfortable" placeholder="smtp.example.com" required hide-details />
+                <v-text-field v-model="form.smtp_host" :label="t('SMTP 服务器')" variant="outlined" density="compact" placeholder="smtp.example.com" required hide-details />
               </v-col>
               <v-col cols="6" sm="3">
-                <v-text-field v-model.number="form.smtp_port" :label="t('端口')" type="number" variant="filled" density="comfortable" required hide-details />
+                <v-text-field v-model.number="form.smtp_port" :label="t('端口')" type="number" variant="outlined" density="compact" required hide-details />
               </v-col>
               <v-col cols="6" sm="3">
-                <v-select v-model="form.smtp_tls" :items="tlsItems" :label="t('加密')" variant="filled" density="comfortable" hide-details />
+                <v-select v-model="form.smtp_tls" :items="tlsItems" :label="t('加密')" variant="outlined" density="compact" hide-details />
               </v-col>
             </v-row>
             <v-switch v-model="form.tls_skip_verify" :label="t('跳过证书校验')" color="primary" hide-details class="mb-2" />
           </template>
-          <div v-if="form.kind !== 'gmail'" class="d-flex align-center ga-2 mb-2">
+          <div class="d-flex align-center ga-2 mb-2">
             <v-btn
               variant="tonal"
               :prepend-icon="testOk ? 'mdi-check' : 'mdi-connection'"
@@ -1634,8 +1737,8 @@ onMounted(() => {
       </v-card-text>
       <v-card-actions>
         <v-spacer />
-        <v-btn variant="text" @click="dialogOpen = false">{{ t('取消') }}</v-btn>
-        <v-btn color="primary" @click="save">{{ form.kind === 'gmail' && !editing ? t('授权') : t('保存') }}</v-btn>
+        <v-btn variant="text" @click="closeAccountDialog">{{ t('取消') }}</v-btn>
+        <v-btn color="primary" @click="save">{{ t('保存') }}</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
@@ -1649,16 +1752,16 @@ onMounted(() => {
           v-model="rcForm.password"
           :label="t('登录密码')"
           type="password"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           class="mb-2"
         />
         <v-text-field
           v-model="rcForm.mailbox_password"
           :label="t('邮箱密码（可选）')"
           type="password"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           :placeholder="t('留空 = 与登录密码相同')"
           class="mb-2"
         />
@@ -1666,8 +1769,8 @@ onMounted(() => {
           v-if="rcNeedsTotp"
           v-model="rcForm.totp"
           :label="t('两步验证码')"
-          variant="filled"
-          density="comfortable"
+          variant="outlined"
+          density="compact"
           class="mb-2"
         />
         <div v-if="rcNeedsCaptcha" class="mb-2">

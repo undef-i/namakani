@@ -35,6 +35,12 @@ func newAPIFakeGmail(t *testing.T) *apiFakeGmail {
 		f.mu.Lock()
 		f.tokenHits++
 		f.mu.Unlock()
+		if r.Form.Get("grant_type") == "refresh_token" && r.Form.Get("refresh_token") == "bad-rt" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant", "error_description": "bad refresh token"})
+			return
+		}
 		resp := map[string]any{"access_token": "at-1", "expires_in": 3600, "token_type": "Bearer"}
 		if r.Form.Get("grant_type") == "authorization_code" {
 			if r.Form.Get("code") != "good-code" || r.Form.Get("code_verifier") == "" {
@@ -151,7 +157,7 @@ func TestGmailStartRequiresBaseURL(t *testing.T) {
 	}
 }
 
-func TestGmailOAuthStartAndCallbackCreatesAccount(t *testing.T) {
+func TestGmailOAuthStartAndCallbackCreatesPendingThenSaveCreatesAccount(t *testing.T) {
 	fake := newAPIFakeGmail(t)
 	f := newGmailFixture(t)
 	cfg := f.st.AppSettings()
@@ -202,13 +208,67 @@ func TestGmailOAuthStartAndCallbackCreatesAccount(t *testing.T) {
 	}
 
 	resp = f.doReq(t, http.MethodGet, "/api/gmail/callback?code=good-code&state="+url.QueryEscape(state), "")
-	resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("callback status = %d; want 302 after a successful exchange", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); loc != "/#/settings" {
-		t.Fatalf("callback redirect = %q; want /#/settings", loc)
+	loc := resp.Header.Get("Location")
+	resp.Body.Close()
+	locURL, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("callback redirect: %v", err)
 	}
+	pendingID := locURL.Query().Get("gmail_pending")
+	if pendingID == "" || locURL.Fragment != "/settings" {
+		t.Fatalf("callback redirect = %q; want a gmail_pending id on the settings route", loc)
+	}
+	if err := f.st.DB.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("accounts after callback = %d, %v; want none before save", n, err)
+	}
+
+	resp = f.doReq(t, http.MethodGet, "/api/accounts/gmail/pending/"+pendingID, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get pending status = %d; want 200", resp.StatusCode)
+	}
+	var pending struct {
+		Label        string   `json:"label"`
+		Email        string   `json:"email"`
+		Folders      int      `json:"folders"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pending); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if pending.Label != "我的 Gmail" || pending.Email != "user@gmail.com" || pending.Folders != 3 ||
+		len(pending.Capabilities) != 1 || pending.Capabilities[0] != "GMAIL-API" {
+		t.Fatalf("pending = %+v; want the submitted label, Google email, 3 folders and GMAIL-API", pending)
+	}
+	if err := f.st.DB.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("accounts after reading pending = %d, %v; want still none", n, err)
+	}
+
+	resp = f.doReq(t, http.MethodPost, "/api/accounts", `{"kind":"gmail","gmail_pending_id":"`+pendingID+`"}`)
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("save pending status = %d, body %s; want 201", resp.StatusCode, body)
+	}
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if created.ID != 1 {
+		t.Fatalf("created account id = %d; want 1", created.ID)
+	}
+	resp = f.doReq(t, http.MethodGet, "/api/accounts/gmail/pending/"+pendingID, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("pending after save status = %d; want 404 because save consumes it", resp.StatusCode)
+	}
+
 	var kind, email string
 	if err := f.st.DB.QueryRow("SELECT kind, email FROM accounts").Scan(&kind, &email); err != nil {
 		t.Fatalf("account row: %v", err)
@@ -256,6 +316,254 @@ func TestGmailOAuthStartAndCallbackCreatesAccount(t *testing.T) {
 		t.Fatalf("accounts after replay = %d, %v; want still 1", n, err)
 	}
 	_ = fake
+}
+
+func createGmailPending(t *testing.T, f *gmailFixture) string {
+	t.Helper()
+	cfg := f.st.AppSettings()
+	cfg.BaseURL = "https://mail.example.com"
+	if err := f.st.SaveAppSettings(cfg); err != nil {
+		t.Fatalf("save base url: %v", err)
+	}
+	if err := f.srv.gmailOAuthSave("cid-1", "secret-1"); err != nil {
+		t.Fatalf("save shared oauth: %v", err)
+	}
+	resp := f.doReq(t, http.MethodPost, "/api/accounts/gmail/start",
+		`{"label":"我的 Gmail","email":"user@gmail.com","from_name":"User","signature":"sig"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("start status = %d; want 200", resp.StatusCode)
+	}
+	var startOut struct {
+		AuthURL string `json:"auth_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&startOut); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	authURL, err := url.Parse(startOut.AuthURL)
+	if err != nil {
+		t.Fatalf("auth url: %v", err)
+	}
+	resp = f.doReq(t, http.MethodGet, "/api/gmail/callback?code=good-code&state="+url.QueryEscape(authURL.Query().Get("state")), "")
+	loc := resp.Header.Get("Location")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("callback status = %d; want 302", resp.StatusCode)
+	}
+	locURL, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("callback redirect: %v", err)
+	}
+	pendingID := locURL.Query().Get("gmail_pending")
+	if pendingID == "" {
+		t.Fatalf("callback redirect = %q; want a gmail_pending id", loc)
+	}
+	var n int
+	if err := f.st.DB.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("accounts after callback = %d, %v; want none", n, err)
+	}
+	return pendingID
+}
+
+func TestGmailSaveWithoutPendingRequiresTest(t *testing.T) {
+	f := newGmailFixture(t)
+	resp := f.doReq(t, http.MethodPost, "/api/accounts", `{"kind":"gmail"}`)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "请先点测试连接") {
+		t.Fatalf("save without pending = %d, %s; want 400 telling the user to test first", resp.StatusCode, body)
+	}
+}
+
+func TestGmailPendingCancelDiscards(t *testing.T) {
+	_ = newAPIFakeGmail(t)
+	f := newGmailFixture(t)
+	pendingID := createGmailPending(t, f)
+
+	resp := f.doReq(t, http.MethodDelete, "/api/accounts/gmail/pending/"+pendingID, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete pending status = %d; want 200", resp.StatusCode)
+	}
+	resp = f.doReq(t, http.MethodGet, "/api/accounts/gmail/pending/"+pendingID, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("pending after cancel status = %d; want 404", resp.StatusCode)
+	}
+	resp = f.doReq(t, http.MethodPost, "/api/accounts", `{"kind":"gmail","gmail_pending_id":"`+pendingID+`"}`)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "请先点测试连接") {
+		t.Fatalf("save after cancel = %d, %s; want 400 telling the user to test first", resp.StatusCode, body)
+	}
+	var n int
+	if err := f.st.DB.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("accounts after cancel = %d, %v; want none", n, err)
+	}
+}
+
+func TestGmailAccountFormTestUsesStoredAccount(t *testing.T) {
+	_ = newAPIFakeGmail(t)
+	f := newGmailFixture(t)
+	f.insertGmailAccount(t)
+
+	resp := f.doReq(t, http.MethodPost, "/api/accounts/test", `{"id":1,"kind":"gmail","label":"g","email":"user@gmail.com"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("gmail form test status = %d, body %s; want 200", resp.StatusCode, body)
+	}
+	var out struct {
+		OK           bool     `json:"ok"`
+		Folders      int      `json:"folders"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.OK || out.Folders != 3 || len(out.Capabilities) != 1 || out.Capabilities[0] != "GMAIL-API" {
+		t.Fatalf("gmail form test = %+v; want ok with 3 folders and GMAIL-API", out)
+	}
+}
+
+func TestGmailAccountFormTestInvalidStoredToken(t *testing.T) {
+	_ = newAPIFakeGmail(t)
+	f := newGmailFixture(t)
+	f.insertGmailAccount(t)
+	enc, err := auth.Encrypt(f.key, gmail.Creds{ClientID: "cid-1", ClientSecret: "secret-1", RefreshToken: "bad-rt"}.JSON())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.DB.Exec(`UPDATE accounts SET enc_password = ? WHERE id = 1`, enc); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := f.doReq(t, http.MethodPost, "/api/accounts/test", `{"id":1,"kind":"gmail","label":"g","email":"user@gmail.com"}`)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "连接失败，请检查服务器设置和账号密码") {
+		t.Fatalf("gmail form test with a bad token = %d, %s; want the 502 connection-failure form", resp.StatusCode, body)
+	}
+}
+
+func TestGmailAccountFormTestWithoutStoredAccountRequiresAuthorization(t *testing.T) {
+	f := newGmailFixture(t)
+	resp := f.doReq(t, http.MethodPost, "/api/accounts/test", `{"kind":"gmail","label":"g","email":"user@gmail.com"}`)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "请先完成授权") {
+		t.Fatalf("gmail form test without an account = %d, %s; want 400 telling the user to authorize first", resp.StatusCode, body)
+	}
+}
+
+func TestGmailReauthCallbackStoresResultForDialogRestore(t *testing.T) {
+	_ = newAPIFakeGmail(t)
+	f := newGmailFixture(t)
+	cfg := f.st.AppSettings()
+	cfg.BaseURL = "https://mail.example.com"
+	if err := f.st.SaveAppSettings(cfg); err != nil {
+		t.Fatalf("save base url: %v", err)
+	}
+	if err := f.srv.gmailOAuthSave("cid-1", "secret-1"); err != nil {
+		t.Fatalf("save shared oauth: %v", err)
+	}
+	f.insertGmailAccount(t)
+	if _, err := f.st.DB.Exec(`UPDATE accounts SET from_name = 'User', signature = 'sig' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := auth.Encrypt(f.key, gmail.TokenCredsJSON("rt-stale"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.st.DB.Exec(`UPDATE accounts SET enc_password = ? WHERE id = 1`, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := f.doReq(t, http.MethodPost, "/api/accounts/gmail/start", `{"account_id":1}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reauth start status = %d; want 200", resp.StatusCode)
+	}
+	var startOut struct {
+		AuthURL string `json:"auth_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&startOut); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	authURL, err := url.Parse(startOut.AuthURL)
+	if err != nil {
+		t.Fatalf("auth url: %v", err)
+	}
+	state := authURL.Query().Get("state")
+	if state == "" {
+		t.Fatal("auth url carries no state")
+	}
+
+	resp = f.doReq(t, http.MethodGet, "/api/gmail/callback?code=good-code&state="+url.QueryEscape(state), "")
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("reauth callback status = %d; want 302", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	resp.Body.Close()
+	locURL, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("callback redirect: %v", err)
+	}
+	reauthID := locURL.Query().Get("gmail_reauthed")
+	if reauthID == "" || locURL.Fragment != "/settings" {
+		t.Fatalf("reauth callback redirect = %q; want a gmail_reauthed id on the settings route", loc)
+	}
+	var n int
+	if err := f.st.DB.QueryRow("SELECT COUNT(*) FROM accounts").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("accounts after reauth callback = %d, %v; want still 1", n, err)
+	}
+
+	acct, err := f.srv.loadMailAccount(1, f.key)
+	if err != nil {
+		t.Fatalf("load account: %v", err)
+	}
+	creds, err := gmail.ParseCreds(acct.Password)
+	if err != nil {
+		t.Fatalf("stored creds: %v", err)
+	}
+	if creds.RefreshToken != "rt-1" {
+		t.Fatalf("refresh token after reauth = %q; want rt-1 from the new grant", creds.RefreshToken)
+	}
+
+	resp = f.doReq(t, http.MethodGet, "/api/accounts/gmail/reauth/"+reauthID, "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get reauth status = %d; want 200", resp.StatusCode)
+	}
+	var got struct {
+		AccountID    int64    `json:"account_id"`
+		Label        string   `json:"label"`
+		Email        string   `json:"email"`
+		FromName     string   `json:"from_name"`
+		Signature    string   `json:"signature"`
+		Folders      int      `json:"folders"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got.AccountID != 1 || got.Label != "g" || got.Email != "user@gmail.com" ||
+		got.FromName != "User" || got.Signature != "sig" || got.Folders != 3 ||
+		len(got.Capabilities) != 1 || got.Capabilities[0] != "GMAIL-API" {
+		t.Fatalf("reauth entry = %+v; want the account form fields, 3 folders and GMAIL-API", got)
+	}
 }
 
 func TestGmailStartRequiresSharedOAuth(t *testing.T) {

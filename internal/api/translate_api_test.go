@@ -202,6 +202,28 @@ func TestTranslateSettingsRoundTripAndKeySealed(t *testing.T) {
 	}
 }
 
+func TestTranslateSettingsAcceptsResponsesFormat(t *testing.T) {
+	f := newDrainFixture(t)
+	put := f.authedReq(http.MethodPut, "/api/settings/translate",
+		`{"engine":"llm","target":"zh","llm_format":"responses","llm_endpoint":"https://llm.example","llm_model":"model-x","llm_api_key":""}`)
+	rec := httptest.NewRecorder()
+	f.srv.handlePutTranslateSettings(rec, put)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put settings status = %d body %s", rec.Code, rec.Body.String())
+	}
+	cfg, _ := f.srv.loadTranslateSettings()
+	if cfg.LLMFormat != "responses" {
+		t.Fatalf("llm_format = %q, want responses", cfg.LLMFormat)
+	}
+	putBad := f.authedReq(http.MethodPut, "/api/settings/translate",
+		`{"engine":"llm","target":"zh","llm_format":"bogus","llm_endpoint":"https://llm.example","llm_model":"model-x","llm_api_key":""}`)
+	recBad := httptest.NewRecorder()
+	f.srv.handlePutTranslateSettings(recBad, putBad)
+	if recBad.Code != http.StatusBadRequest {
+		t.Fatalf("bogus format status = %d, want 400", recBad.Code)
+	}
+}
+
 func TestAvatarEndpointsCacheAndServe(t *testing.T) {
 	f := newDrainFixture(t)
 	calls := 0
@@ -266,5 +288,65 @@ func TestTranslateSettingsLocalNormalizedToGoogle(t *testing.T) {
 	}
 	if v, ok, _ := f.srv.st.GetSetting(settingTrEngine); !ok || v != "google" {
 		t.Fatalf("stored engine after load = %q (ok=%v), want google persisted", v, ok)
+	}
+}
+
+func getLanguages(t *testing.T, f *drainFixture) *httptest.ResponseRecorder {
+	t.Helper()
+	req := f.authedReq(http.MethodGet, "/api/translate/languages", "")
+	rec := httptest.NewRecorder()
+	f.srv.handleTranslateLanguages(rec, req)
+	return rec
+}
+
+func TestTranslateLanguagesServesAndCaches(t *testing.T) {
+	f := newDrainFixture(t)
+	calls := 0
+	f.srv.trLangsFetch = func(ctx context.Context) ([]translate.Language, error) {
+		calls++
+		return []translate.Language{
+			{Code: "zh-CN", En: "Chinese (Simplified)", Zh: "简体中文"},
+			{Code: "gom", En: "Konkani", Zh: "贡根语"},
+		}, nil
+	}
+	for i := 0; i < 2; i++ {
+		rec := getLanguages(t, f)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("call %d: status = %d, body %s", i, rec.Code, rec.Body)
+		}
+		var out struct {
+			Languages []translate.Language `json:"languages"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("call %d: decode: %v", i, err)
+		}
+		if len(out.Languages) != 2 || out.Languages[0].Code != "zh-CN" || out.Languages[0].Zh != "简体中文" || out.Languages[1].En != "Konkani" {
+			t.Fatalf("call %d: languages = %+v", i, out.Languages)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 (second response must come from the in-process cache)", calls)
+	}
+}
+
+func TestTranslateLanguagesFetchErrorIsNotCached(t *testing.T) {
+	f := newDrainFixture(t)
+	calls := 0
+	f.srv.trLangsFetch = func(ctx context.Context) ([]translate.Language, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("page unavailable")
+		}
+		return []translate.Language{{Code: "ab", En: "Abkhaz", Zh: "阿布哈兹语"}}, nil
+	}
+	if rec := getLanguages(t, f); rec.Code != http.StatusBadGateway {
+		t.Fatalf("failing fetch: status = %d, want 502, body %s", rec.Code, rec.Body)
+	}
+	rec := getLanguages(t, f)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retry after failure: status = %d, body %s", rec.Code, rec.Body)
+	}
+	if calls != 2 {
+		t.Fatalf("fetch calls = %d, want 2 (a failure must not be cached)", calls)
 	}
 }

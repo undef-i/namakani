@@ -24,7 +24,7 @@ const PAGE_SIZE = 60
 const display = useDisplay()
 const theme = useTheme()
 const vuetifyLocale = useLocale()
-watch(lang, (v) => (vuetifyLocale.current.value = v === 'zh' ? 'zhHans' : 'en'), { immediate: true })
+watch(lang, (v) => (vuetifyLocale.current.value = v === 'zh-Hant' ? 'zhHant' : v === 'zh-Hans' ? 'zhHans' : 'en'), { immediate: true })
 const lgAndUp = computed(() => display.lgAndUp.value)
 
 const view = ref('loading')
@@ -4777,14 +4777,15 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div v-else class="appbar-search">
-          <div v-if="selectionActive" class="d-flex align-center ga-1 mx-n2">
+          <v-fade-transition hide-on-leave>
+          <div v-if="selectionActive" key="selection" class="d-flex align-center ga-1 mx-n2">
             <v-btn icon="mdi-close" variant="text" :aria-label="t('取消选择')" @click="clearSelectionIds" />
             <v-toolbar-title class="ml-4">{{ selectedIds.size }}</v-toolbar-title>
             <v-btn :icon="scope === 'scheduled' ? 'mdi-file-document-edit-outline' : (scope === 'trash' || scope === 'junk') ? 'mdi-inbox' : 'mdi-archive'" variant="text" :disabled="scope === 'archive'" :aria-label="scope === 'scheduled' ? t('退回草稿箱') : (scope === 'trash' || scope === 'junk') ? t('移回收件箱') : t('归档')" @click="bulkAct('archive')" />
             <v-btn icon="mdi-delete" variant="text" :aria-label="t('删除')" @click="bulkAct('delete')" />
             <v-btn v-if="scope !== 'scheduled'" :icon="selectionHasUnread ? 'mdi-email-open' : 'mdi-email'" variant="text" :aria-label="selectionHasUnread ? t('标为已读') : t('标为未读')" @click="bulkAct(selectionHasUnread ? 'seen' : 'unseen')" />
           </div>
-          <div v-else-if="mobileSearch || searching" class="search-wrap">
+          <div v-else-if="mobileSearch || searching" key="search" class="search-wrap">
             <v-btn icon="mdi-arrow-left" variant="text" :aria-label="t('返回')" class="search-back-btn" @click="closeMobileSearch" />
             <v-text-field
               ref="searchEl"
@@ -4808,7 +4809,7 @@ onBeforeUnmount(() => {
               </template>
             </v-text-field>
           </div>
-          <div v-else class="d-flex align-center ga-1 mx-n2">
+          <div v-else key="normal" class="d-flex align-center ga-1 mx-n2">
             <v-btn icon="mdi-menu" variant="text" :aria-label="t('展开菜单')" @click="toggleDrawer" />
             <v-toolbar-title class="ml-4">{{ mobileBarTitle }}</v-toolbar-title>
             <v-badge v-if="attentionCount > 0" :content="attentionCount" color="error">
@@ -4819,6 +4820,7 @@ onBeforeUnmount(() => {
             </v-badge>
             <v-btn icon="mdi-magnify" variant="text" :aria-label="t('搜索')" @click="openMobileSearch" />
           </div>
+          </v-fade-transition>
         </div>
       </v-app-bar>
 

@@ -67,8 +67,15 @@ type Server struct {
 	protonAuth    map[string]protonAuthEntry
 	gmailAuthMu   sync.Mutex
 	gmailAuth     map[string]gmailAuthEntry
+	gmailPendingMu sync.Mutex
+	gmailPending   map[string]gmailPendingEntry
+	gmailReauthMu  sync.Mutex
+	gmailReauth    map[string]gmailReauthEntry
 	trMgr         *translate.Manager
 	translateBuild func(cfg translateSettings) (translate.Engine, error)
+	trLangsMu     sync.Mutex
+	trLangs       []translate.Language
+	trLangsFetch  func(ctx context.Context) ([]translate.Language, error)
 	avatarResolve func(ctx context.Context, email string) (string, string, []byte)
 }
 
@@ -78,7 +85,7 @@ type protonAuthEntry struct {
 }
 
 func New(st *store.Store, uiFS fs.FS, mgr *syncmgr.Manager) *Server {
-	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry), gmailAuth: make(map[string]gmailAuthEntry), drainWake: make(chan struct{}, 1), drainWaves: make(map[int64]*drainWave), connFail: make(map[int64]*connFailState), trMgr: translate.NewManager(filepath.Join(st.DataDir(), "models"))}
+	s := &Server{st: st, uiFS: uiFS, mgr: mgr, hub: newHub(), keys: make(map[string][]byte), tgSeen: make(map[string]tgChat), protonAuth: make(map[string]protonAuthEntry), gmailAuth: make(map[string]gmailAuthEntry), gmailPending: make(map[string]gmailPendingEntry), gmailReauth: make(map[string]gmailReauthEntry), drainWake: make(chan struct{}, 1), drainWaves: make(map[int64]*drainWave), connFail: make(map[int64]*connFailState), trMgr: translate.NewManager(filepath.Join(st.DataDir(), "models"))}
 	s.claimStuckSecs = store.BackoffSeconds(1 << 30)
 	s.drainOpen = s.openDrainConn
 	s.appendOpen = s.openConn
@@ -104,6 +111,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/accounts", s.authOnly(s.handleListAccounts))
 	mux.HandleFunc("POST /api/accounts", s.authOnly(s.handleCreateAccount))
 	mux.HandleFunc("POST /api/accounts/gmail/start", s.authOnly(s.handleGmailStart))
+	mux.HandleFunc("GET /api/accounts/gmail/pending/{id}", s.authOnly(s.handleGetGmailPending))
+	mux.HandleFunc("DELETE /api/accounts/gmail/pending/{id}", s.authOnly(s.handleDeleteGmailPending))
+	mux.HandleFunc("GET /api/accounts/gmail/reauth/{id}", s.authOnly(s.handleGetGmailReauth))
 	mux.HandleFunc("GET /api/gmail/callback", s.handleGmailCallback)
 	mux.HandleFunc("POST /api/accounts/test", s.authOnly(s.handleTestAccountForm))
 	mux.HandleFunc("PUT /api/accounts/{id}", s.authOnly(s.handleUpdateAccount))
@@ -148,6 +158,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings/translate", s.authOnly(s.handlePutTranslateSettings))
 	mux.HandleFunc("POST /api/messages/{id}/translate", s.authOnly(s.handleTranslateMessage))
 	mux.HandleFunc("GET /api/translate/models", s.authOnly(s.handleTranslateModels))
+	mux.HandleFunc("GET /api/translate/languages", s.authOnly(s.handleTranslateLanguages))
 	mux.HandleFunc("POST /api/translate/llm/models", s.authOnly(s.handleLLMModels))
 	mux.HandleFunc("POST /api/avatars", s.authOnly(s.handleAvatars))
 	mux.HandleFunc("GET /api/avatar/img", s.authOnly(s.handleAvatarImage))
@@ -520,6 +531,7 @@ type accountIn struct {
 	CaptchaToken    string `json:"captcha_token"`
 	ClientID        string `json:"client_id"`
 	ClientSecret    string `json:"client_secret"`
+	GmailPendingID  string `json:"gmail_pending_id"`
 }
 
 type accountOut struct {
@@ -599,7 +611,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.Kind == "gmail" {
-		writeErr(w, http.StatusBadRequest, "Gmail 账号请通过 Google 授权添加")
+		s.createGmailAccount(w, key, &in)
 		return
 	}
 	imapPort, smtpPort, err := validateAccount(&in, true)
@@ -1005,6 +1017,10 @@ func (s *Server) handleTestAccountForm(w http.ResponseWriter, r *http.Request) {
 		s.testTutaAccount(w, key, &in)
 		return
 	}
+	if in.Kind == "gmail" {
+		s.testGmailAccount(w, key, &in)
+		return
+	}
 	s.testIMAPAccount(w, key, &in)
 }
 
@@ -1137,6 +1153,38 @@ func (s *Server) testProtonStored(w http.ResponseWriter, key []byte, id int64) {
 	defer cl.Close()
 	folders, err := cl.ListFolders()
 	if err != nil {
+		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
+}
+
+func (s *Server) testGmailAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
+	if in.ID <= 0 {
+		writeErr(w, http.StatusBadRequest, "请先完成授权")
+		return
+	}
+	acct, err := s.loadMailAccount(in.ID, key)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "保存的登录凭据不可用，请重新登录")
+		return
+	}
+	if acct.Kind != "gmail" {
+		writeErr(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	cl, err := gmail.Connect(s.st, acct)
+	if err != nil {
+		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
+		return
+	}
+	defer cl.Close()
+	folders, err := cl.ListFolders()
+	if err != nil {
+		if gmail.IsAuthError(err) {
+			writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
+			return
+		}
 		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
 		return
 	}

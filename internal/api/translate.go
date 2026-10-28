@@ -94,7 +94,7 @@ func (s *Server) handlePutTranslateSettings(w http.ResponseWriter, r *http.Reque
 		req.LLMFormat = defaultTrLLMFormat
 	}
 	switch req.LLMFormat {
-	case "openai", "anthropic":
+	case "openai", "responses", "anthropic":
 	default:
 		writeErr(w, http.StatusBadRequest, "翻译服务格式不对")
 		return
@@ -301,7 +301,7 @@ func (s *Server) handleLLMModels(w http.ResponseWriter, r *http.Request) {
 		format = defaultTrLLMFormat
 	}
 	switch format {
-	case "openai", "anthropic":
+	case "openai", "responses", "anthropic":
 	default:
 		writeErr(w, http.StatusBadRequest, "翻译服务格式不对")
 		return
@@ -325,6 +325,32 @@ func (s *Server) handleLLMModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": ids})
+}
+
+func (s *Server) handleTranslateLanguages(w http.ResponseWriter, r *http.Request) {
+	s.trLangsMu.Lock()
+	langs := s.trLangs
+	s.trLangsMu.Unlock()
+	if langs == nil {
+		fetch := s.trLangsFetch
+		if fetch == nil {
+			fetch = func(ctx context.Context) ([]translate.Language, error) {
+				return translate.FetchGoogleLanguages(ctx, nil, translate.GoogleLanguagesURL)
+			}
+		}
+		fetched, err := fetch(r.Context())
+		if err != nil {
+			writeUserErr(w, http.StatusBadGateway, "读取语言名单失败，请稍后重试", err)
+			return
+		}
+		s.trLangsMu.Lock()
+		if s.trLangs == nil {
+			s.trLangs = fetched
+		}
+		langs = s.trLangs
+		s.trLangsMu.Unlock()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"languages": langs})
 }
 
 func (s *Server) handleTranslateModels(w http.ResponseWriter, r *http.Request) {
