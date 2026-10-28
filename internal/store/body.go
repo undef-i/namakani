@@ -182,10 +182,17 @@ func (s *Store) FolderBySpecial(accountID int64, special string) (int64, string,
 	)
 	err := s.DB.QueryRow("SELECT id, name FROM folders WHERE account_id = ? AND special_use = ? LIMIT 1",
 		accountID, special).Scan(&id, &name)
-	if err != nil {
-		return 0, "", false, nil
+	if err == nil {
+		return id, name, true, nil
 	}
-	return id, name, true, nil
+	if special == "archive" {
+		err := s.DB.QueryRow("SELECT id, name FROM folders WHERE account_id = ? AND special_use = 'all' LIMIT 1",
+			accountID).Scan(&id, &name)
+		if err == nil {
+			return id, name, true, nil
+		}
+	}
+	return 0, "", false, nil
 }
 
 func (s *Store) MoveLocalMessage(oldID, destFolderID int64, destUID uint32) error {

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"namakani/internal/mail"
 	"namakani/internal/store"
@@ -551,5 +552,138 @@ func TestSendRawDraftAppendAndFetchRaw(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "body of m2") {
 		t.Fatalf("raw = %q; want m2's body", got)
+	}
+}
+
+func drainGmailMove(t *testing.T, st *store.Store, sess *Session, opID int64) {
+	t.Helper()
+	claimed, err := st.ClaimDueOps(1, time.Now().Unix(), 10, store.OpMove)
+	if err != nil {
+		t.Fatalf("claim ops: %v", err)
+	}
+	found := false
+	for _, c := range claimed {
+		if c.ID == opID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("op %d was not claimed", opID)
+	}
+	o, err := st.GetOp(opID)
+	if err != nil {
+		t.Fatalf("get op: %v", err)
+	}
+	tgt, ok, err := st.ResolveMoveSource(o)
+	if err != nil || !ok {
+		t.Fatalf("resolve move source: ok=%v err=%v", ok, err)
+	}
+	o, err = st.GetOp(opID)
+	if err != nil {
+		t.Fatalf("get op after resolve: %v", err)
+	}
+	var p store.MovePayload
+	if err := json.Unmarshal([]byte(o.Payload), &p); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if _, err := sess.Select(tgt.FolderName); err != nil {
+		t.Fatalf("select %s: %v", tgt.FolderName, err)
+	}
+	destUID, err := sess.MoveMessage(tgt.UID, p.ToFolder)
+	if err != nil {
+		t.Fatalf("provider move %s -> %s: %v", tgt.FolderName, p.ToFolder, err)
+	}
+	if err := st.CompleteMoveOp(opID, o.ToFolderID, o.MessageID, destUID); err != nil {
+		t.Fatalf("complete move: %v", err)
+	}
+	done, err := st.GetOp(opID)
+	if err != nil {
+		t.Fatalf("get completed op: %v", err)
+	}
+	if done.Status != store.OpDone || done.LastError != "" {
+		t.Fatalf("op %d status = %q error = %q; want done without error", opID, done.Status, done.LastError)
+	}
+}
+
+func TestGmailArchiveUndoLifecycle(t *testing.T) {
+	f := newFakeGmail(t)
+	f.use(t)
+	seedBasic(t, f)
+	st := openDriverStore(t)
+	sess := syncOnce(t, st)
+
+	rowIn := func(folderID int64) (int64, bool) {
+		var id int64
+		err := st.DB.QueryRow("SELECT id FROM messages WHERE account_id = 1 AND folder_id = ? AND message_id = 'm2@mail.test'", folderID).Scan(&id)
+		if err != nil {
+			return 0, false
+		}
+		return id, true
+	}
+	labelsOf := func() map[string]bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		out := map[string]bool{}
+		for l := range f.msgs["m2"].labels {
+			out[l] = true
+		}
+		return out
+	}
+	inboxRow, ok := rowIn(1)
+	if !ok {
+		t.Fatal("seed: m2 has no INBOX row")
+	}
+	if _, ok := rowIn(8); !ok {
+		t.Fatal("seed: m2 has no All Mail row")
+	}
+
+	destID, destName, ok, err := st.FolderBySpecial(1, "archive")
+	if err != nil || !ok {
+		t.Fatalf("archive target does not resolve for a gmail account: ok=%v err=%v", ok, err)
+	}
+	if destName != "All Mail" {
+		t.Fatalf("archive target = %q; want All Mail", destName)
+	}
+
+	opID, err := st.EnqueueMove(1, inboxRow, destID, "")
+	if err != nil {
+		t.Fatalf("enqueue archive: %v", err)
+	}
+	drainGmailMove(t, st, sess, opID)
+
+	if labelsOf()["INBOX"] {
+		t.Fatal("m2 still carries INBOX at the provider after archive")
+	}
+	if _, ok := rowIn(1); ok {
+		t.Fatal("m2 still has an INBOX row after archive")
+	}
+	if _, ok := rowIn(8); !ok {
+		t.Fatal("m2 lost its All Mail row after archive")
+	}
+	var allRows int
+	if err := st.DB.QueryRow("SELECT COUNT(*) FROM messages WHERE account_id = 1 AND folder_id = 8 AND message_id = 'm2@mail.test'").Scan(&allRows); err != nil {
+		t.Fatal(err)
+	}
+	if allRows != 1 {
+		t.Fatalf("m2 has %d All Mail rows after archive; want exactly 1", allRows)
+	}
+
+	res, err := st.UndoOp(opID)
+	if err != nil {
+		t.Fatalf("undo archive: %v", err)
+	}
+	if res == nil || res.Inverse == nil {
+		t.Fatalf("undo archive produced no inverse op: %+v", res)
+	}
+	drainGmailMove(t, st, sess, res.Inverse.ID)
+
+	if !labelsOf()["INBOX"] {
+		t.Fatal("m2 did not regain INBOX at the provider after undo")
+	}
+	if _, ok := rowIn(1); !ok {
+		t.Fatal("m2 has no INBOX row after undo")
+	}
+	if _, ok := rowIn(8); !ok {
+		t.Fatal("undo deleted m2's All Mail row")
 	}
 }

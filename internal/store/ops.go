@@ -1046,6 +1046,35 @@ func (s *Store) CompleteMoveOp(id, destFolderID int64, messageID int64, realUID 
 		AND prior_folder_id = ? AND prior_uid = ?`, realUID, messageID, destFolderID, prov); err != nil {
 		return err
 	}
+	var priorSpecial, destSpecial string
+	_ = tx.QueryRow("SELECT COALESCE(special_use, '') FROM folders WHERE id = ?", o.PriorFolderID).Scan(&priorSpecial)
+	_ = tx.QueryRow("SELECT COALESCE(special_use, '') FROM folders WHERE id = ?", destFolderID).Scan(&destSpecial)
+	if priorSpecial == "all" && destSpecial != "all" && destSpecial != "trash" && destSpecial != "junk" {
+		var existing int64
+		err := tx.QueryRow("SELECT id FROM messages WHERE account_id = ? AND folder_id = ? AND uid = ?",
+			o.AccountID, o.PriorFolderID, o.PriorUID).Scan(&existing)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err == sql.ErrNoRows {
+			res2, err := tx.Exec(`INSERT INTO messages(account_id, folder_id, uid, message_id, thread_key, subject,
+				from_json, to_json, cc_json, date_ts, flags, snippet, has_attach, size, body_state, trash_origin_folder_id)
+				SELECT account_id, ?, ?, message_id, thread_key, subject, from_json, to_json, cc_json, date_ts,
+				flags, snippet, has_attach, size, 0, trash_origin_folder_id FROM messages WHERE id = ?`,
+				o.PriorFolderID, o.PriorUID, messageID)
+			if err != nil {
+				return err
+			}
+			newID, _ := res2.LastInsertId()
+			if _, err := tx.Exec(`INSERT INTO messages_fts(rowid, subject, senders, recipients, body)
+				SELECT ?, subject, senders, recipients, body FROM messages_fts WHERE rowid = ?`, newID, messageID); err != nil {
+				return err
+			}
+			if err := adjustFolderTotalsTx(tx, o.PriorFolderID, 1); err != nil {
+				return err
+			}
+		}
+	}
 	if _, err := tx.Exec("UPDATE ops SET status = 'done', last_error = '', finished_at = unixepoch() WHERE id = ? AND status = 'in_flight'", id); err != nil {
 		return err
 	}

@@ -1693,7 +1693,7 @@ const shownText = computed(() =>
   trActive.value && trData.value ? trData.value.text : detail.value?.text,
 )
 
-async function effectiveTarget() {
+async function trSettings() {
   if (!trSettingsCache) {
     try {
       trSettingsCache = (await api.getTranslateSettings()).settings
@@ -1701,8 +1701,18 @@ async function effectiveTarget() {
       trSettingsCache = null
     }
   }
-  const v = trSettingsCache?.target
+  return trSettingsCache
+}
+
+async function effectiveTarget() {
+  const v = (await trSettings())?.target
   return v && v !== 'auto' ? v : lang.value
+}
+
+async function effectiveEngineKey() {
+  const c = await trSettings()
+  if (!c) return ''
+  return c.engine === 'llm' ? 'llm:' + (c.llm_format || '') + ':' + (c.llm_model || '') : 'google'
 }
 
 async function toggleTranslate() {
@@ -1711,17 +1721,25 @@ async function toggleTranslate() {
     trActive.value = false
     return
   }
-  if (trData.value && trData.value.id === selected.value.id) {
+  const target = await effectiveTarget()
+  const engine = await effectiveEngineKey()
+  if (
+    trData.value &&
+    trData.value.id === selected.value.id &&
+    trData.value.target === target &&
+    trData.value.engine === engine
+  ) {
     trActive.value = true
     return
   }
   trBusy.value = true
   try {
-    const target = await effectiveTarget()
     const res = await api.translateMessage(selected.value.id, target)
     if (res && !res.same_language) {
       trData.value = {
         id: selected.value.id,
+        target,
+        engine,
         subject: res.subject,
         html: res.html,
         text: res.text,
@@ -1742,18 +1760,20 @@ watch(
 )
 
 async function ensureConvoTranslation(id) {
-  if (convoTr.value[id]) return
-  convoTr.value = { ...convoTr.value, [id]: { st: 'pending' } }
+  const target = await effectiveTarget()
+  const engine = await effectiveEngineKey()
+  const cur = convoTr.value[id]
+  if (cur && cur.target === target && cur.engine === engine) return
+  convoTr.value = { ...convoTr.value, [id]: { st: 'pending', target, engine } }
   try {
-    const target = await effectiveTarget()
     const res = await api.translateMessage(id, target)
     if (res && !res.same_language) {
-      convoTr.value = { ...convoTr.value, [id]: { st: 'done', subject: res.subject, html: res.html, text: res.text } }
+      convoTr.value = { ...convoTr.value, [id]: { st: 'done', target, engine, subject: res.subject, html: res.html, text: res.text } }
     } else {
-      convoTr.value = { ...convoTr.value, [id]: { st: 'same' } }
+      convoTr.value = { ...convoTr.value, [id]: { st: 'same', target, engine } }
     }
   } catch {
-    convoTr.value = { ...convoTr.value, [id]: { st: 'failed' } }
+    convoTr.value = { ...convoTr.value, [id]: { st: 'failed', target, engine } }
   }
 }
 
@@ -1764,7 +1784,7 @@ async function toggleCardTranslate(msg) {
     convoTr.value = { ...convoTr.value, [msg.id]: { ...e, on: false } }
     return
   }
-  if (!e || e.st !== 'done') await ensureConvoTranslation(msg.id)
+  await ensureConvoTranslation(msg.id)
   const now = convoTr.value[msg.id]
   if (now && now.st === 'done') {
     convoTr.value = { ...convoTr.value, [msg.id]: { ...now, on: true } }
@@ -2359,6 +2379,7 @@ function rowBelongsToCurrentView(row) {
 }
 
 function undoRemoval() {
+  if (Date.now() < suppressClickUntil) return
   const u = pendingUndo.value
   if (!u) return
   dismissToast()
@@ -2608,7 +2629,7 @@ function clearSearch() {
   searchQuery.value = ''
   searching.value = false
   resetSearchFilter()
-  loadMessages(true)
+  loadMessages()
 }
 
 function openCompose(init) {
@@ -6631,7 +6652,8 @@ body {
 }
 .meta-grid {
   display: grid;
-  grid-template-columns: 52px minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 12px;
   row-gap: 4px;
 }
 .fab-compose {
