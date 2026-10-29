@@ -155,6 +155,125 @@ func TestHandleTelegramWebAppAuthBoundUser(t *testing.T) {
 	}
 }
 
+func TestHandleTelegramWebAppAuthReplayRejected(t *testing.T) {
+	s := newTGTestServer(t)
+	initData := signTGInitData(tgTestToken, 424242, time.Now().Unix())
+	if rec := postInitData(t, s, initData); rec.Code != http.StatusOK {
+		t.Fatalf("first use status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := postInitData(t, s, initData); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("replayed init data status = %d, want 401, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleTelegramWebAppAuthFreshDataStillWorks(t *testing.T) {
+	s := newTGTestServer(t)
+	now := time.Now().Unix()
+	if rec := postInitData(t, s, signTGInitData(tgTestToken, 424242, now)); rec.Code != http.StatusOK {
+		t.Fatalf("first init data status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := postInitData(t, s, signTGInitData(tgTestToken, 424242, now-120)); rec.Code != http.StatusOK {
+		t.Fatalf("different init data status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleTelegramWebAppAuthExpiredRejected(t *testing.T) {
+	s := newTGTestServer(t)
+	old := time.Now().Add(-25 * time.Hour).Unix()
+	if rec := postInitData(t, s, signTGInitData(tgTestToken, 424242, old)); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expired init data status = %d, want 401", rec.Code)
+	}
+}
+
+func postInitDataCookie(t *testing.T, s *Server, initData string, cookie *http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"init_data": initData})
+	req := httptest.NewRequest(http.MethodPost, "/api/telegram/webapp-auth", strings.NewReader(string(body)))
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	s.handleTelegramWebAppAuth(rec, req)
+	return rec
+}
+
+func issuedSessionCookie(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
+	t.Helper()
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "namakani_session" && c.Value != "" {
+			return c
+		}
+	}
+	t.Fatal("no session cookie issued")
+	return nil
+}
+
+func sessionRowCount(t *testing.T, s *Server) int {
+	t.Helper()
+	var n int
+	if err := s.st.DB.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&n); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	return n
+}
+
+func TestHandleTelegramWebAppAuthRepeatWithIssuedSession(t *testing.T) {
+	s := newTGTestServer(t)
+	initData := signTGInitData(tgTestToken, 424242, time.Now().Unix())
+	first := postInitData(t, s, initData)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first use status = %d, body = %s", first.Code, first.Body.String())
+	}
+	cookie := issuedSessionCookie(t, first)
+	before := sessionRowCount(t, s)
+	second := postInitDataCookie(t, s, initData, cookie)
+	if second.Code != http.StatusOK {
+		t.Fatalf("repeat with the session it issued status = %d, want 200, body = %s", second.Code, second.Body.String())
+	}
+	if got := sessionRowCount(t, s); got != before {
+		t.Fatalf("sessions after benign repeat = %d, want %d (no new session, none dropped)", got, before)
+	}
+	if _, ok := s.credentialKey(sessionReq(cookie.Value)); !ok {
+		t.Fatal("the session issued by the first auth must still authenticate after the repeat")
+	}
+}
+
+func TestHandleTelegramWebAppAuthRepeatWithForeignSession(t *testing.T) {
+	s := newTGTestServer(t)
+	initData := signTGInitData(tgTestToken, 424242, time.Now().Unix())
+	if rec := postInitData(t, s, initData); rec.Code != http.StatusOK {
+		t.Fatalf("first use status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	wrapped, err := auth.Encrypt(s.serverKey, "the-credential-key")
+	if err != nil {
+		t.Fatalf("encrypt credential key: %v", err)
+	}
+	foreign, err := auth.NewSession(s.st, wrapped)
+	if err != nil {
+		t.Fatalf("seed foreign session: %v", err)
+	}
+	rec := postInitDataCookie(t, s, initData, &http.Cookie{Name: "namakani_session", Value: foreign})
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("repeat backed by a different session status = %d, want 401, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleTelegramWebAppAuthRepeatAfterSessionRevoked(t *testing.T) {
+	s := newTGTestServer(t)
+	initData := signTGInitData(tgTestToken, 424242, time.Now().Unix())
+	first := postInitData(t, s, initData)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first use status = %d, body = %s", first.Code, first.Body.String())
+	}
+	cookie := issuedSessionCookie(t, first)
+	if err := auth.DeleteSession(s.st, cookie.Value); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+	if rec := postInitDataCookie(t, s, initData, cookie); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("repeat after its session was revoked status = %d, want 401, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleTelegramWebAppAuthWrongUser(t *testing.T) {
 	s := newTGTestServer(t)
 	initData := signTGInitData(tgTestToken, 999999, time.Now().Unix())

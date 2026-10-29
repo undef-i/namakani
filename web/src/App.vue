@@ -4764,7 +4764,7 @@ onBeforeUnmount(() => {
       <v-app-bar flat class="app-topbar">
         <div v-if="lgAndUp" class="topbar-desktop">
           <v-btn icon="mdi-menu" variant="text" :aria-label="t('展开菜单')" @click="toggleDrawer" />
-          <span v-if="wideDesktop" class="topbar-title">Namakani</span>
+          <span v-if="wideDesktop" class="topbar-title">namakani</span>
           <v-badge v-if="attentionCount > 0" :content="attentionCount" color="error">
             <v-btn icon="mdi-alert-circle" variant="text" color="error" :aria-label="t('有 {n} 项操作没有完成', { n: attentionCount })" @click="openSyncPanel" />
           </v-badge>

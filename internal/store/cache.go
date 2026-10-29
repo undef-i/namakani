@@ -162,6 +162,44 @@ func (s *Store) AttachmentFilePath(attachmentID int64) string {
 	return filepath.Join(s.attachmentsDir, strconv.FormatInt(attachmentID, 10)+".bin")
 }
 
+// A row whose recorded file is gone but whose canonical file exists was
+// left pointing at a previous data dir; repoint it so downloads stay local.
+func (s *Store) repairAttachmentPaths() error {
+	rows, err := s.DB.Query(`SELECT id, local_path FROM attachments WHERE local_path <> ''`)
+	if err != nil {
+		return err
+	}
+	var fix []int64
+	for rows.Next() {
+		var id int64
+		var p string
+		if err := rows.Scan(&id, &p); err != nil {
+			rows.Close()
+			return err
+		}
+		if p == s.AttachmentFilePath(id) {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil {
+			continue
+		}
+		if _, err := os.Stat(s.AttachmentFilePath(id)); err == nil {
+			fix = append(fix, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, id := range fix {
+		if _, err := s.DB.Exec(`UPDATE attachments SET local_path = ? WHERE id = ?`, s.AttachmentFilePath(id), id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) oldestCachedAttachment(beforeDateTS, beforeMsgID, beforeAttID int64, matchAny bool) (int64, string, int64, bool, error) {
 	q := `SELECT a.id, a.local_path, a.size FROM attachments a JOIN messages m ON m.id = a.message_id
 		WHERE a.local_path <> ''`

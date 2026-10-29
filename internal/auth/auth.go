@@ -89,6 +89,8 @@ func tokenHash(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func TokenHash(token string) string { return tokenHash(token) }
+
 func NewSession(st *store.Store, wrappedKey string) (string, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {

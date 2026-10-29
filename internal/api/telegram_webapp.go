@@ -81,6 +81,36 @@ func verifyTGInitData(token, initData string, now time.Time) (tgInitData, error)
 	return out, nil
 }
 
+func tgInitDataFingerprint(initData string) string {
+	sum := sha256.Sum256([]byte(initData))
+	return hex.EncodeToString(sum[:])
+}
+
+// Records the fingerprint on first use and reports the claim as fresh; a
+// repeat claim returns the hash of the session the first use issued.
+// Rows outlive the verify window only until the next claim prunes them.
+func (s *Server) claimTGInitData(fp string, authDate int64, now time.Time) (string, bool) {
+	_, _ = s.st.DB.Exec(`DELETE FROM tg_webapp_logins WHERE auth_date < ?`, now.Add(-tgWebAppMaxAge).Unix())
+	if _, err := s.st.DB.Exec(`INSERT INTO tg_webapp_logins(data_hash, auth_date, used_at) VALUES(?, ?, ?)`,
+		fp, authDate, now.Unix()); err == nil {
+		return "", true
+	}
+	var bound string
+	if err := s.st.DB.QueryRow(`SELECT session_hash FROM tg_webapp_logins WHERE data_hash = ?`, fp).Scan(&bound); err != nil {
+		return "", false
+	}
+	return bound, false
+}
+
+func (s *Server) bindTGInitDataSession(fp, token string) {
+	_, _ = s.st.DB.Exec(`UPDATE tg_webapp_logins SET session_hash = ? WHERE data_hash = ?`,
+		auth.TokenHash(token), fp)
+}
+
+func (s *Server) releaseTGInitData(fp string) {
+	_, _ = s.st.DB.Exec(`DELETE FROM tg_webapp_logins WHERE data_hash = ?`, fp)
+}
+
 func (s *Server) recoverCredentialKey() ([]byte, bool) {
 	if s.serverKey == nil {
 		log.Printf("tg webapp-auth: recover key: no server key")
@@ -130,17 +160,46 @@ func (s *Server) handleTelegramWebAppAuth(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusForbidden, "Telegram 账号与绑定的聊天不一致")
 		return
 	}
+	fp := tgInitDataFingerprint(req.InitData)
+	bound, fresh := s.claimTGInitData(fp, init.AuthDate, time.Now())
+	if !fresh {
+		// A repeat is benign when it carries the live session this data
+		// issued (a WebView reload re-running auth); anything else is a
+		// replay and gets no session.
+		if bound != "" {
+			if tok := s.sessionToken(r); tok != "" && auth.TokenHash(tok) == bound {
+				if _, ok := s.sessionKey(r); ok {
+					s.renewSession(w, r)
+					log.Printf("tg webapp-auth: repeat with its live session for user %d", init.UserID)
+					writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+					return
+				}
+			}
+		}
+		log.Printf("tg webapp-auth: replayed init data rejected for user %d", init.UserID)
+		writeErr(w, http.StatusUnauthorized, "Telegram 登录数据已使用，请重新打开小程序")
+		return
+	}
+	claimed := true
+	defer func() {
+		if claimed {
+			s.releaseTGInitData(fp)
+		}
+	}()
 	key, ok := s.recoverCredentialKey()
 	if !ok {
 		log.Printf("tg webapp-auth: rejected: credential key not recoverable")
 		writeErr(w, http.StatusConflict, "当前没有可用的登录会话，请先用主密码登录一次")
 		return
 	}
-	if err := s.startSession(w, r, key); err != nil {
+	token, err := s.startSession(w, r, key)
+	if err != nil {
 		log.Printf("tg webapp-auth: start session failed: %v", err)
 		writeErr(w, http.StatusInternalServerError, "会话处理失败")
 		return
 	}
+	s.bindTGInitDataSession(fp, token)
+	claimed = false
 	s.startAllWorkers(key)
 	log.Printf("tg webapp-auth: ok for user %d", init.UserID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

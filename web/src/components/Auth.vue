@@ -33,7 +33,7 @@ async function submit() {
 <template>
   <v-container class="fill-height d-flex align-center justify-center">
     <v-card width="100%" max-width="380" class="pa-2">
-      <v-card-title class="text-h5">Namakani</v-card-title>
+      <v-card-title class="text-h5">namakani</v-card-title>
       <v-card-subtitle v-if="mode === 'setup'">{{ t('首次使用：设置主密码') }}</v-card-subtitle>
       <v-card-text>
         <v-form @submit.prevent="submit">

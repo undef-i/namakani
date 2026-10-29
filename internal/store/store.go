@@ -214,6 +214,12 @@ CREATE TABLE IF NOT EXISTS tg_pushes (
 	message_id INTEGER PRIMARY KEY,
 	pushed_at  INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS tg_webapp_logins (
+	data_hash    TEXT PRIMARY KEY,
+	auth_date    INTEGER NOT NULL DEFAULT 0,
+	used_at      INTEGER NOT NULL DEFAULT 0,
+	session_hash TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS first_seen (
 	account_id     INTEGER NOT NULL,
 	msg_key        TEXT NOT NULL,
@@ -318,6 +324,7 @@ func Open(path string) (*Store, error) {
 		{"attachments", "content_id", "ALTER TABLE attachments ADD COLUMN content_id TEXT NOT NULL DEFAULT ''"},
 		{"attachments", "inline", "ALTER TABLE attachments ADD COLUMN inline INTEGER NOT NULL DEFAULT 0"},
 		{"sessions", "wrapped_key", "ALTER TABLE sessions ADD COLUMN wrapped_key TEXT NOT NULL DEFAULT ''"},
+		{"tg_webapp_logins", "session_hash", "ALTER TABLE tg_webapp_logins ADD COLUMN session_hash TEXT NOT NULL DEFAULT ''"},
 		{"accounts", "signature", "ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''"},
 		{"accounts", "from_name", "ALTER TABLE accounts ADD COLUMN from_name TEXT NOT NULL DEFAULT ''"},
 		{"accounts", "kind", "ALTER TABLE accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'imap'"},
@@ -363,6 +370,9 @@ func Open(path string) (*Store, error) {
 	}
 	st := &Store{DB: db, dataDir: filepath.Dir(path),
 		attachmentsDir: filepath.Join(filepath.Dir(path), "attachments")}
+	if err := st.repairAttachmentPaths(); err != nil {
+		return nil, fmt.Errorf("repair attachment paths: %w", err)
+	}
 	st.loadAppSettings()
 	return st, nil
 }

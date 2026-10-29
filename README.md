@@ -1,4 +1,4 @@
-# Namakani
+# namakani
 
 A webmail client that aggregates multiple mailboxes for reading and writing in one place. Supports the IMAP and SMTP protocols, and connecting to Proton, Tuta and Gmail accounts.
 

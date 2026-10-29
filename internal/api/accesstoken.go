@@ -33,7 +33,7 @@ func (s *Server) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request)
 	}
 	s.mu.Unlock()
 	s.mgr.StopAll()
-	http.SetCookie(w, &http.Cookie{Name: "namakani_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: "namakani_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.cookieSecure(r), SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "revoked": n})
 }
 

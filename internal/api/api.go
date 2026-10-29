@@ -15,6 +15,7 @@ import (
 	"mime"
 	"net/http"
 	netmail "net/mail"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -334,13 +335,25 @@ func requestIsHTTPS(r *http.Request) bool {
 	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 }
 
+// The public scheme is the one base_url declares; the proxy chain makes
+// the request itself look like plain http even on an https deployment.
+func (s *Server) cookieSecure(r *http.Request) bool {
+	if requestIsHTTPS(r) {
+		return true
+	}
+	if u, err := url.Parse(s.st.BaseURL()); err == nil && u.Scheme == "https" {
+		return true
+	}
+	return false
+}
+
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "namakani_session",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   requestIsHTTPS(r),
+		Secure:   s.cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(auth.SessionTTL / time.Second),
 	})
@@ -355,24 +368,24 @@ func (s *Server) renewSession(w http.ResponseWriter, r *http.Request) {
 	_ = auth.TouchSession(s.st, token)
 }
 
-func (s *Server) startSession(w http.ResponseWriter, r *http.Request, key []byte) error {
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request, key []byte) (string, error) {
 	wrapped := ""
 	if s.serverKey != nil {
 		sealed, err := auth.Encrypt(s.serverKey, string(key))
 		if err != nil {
-			return err
+			return "", err
 		}
 		wrapped = sealed
 	}
 	token, err := auth.NewSession(s.st, wrapped)
 	if err != nil {
-		return err
+		return "", err
 	}
 	s.mu.Lock()
 	s.keys[token] = key
 	s.mu.Unlock()
 	s.setSessionCookie(w, r, token)
-	return nil
+	return token, nil
 }
 
 var BuildVersion = "dev"
@@ -425,7 +438,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "初始化校验失败")
 		return
 	}
-	if err := s.startSession(w, r, key); err != nil {
+	if _, err := s.startSession(w, r, key); err != nil {
 		writeErr(w, http.StatusInternalServerError, "会话处理失败")
 		return
 	}
@@ -483,7 +496,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.resetLoginFailures()
-	if err := s.startSession(w, r, key); err != nil {
+	if _, err := s.startSession(w, r, key); err != nil {
 		writeErr(w, http.StatusInternalServerError, "会话处理失败")
 		return
 	}
@@ -507,7 +520,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		s.keys = make(map[string][]byte)
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "namakani_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: requestIsHTTPS(r), SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: "namakani_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.cookieSecure(r), SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
