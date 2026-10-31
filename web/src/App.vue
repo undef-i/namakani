@@ -759,7 +759,9 @@ function applySnapshot(batch, snap, startSeq, append = false, wm = null) {
     }
   }
   appendReplay = prevAppendReplay
+  foldJournalIntoCache()
   journal.length = 0
+  journalBase = inputSeq
   journalRows(rows)
   baseRows.value = rows
   snapEpoch = listEpoch
@@ -782,21 +784,143 @@ function applySnapshot(batch, snap, startSeq, append = false, wm = null) {
   touchIntents()
 }
 
+function replayEntryDeltas(entry, snap) {
+  let rows = [...entry.messages]
+  let seq = entry.seq
+  let complete = true
+  const prevAppendReplay = appendReplay
+  appendReplay = false
+  const belongs = snapBelongs(snap)
+  for (const d of journal) {
+    if (d.seq <= entry.seq) continue
+    if (snap.kind === 'search') {
+      if (d.type === 'flags') {
+        rows = rowsApplyFlags(rows, d.items)
+        for (const it of d.items) memberFlags.set(it.id, it.flags)
+      } else if (d.type === 'removed') {
+        const ids = new Set(d.ev.ids ?? [])
+        if (ids.size) {
+          rows = rows.filter(
+            (r) => !(ids.has(r.id) && (d.ev.folder_id == null || r.folder_id === d.ev.folder_id)),
+          )
+        }
+      } else {
+        complete = false
+      }
+      seq = d.seq
+      continue
+    }
+    if (d.type === 'removed' && searching.value) {
+      complete = false
+      break
+    }
+    if (deltaInCtx(d, snap)) {
+      if (d.type === 'msg') {
+        for (const item of d.items) rows = rowsInsertThreaded(rows, item, belongs)
+      } else if (d.type === 'removed') {
+        rows = rowsApplyRemoved(rows, d.ev).rows
+      } else if (d.type === 'flags') {
+        rows = rowsApplyFlags(rows, d.items)
+        for (const it of d.items) memberFlags.set(it.id, it.flags)
+      }
+    }
+    seq = d.seq
+  }
+  appendReplay = prevAppendReplay
+  return { rows, seq, complete }
+}
+
+function foldJournalIntoCache() {
+  for (const entry of scopeCache.values()) {
+    if (entry.seq == null || entry.seq >= inputSeq || !entry.snap) continue
+    const res = replayEntryDeltas(entry, entry.snap)
+    entry.messages = res.rows
+    entry.seq = res.complete ? inputSeq : res.seq
+    if (res.complete) entry.epoch = listEpoch
+  }
+}
+
 const scopeCache = new Map()
 let listEpoch = 0
 let snapEpoch = 0
+let journalBase = 0
+let searchDirty = false
+let searchDirtySeq = 0
+let searchMergeTimer = null
+let searchMerging = false
+let lastListScrollAt = 0
 function listCacheKey(snap) {
   return snapCtxKey(snap)
 }
+function rowKeyOf(m, snap) {
+  return snap.kind !== 'search' && m.thread_key ? 't' + m.account_id + ':' + m.thread_key : m.id
+}
+function captureListAnchor() {
+  const host = listEl.value
+  const el = scrollEl(host)
+  if (!host || !el) return null
+  const rows = displayMessages.value
+  if (!rows.length) return null
+  const vRect = el.getBoundingClientRect()
+  let anchorIdx = -1
+  let anchorTop = 0
+  for (const w of host.querySelectorAll('.mail-row-wrap')) {
+    const r = w.getBoundingClientRect()
+    if (r.height > 0 && r.bottom > vRect.top + 1) {
+      const idxEl = w.querySelector('[data-rowidx]')
+      if (!idxEl) return null
+      anchorIdx = +idxEl.dataset.rowidx
+      anchorTop = el.scrollTop + (r.top - vRect.top)
+      break
+    }
+  }
+  if (anchorIdx < 0 || anchorIdx >= rows.length) return null
+  const snap = listSnap.value
+  return {
+    key: rowKeyOf(rows[anchorIdx], snap),
+    delta: el.scrollTop - anchorTop,
+    keys: rows.map((m) => rowKeyOf(m, snap)),
+  }
+}
+function restoreListAnchor(anchor) {
+  if (!anchor) return false
+  const host = listEl.value
+  const el = scrollEl(host)
+  if (!host || !el) return false
+  const rows = displayMessages.value
+  const snap = listSnap.value
+  const keysNow = new Map(rows.map((m, i) => [rowKeyOf(m, snap), i]))
+  let targetIdx = -1
+  for (let i = Math.max(0, anchor.keys.indexOf(anchor.key)); i < anchor.keys.length; i++) {
+    if (keysNow.has(anchor.keys[i])) {
+      targetIdx = keysNow.get(anchor.keys[i])
+      break
+    }
+  }
+  if (targetIdx < 0) return false
+  for (const w of host.querySelectorAll('.mail-row-wrap')) {
+    const idxEl = w.querySelector('[data-rowidx]')
+    if (idxEl && +idxEl.dataset.rowidx === targetIdx) {
+      const vRect = el.getBoundingClientRect()
+      const r = w.getBoundingClientRect()
+      el.scrollTop = el.scrollTop + (r.top - vRect.top) + anchor.delta
+      return true
+    }
+  }
+  return false
+}
 function stashList() {
   const snap = listSnap.value
-  if (snap.kind !== 'folder' || listStatus.value !== 'ready') return
+  if (listStatus.value !== 'ready') return
   scopeCache.set(listCacheKey(snap), {
     messages: baseRows.value,
     offset: listOffset,
     hasMore: listHasMore.value,
     scroll: scrollEl(listEl.value)?.scrollTop ?? 0,
     epoch: snapEpoch,
+    seq: inputSeq,
+    snap: { ...snap },
+    anchor: captureListAnchor(),
   })
   if (scopeCache.size > 12) scopeCache.delete(scopeCache.keys().next().value)
 }
@@ -1450,7 +1574,7 @@ const liveScopeLabel = computed(
 )
 const listHeadTitle = computed(() => {
   if (searching.value) {
-    if (listSnap.value.kind === 'search') {
+    if (listSnap.value.kind === 'search' && listSnap.value.query === searchQuery.value.trim()) {
       return t('搜索结果') + ' (' + t('{n} 封', { n: messages.value.length }) + ')'
     }
     return t('搜索结果')
@@ -1478,6 +1602,18 @@ const mobileBarTitle = computed(() => {
 
 function openMobileSearch() {
   mobileSearch.value = true
+  if (listSnap.value.kind !== 'search') {
+    loadToken++
+    stashList()
+    baseRows.value = []
+    listOffset = 0
+    listHasMore.value = false
+    listSnap.value = { kind: 'search', query: '' }
+    listStatus.value = 'ready'
+    listErrorBar.value = ''
+    listBusy.value = false
+    clearSelection()
+  }
   nextTick(() => {
     searchEl.value?.focus?.()
   })
@@ -1861,6 +1997,7 @@ function fmtAddrList(list) {
 
 
 async function loadMessages(soft = false) {
+  if (mobileSearch.value && !searching.value) return
   if (!searching.value && rangeId.value && foldersStatus.value !== 'ready') {
     await loadFolders()
   }
@@ -1880,7 +2017,10 @@ async function loadMessages(soft = false) {
     newMailPending.value = 0
   }
   const keepReady =
-    (soft || target.kind === 'search') && listStatus.value === 'ready' && messages.value.length > 0
+    (soft || target.kind === 'search') &&
+    listStatus.value === 'ready' &&
+    messages.value.length > 0 &&
+    listSnap.value.kind === target.kind
   if (!keepReady) listStatus.value = 'loading'
   listError.value = ''
   listOffset = 0
@@ -1888,8 +2028,17 @@ async function loadMessages(soft = false) {
   convoOpenIds.value = new Set()
   convoDetails.value = {}
   cursorIdx.value = 0
-  const rawHit = !soft && target.kind === 'folder' ? scopeCache.get(listCacheKey(target)) : null
-  const hit = rawHit && rawHit.epoch === listEpoch ? rawHit : null
+  const rawHit = !soft ? scopeCache.get(listCacheKey(target)) : null
+  let hit = rawHit && rawHit.epoch === listEpoch ? rawHit : null
+  let staleAnchor = null
+  if (!hit && rawHit && rawHit.seq != null && rawHit.seq >= journalBase) {
+    rawHit.messages = replayEntryDeltas(rawHit, target).rows
+    rawHit.epoch = listEpoch
+    rawHit.seq = inputSeq
+    hit = rawHit
+    staleAnchor = rawHit.anchor ?? null
+    if (target.kind === 'search') markSearchDirty()
+  }
   if (hit) {
     journalRows(hit.messages)
     let rows = hit.messages
@@ -1911,6 +2060,7 @@ async function loadMessages(soft = false) {
     listStatus.value = 'ready'
     listBusy.value = false
     nextTick(() => {
+      if (staleAnchor && restoreListAnchor(staleAnchor)) return
       const el = scrollEl(listEl.value)
       if (el) el.scrollTop = hit.scroll
     })
@@ -1931,12 +2081,15 @@ async function loadMessages(soft = false) {
       wm = r.wm
     }
     if (gen !== loadToken) return
+    const sawMsgInFlight =
+      target.kind === 'search' && journal.some((d) => d.seq > startSeq && d.type === 'msg')
     applySnapshot(batch, target, startSeq, false, wm)
     listOffset = batch.length
     listHasMore.value = batch.length === PAGE_SIZE
     listSnap.value = target
     listStatus.value = 'ready'
     listErrorBar.value = ''
+    if (sawMsgInFlight) markSearchDirty()
   } catch (err) {
     if (gen !== loadToken) return
     if (keepReady) {
@@ -1981,7 +2134,7 @@ async function loadMore() {
 }
 
 async function rebuildList() {
-  if (searching.value || listStatus.value === 'loading') return
+  if (searching.value || mobileSearch.value || listStatus.value === 'loading') return
   const gen = ++loadToken
   const startSeq = inputSeq
   try {
@@ -2001,7 +2154,64 @@ async function rebuildList() {
   }
 }
 
+function markSearchDirty() {
+  searchDirty = true
+  searchDirtySeq++
+  if (selected.value || convo.value) return
+  scheduleSearchMerge()
+}
+
+function scheduleSearchMerge() {
+  if (searchMergeTimer) return
+  searchMergeTimer = setTimeout(() => {
+    searchMergeTimer = null
+    if (!searchDirty) return
+    if (selected.value || convo.value) return
+    if (listSnap.value.kind !== 'search' || !listSnap.value.query) {
+      searchDirty = false
+      return
+    }
+    if (Date.now() - lastListScrollAt < 400) {
+      scheduleSearchMerge()
+      return
+    }
+    void mergeSearchResults()
+  }, 700)
+}
+
+async function mergeSearchResults() {
+  if (searchMerging) return
+  if (listSnap.value.kind !== 'search' || !listSnap.value.query) {
+    searchDirty = false
+    return
+  }
+  searchMerging = true
+  searchDirty = false
+  const seqAtStart = searchDirtySeq
+  const query = listSnap.value.query
+  const gen = loadToken
+  const startSeq = inputSeq
+  const anchor = captureListAnchor()
+  try {
+    const n = Math.max(PAGE_SIZE, listOffset)
+    const batch = await api.searchMessages(query, 0, n)
+    if (gen !== loadToken || listSnap.value.kind !== 'search' || listSnap.value.query !== query) return
+    applySnapshot(batch, { kind: 'search', query }, startSeq, false, null)
+    listOffset = batch.length
+    listHasMore.value = batch.length === n
+    if (anchor) nextTick(() => restoreListAnchor(anchor))
+  } catch {
+    searchDirty = true
+  } finally {
+    searchMerging = false
+    if (searchDirty && searchDirtySeq !== seqAtStart && !selected.value && !convo.value) {
+      scheduleSearchMerge()
+    }
+  }
+}
+
 function onListScroll() {
+  lastListScrollAt = Date.now()
   const el = scrollEl(listEl.value)
   if (!el) return
   if (el.scrollTop <= 80) newMailPending.value = 0
@@ -2620,16 +2830,33 @@ function onSearchInput() {
   searchTimer = setTimeout(() => {
     searching.value = searchQuery.value.trim().length > 0
     clearSelection()
+    if (!searching.value && mobileSearch.value) {
+      baseRows.value = []
+      listOffset = 0
+      listHasMore.value = false
+      listSnap.value = { kind: 'search', query: '' }
+      listStatus.value = 'ready'
+      listErrorBar.value = ''
+      listBusy.value = false
+      return
+    }
     loadMessages(true)
   }, 300)
 }
 
-function clearSearch() {
+function exitSearchState() {
   clearTimeout(searchTimer)
+  mobileSearch.value = false
   searchQuery.value = ''
   searching.value = false
   resetSearchFilter()
-  loadMessages()
+}
+
+function clearSearch() {
+  const active =
+    searching.value || searchQuery.value !== '' || listSnap.value.kind === 'search'
+  exitSearchState()
+  if (active) loadMessages()
 }
 
 function openCompose(init) {
@@ -2979,7 +3206,10 @@ function onServerEvent(ev) {
   if (ev.type === 'messages' || ev.type === 'removed' || ev.type === 'scheduled') listEpoch++
   if (ev.type === 'messages') {
     const beforeCount = messages.value.length
+    const guardAnchor = selected.value || convo.value ? captureListAnchor() : null
     applyMessagesInput(ev.items ?? [])
+    if (guardAnchor) nextTick(() => restoreListAnchor(guardAnchor))
+    if (listSnap.value.kind === 'search' && listSnap.value.query) markSearchDirty()
     if (
       listSnap.value.kind === 'folder' &&
       messages.value.length > beforeCount &&
@@ -2994,7 +3224,9 @@ function onServerEvent(ev) {
   } else if (ev.type === 'flags') {
     applyFlagsInput(ev.items ?? [])
   } else if (ev.type === 'removed') {
+    const guardAnchor = selected.value || convo.value ? captureListAnchor() : null
     applyRemovedInput(ev)
+    if (guardAnchor) nextTick(() => restoreListAnchor(guardAnchor))
   } else if (ev.type === 'folder') {
     applyFolderEvent(ev.folder)
   } else if (ev.type === 'ops') {
@@ -3229,12 +3461,10 @@ function onDrawerPressClick(e) {
 
 function selectScope(key) {
   flushSwipeSends()
-  mobileSearch.value = false
+  exitSearchState()
   scope.value = key
   clearSelection()
   if (!lgAndUp.value) drawerOpen.value = false
-  searchQuery.value = ''
-  searching.value = false
   loadMessages()
 }
 
@@ -3513,10 +3743,8 @@ function onHashChange() {
     }
     return
   }
-  if (searching.value) {
-    searching.value = false
-    searchQuery.value = ''
-  }
+  const wasSearching = searching.value || listSnap.value.kind === 'search'
+  exitSearchState()
   if (route.scope !== scope.value && route.account !== rangeId.value) {
     rangeId.value = route.account
     localStorage.setItem('namakani_range', String(route.account))
@@ -3525,6 +3753,8 @@ function onHashChange() {
     selectScope(route.scope)
   } else if (route.account !== rangeId.value) {
     setRange(route.account)
+  } else if (wasSearching) {
+    loadMessages()
   }
 }
 
@@ -3708,6 +3938,7 @@ function closeReaderNow() {
   readerNoAnim.value = false
   if (convo.value) closeConvo()
   else if (selected.value) clearSelection()
+  if (searchDirty) void mergeSearchResults()
 }
 
 function leaveReader() {
