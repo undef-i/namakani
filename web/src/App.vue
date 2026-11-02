@@ -2084,11 +2084,20 @@ async function loadMessages(soft = false) {
     const sawMsgInFlight =
       target.kind === 'search' && journal.some((d) => d.seq > startSeq && d.type === 'msg')
     applySnapshot(batch, target, startSeq, false, wm)
+    const newQuery =
+      target.kind === 'search' &&
+      (listSnap.value.kind !== 'search' || listSnap.value.query !== target.query)
     listOffset = batch.length
     listHasMore.value = batch.length === PAGE_SIZE
     listSnap.value = target
     listStatus.value = 'ready'
     listErrorBar.value = ''
+    if (newQuery) {
+      nextTick(() => {
+        const el = scrollEl(listEl.value)
+        if (el) el.scrollTop = 0
+      })
+    }
     if (sawMsgInFlight) markSearchDirty()
   } catch (err) {
     if (gen !== loadToken) return
@@ -2857,6 +2866,21 @@ function clearSearch() {
     searching.value || searchQuery.value !== '' || listSnap.value.kind === 'search'
   exitSearchState()
   if (active) loadMessages()
+}
+
+function clearSearchText() {
+  clearTimeout(searchTimer)
+  loadToken++
+  searchQuery.value = ''
+  searching.value = false
+  clearSelection()
+  baseRows.value = []
+  listOffset = 0
+  listHasMore.value = false
+  listSnap.value = { kind: 'search', query: '' }
+  listStatus.value = 'ready'
+  listErrorBar.value = ''
+  listBusy.value = false
 }
 
 function openCompose(init) {
@@ -5029,7 +5053,6 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div v-else class="appbar-search">
-          <v-fade-transition hide-on-leave>
           <div v-if="selectionActive" key="selection" class="d-flex align-center ga-1 mx-n2">
             <v-btn icon="mdi-close" variant="text" :aria-label="t('取消选择')" @click="clearSelectionIds" />
             <v-toolbar-title class="ml-4">{{ selectedIds.size }}</v-toolbar-title>
@@ -5037,29 +5060,19 @@ onBeforeUnmount(() => {
             <v-btn icon="mdi-delete" variant="text" :aria-label="t('删除')" @click="bulkAct('delete')" />
             <v-btn v-if="scope !== 'scheduled'" :icon="selectionHasUnread ? 'mdi-email-open' : 'mdi-email'" variant="text" :aria-label="selectionHasUnread ? t('标为已读') : t('标为未读')" @click="bulkAct(selectionHasUnread ? 'seen' : 'unseen')" />
           </div>
-          <div v-else-if="mobileSearch || searching" key="search" class="search-wrap">
-            <v-btn icon="mdi-arrow-left" variant="text" :aria-label="t('返回')" class="search-back-btn" @click="closeMobileSearch" />
+          <div v-else-if="mobileSearch || searching" key="search" class="search-wrap d-flex align-center ga-1 mx-n2">
+            <v-btn icon="mdi-arrow-left" variant="text" :aria-label="t('返回')" @click="closeMobileSearch" />
             <v-text-field
               ref="searchEl"
               v-model="searchQuery"
               :placeholder="t('搜索主题、发件人、正文')"
-              variant="solo-filled"
-              rounded="pill"
+              variant="plain"
               density="compact"
               hide-details
               class="search-field"
               @input="onSearchInput"
-            >
-              <template v-if="searching" #append-inner>
-              <v-btn
-                icon="mdi-close"
-                variant="text"
-                size="x-small"
-                :aria-label="t('清除搜索')"
-                @click="clearSearch"
-              />
-              </template>
-            </v-text-field>
+            />
+            <v-btn v-if="searchQuery" icon="mdi-close" variant="text" :aria-label="t('清除')" @click="clearSearchText" />
           </div>
           <div v-else key="normal" class="d-flex align-center ga-1 mx-n2">
             <v-btn icon="mdi-menu" variant="text" :aria-label="t('展开菜单')" @click="toggleDrawer" />
@@ -5072,7 +5085,6 @@ onBeforeUnmount(() => {
             </v-badge>
             <v-btn icon="mdi-magnify" variant="text" :aria-label="t('搜索')" @click="openMobileSearch" />
           </div>
-          </v-fade-transition>
         </div>
       </v-app-bar>
 
@@ -5666,7 +5678,7 @@ onBeforeUnmount(() => {
                               :title="t('邮件正文')"
                               class="d-block w-100 border-0"
                               style="height: 320px; background: transparent"
-                              sandbox="allow-same-origin"
+                              sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
                               scrolling="no"
                               :srcdoc="frameCss + cardTrEntry(msg.id).html"
                               @load="cardFrameLoaded"
@@ -5688,7 +5700,7 @@ onBeforeUnmount(() => {
                             :title="t('邮件正文')"
                             class="d-block w-100 border-0"
                             style="height: 320px; background: transparent"
-                            sandbox="allow-same-origin"
+                            sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
                             scrolling="no"
                             :srcdoc="frameCss + convoDetails[msg.id].html"
                             @load="cardFrameLoaded"
@@ -5933,7 +5945,7 @@ onBeforeUnmount(() => {
                       :title="t('邮件正文')"
                       class="mt-2 d-block w-100 border-0"
                       style="height: 480px; background: transparent"
-                      sandbox="allow-same-origin"
+                      sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
                       scrolling="no"
                       :srcdoc="frameCss + shownHtml"
                       @load="frameLoaded"
@@ -6136,16 +6148,6 @@ body {
     overflow: hidden;
   }
 }
-.search-back-btn {
-  position: absolute;
-  left: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  z-index: 2;
-}
-.search-wrap {
-  position: relative;
-}
 .search-menu-btn {
   position: absolute;
   left: 4px;
@@ -6192,7 +6194,8 @@ body {
   }
 }
 .search-field .v-field__input {
-  padding-inline-start: 48px;
+  padding-top: 0;
+  padding-bottom: 0;
 }
 .appbar-search {
   flex: 0 0 auto;
