@@ -585,7 +585,7 @@ func (s *Server) executeWave(conn mail.Conn, wave *drainWave, accountID int64, o
 		s.broadcastOps()
 	}
 	for _, id := range voidedUndo {
-		s.hub.broadcast(map[string]any{"type": "ops", "op_id": id, "undo_failed": true, "error": "这条操作在撤销执行前已经失败"})
+		s.hub.broadcast(map[string]any{"type": "ops", "op_id": id, "undo_failed": true, "error": "this operation failed before the undo could run"})
 	}
 	for _, oc := range outcomes {
 		if oc.failed != nil && !oc.gone {
@@ -600,7 +600,7 @@ func (s *Server) executeWave(conn mail.Conn, wave *drainWave, accountID int64, o
 			log.Printf("namakani: deferred undo op %d: %v", cur.ID, err)
 			msg, ok := undoErrText(cur, err)
 			if !ok {
-				msg = "撤销失败"
+				msg = "undo failed"
 			}
 			_ = s.st.RecordUndoFailure(cur.ID, msg)
 			s.hub.broadcast(map[string]any{"type": "ops", "op_id": cur.ID, "undo_failed": true, "error": msg})

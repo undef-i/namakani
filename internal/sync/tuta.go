@@ -131,28 +131,13 @@ func (m *Manager) tutaSession(ctx context.Context, acct mail.Account, releaseIni
 		}
 	})
 
-	sweep := time.NewTicker(5 * time.Minute)
-	defer sweep.Stop()
-	var debounce *time.Timer
-	var debounceC <-chan time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case err := <-terminal:
 			return err
-		case <-sweep.C:
-			sess.InvalidateCaches()
-			runSync()
 		case <-events:
-			if debounce != nil {
-				debounce.Stop()
-			}
-			debounce = time.NewTimer(2 * time.Second)
-			debounceC = debounce.C
-		case <-debounceC:
-			debounce = nil
-			debounceC = nil
 			runSync()
 		}
 	}

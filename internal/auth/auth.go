@@ -282,17 +282,17 @@ func ParsePort(v any) (int, error) {
 	case float64:
 		p := int(n)
 		if p < 1 || p > 65535 {
-			return 0, fmt.Errorf("端口超出范围")
+			return 0, fmt.Errorf("port out of range")
 		}
 		return p, nil
 	case string:
 		p, err := strconv.Atoi(n)
 		if err != nil || p < 1 || p > 65535 {
-			return 0, fmt.Errorf("端口格式不对")
+			return 0, fmt.Errorf("invalid port format")
 		}
 		return p, nil
 	default:
-		return 0, fmt.Errorf("端口格式不对")
+		return 0, fmt.Errorf("invalid port format")
 	}
 }
 

@@ -142,7 +142,7 @@ func (s *Server) wpNotify(c syncmgr.Change) {
 func (s *Server) handleGetWebPush(w http.ResponseWriter, r *http.Request) {
 	pub, _, err := s.vapidKeys()
 	if err != nil {
-		writeUserErr(w, http.StatusInternalServerError, "推送密钥不可用", err)
+		writeUserErr(w, http.StatusInternalServerError, "push key unavailable", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -163,11 +163,11 @@ type wpSubscribeReq struct {
 func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req wpSubscribeReq
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	if !strings.HasPrefix(req.Endpoint, "https://") || req.Keys.P256dh == "" || req.Keys.Auth == "" {
-		writeErr(w, http.StatusBadRequest, "订阅参数不完整")
+		writeErr(w, http.StatusBadRequest, "subscription parameters are incomplete")
 		return
 	}
 	_, err := s.st.DB.Exec(
@@ -175,7 +175,7 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		 ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`,
 		req.Endpoint, req.Keys.P256dh, req.Keys.Auth, time.Now().Unix())
 	if err != nil {
-		writeUserErr(w, http.StatusInternalServerError, "保存推送订阅失败", err)
+		writeUserErr(w, http.StatusInternalServerError, "failed to save the push subscription", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": len(s.wpSubscriptions())})
@@ -186,7 +186,7 @@ func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		Endpoint string `json:"endpoint"`
 	}
 	if err := decodeJSON(r, &req); err != nil || req.Endpoint == "" {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	s.wpDeleteSubscription(req.Endpoint)
@@ -196,12 +196,12 @@ func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleWebPushTest(w http.ResponseWriter, r *http.Request) {
 	subs := s.wpSubscriptions()
 	if len(subs) == 0 {
-		writeErr(w, http.StatusBadRequest, "还没有任何浏览器订阅")
+		writeErr(w, http.StatusBadRequest, "no browser subscriptions yet")
 		return
 	}
 	pub, priv, err := s.vapidKeys()
 	if err != nil {
-		writeUserErr(w, http.StatusInternalServerError, "推送密钥不可用", err)
+		writeUserErr(w, http.StatusInternalServerError, "push key unavailable", err)
 		return
 	}
 	testURL := "/"

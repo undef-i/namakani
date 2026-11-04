@@ -116,6 +116,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/accounts/gmail/pending/{id}", s.authOnly(s.handleDeleteGmailPending))
 	mux.HandleFunc("GET /api/accounts/gmail/reauth/{id}", s.authOnly(s.handleGetGmailReauth))
 	mux.HandleFunc("GET /api/gmail/callback", s.handleGmailCallback)
+	mux.HandleFunc("POST /api/gmail/pubsub", s.handleGmailPubSub)
 	mux.HandleFunc("POST /api/accounts/test", s.authOnly(s.handleTestAccountForm))
 	mux.HandleFunc("PUT /api/accounts/{id}", s.authOnly(s.handleUpdateAccount))
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.authOnly(s.handleDeleteAccount))
@@ -201,15 +202,15 @@ func describeConnError(err error) string {
 	switch {
 	case strings.Contains(s, "authenticationfailed"), strings.Contains(s, "authentication failed"),
 		strings.Contains(s, "invalid credentials"), strings.Contains(s, "login failed"):
-		return "登录被拒绝，请检查用户名和密码"
+		return "login rejected, check the username and password"
 	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline exceeded"):
-		return "连接超时，请检查服务器地址和网络"
+		return "connection timed out, check the server address and network"
 	case strings.Contains(s, "certificate"), strings.Contains(s, "tls"):
-		return "TLS 证书校验失败"
+		return "TLS certificate verification failed"
 	case strings.Contains(s, "quota"):
-		return "空间或配额不足"
+		return "out of storage or quota"
 	default:
-		return "无法连接服务器，请检查地址和端口"
+		return "cannot connect to the server, check the address and port"
 	}
 }
 
@@ -220,7 +221,7 @@ func writeUserErr(w http.ResponseWriter, code int, fallback string, err error) {
 		return
 	}
 	if errors.Is(err, store.ErrClientKeyConflict) {
-		writeErr(w, http.StatusConflict, "重复提交被拒绝，请刷新后确认当前状态")
+		writeErr(w, http.StatusConflict, "duplicate submission rejected, refresh and confirm the current state")
 		return
 	}
 	log.Printf("namakani: %s: %v", fallback, err)
@@ -323,7 +324,7 @@ func (s *Server) credentialKey(r *http.Request) ([]byte, bool) {
 func (s *Server) authOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := s.credentialKey(r); !ok {
-			writeErr(w, http.StatusUnauthorized, "尚未登录")
+			writeErr(w, http.StatusUnauthorized, "not signed in")
 			return
 		}
 		s.renewSession(w, r)
@@ -393,7 +394,7 @@ var BuildVersion = "dev"
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	setup, err := auth.IsSetup(s.st)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取状态失败")
+		writeErr(w, http.StatusInternalServerError, "failed to read state")
 		return
 	}
 	_, authed := s.credentialKey(r)
@@ -417,29 +418,29 @@ type passwordReq struct {
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	setup, err := auth.IsSetup(s.st)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取状态失败")
+		writeErr(w, http.StatusInternalServerError, "failed to read state")
 		return
 	}
 	if setup {
-		writeErr(w, http.StatusConflict, "已完成初始化")
+		writeErr(w, http.StatusConflict, "setup already completed")
 		return
 	}
 	var req passwordReq
 	if err := decodeJSON(r, &req); err != nil || len(req.Password) < 8 {
-		writeErr(w, http.StatusBadRequest, "密码至少 8 位")
+		writeErr(w, http.StatusBadRequest, "password must be at least 8 characters")
 		return
 	}
 	if err := auth.SetupMaster(s.st, req.Password); err != nil {
-		writeErr(w, http.StatusInternalServerError, "初始化失败")
+		writeErr(w, http.StatusInternalServerError, "setup failed")
 		return
 	}
 	key, ok, err := auth.VerifyMaster(s.st, req.Password)
 	if err != nil || !ok {
-		writeErr(w, http.StatusInternalServerError, "初始化校验失败")
+		writeErr(w, http.StatusInternalServerError, "setup verification failed")
 		return
 	}
 	if _, err := s.startSession(w, r, key); err != nil {
-		writeErr(w, http.StatusInternalServerError, "会话处理失败")
+		writeErr(w, http.StatusInternalServerError, "session handling failed")
 		return
 	}
 	s.startAllWorkers(key)
@@ -478,26 +479,26 @@ func (s *Server) resetLoginFailures() {
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req passwordReq
 	if err := decodeJSON(r, &req); err != nil || req.Password == "" {
-		writeErr(w, http.StatusBadRequest, "请填写密码")
+		writeErr(w, http.StatusBadRequest, "password is required")
 		return
 	}
 	if s.loginWait() > 0 {
-		writeErr(w, http.StatusTooManyRequests, "尝试次数过多，请稍后再试")
+		writeErr(w, http.StatusTooManyRequests, "too many attempts, try again later")
 		return
 	}
 	key, ok, err := auth.VerifyMaster(s.st, req.Password)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "登录失败")
+		writeErr(w, http.StatusInternalServerError, "sign-in failed")
 		return
 	}
 	if !ok {
 		s.noteLoginFailure()
-		writeErr(w, http.StatusUnauthorized, "密码不对")
+		writeErr(w, http.StatusUnauthorized, "incorrect password")
 		return
 	}
 	s.resetLoginFailures()
 	if _, err := s.startSession(w, r, key); err != nil {
-		writeErr(w, http.StatusInternalServerError, "会话处理失败")
+		writeErr(w, http.StatusInternalServerError, "session handling failed")
 		return
 	}
 	s.startAllWorkers(key)
@@ -568,13 +569,13 @@ func validateAccount(in *accountIn, passwordRequired bool) (imapPort, smtpPort i
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" ||
 		strings.TrimSpace(in.ImapHost) == "" || strings.TrimSpace(in.SmtpHost) == "" ||
 		strings.TrimSpace(in.Username) == "" {
-		return 0, 0, userFacing("请填写名称、邮箱、服务器地址和用户名")
+		return 0, 0, userFacing("name, email, server address and username are required")
 	}
 	if passwordRequired && in.Password == "" {
-		return 0, 0, userFacing("请填写密码")
+		return 0, 0, userFacing("password is required")
 	}
 	if !auth.ValidTLSMode(in.ImapTLS) || !auth.ValidTLSMode(in.SmtpTLS) {
-		return 0, 0, userFacing("加密方式只能是 tls、starttls 或 none")
+		return 0, 0, userFacing("encryption must be tls, starttls or none")
 	}
 	imapPort, err = auth.ParsePort(in.ImapPort)
 	if err != nil {
@@ -591,7 +592,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.st.DB.Query(`SELECT id, label, email, imap_host, imap_port, imap_tls,
 		smtp_host, smtp_port, smtp_tls, username, signature, from_name, tls_skip_verify, kind FROM accounts ORDER BY sort, id`)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load list")
 		return
 	}
 	defer rows.Close()
@@ -600,7 +601,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 		var a accountOut
 		if err := rows.Scan(&a.ID, &a.Label, &a.Email, &a.ImapHost, &a.ImapPort, &a.ImapTLS,
 			&a.SmtpHost, &a.SmtpPort, &a.SmtpTLS, &a.Username, &a.Signature, &a.FromName, &a.TLSSkipVerify, &a.Kind); err != nil {
-			writeErr(w, http.StatusInternalServerError, "列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load list")
 			return
 		}
 		out = append(out, a)
@@ -612,7 +613,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var in accountIn
 	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	if in.Kind == "proton" {
@@ -629,12 +630,12 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	imapPort, smtpPort, err := validateAccount(&in, true)
 	if err != nil {
-		writeUserErr(w, http.StatusBadRequest, "账号信息不完整，请检查后重试", err)
+		writeUserErr(w, http.StatusBadRequest, "account details are incomplete, check them and try again", err)
 		return
 	}
 	enc, err := auth.Encrypt(key, in.Password)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "加密失败")
+		writeErr(w, http.StatusInternalServerError, "encryption failed")
 		return
 	}
 	res, err := s.st.DB.Exec(`INSERT INTO accounts(label, email, imap_host, imap_port, imap_tls,
@@ -643,7 +644,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
 		in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, enc, in.Signature, in.FromName, in.TLSSkipVerify, time.Now().Unix())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save")
 		return
 	}
 	id, _ := res.LastInsertId()
@@ -655,7 +656,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var in accountIn
 	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	if in.Kind == "proton" {
@@ -672,14 +673,14 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	imapPort, smtpPort, err := validateAccount(&in, false)
 	if err != nil {
-		writeUserErr(w, http.StatusBadRequest, "账号信息不完整，请检查后重试", err)
+		writeUserErr(w, http.StatusBadRequest, "account details are incomplete, check them and try again", err)
 		return
 	}
 	id := r.PathValue("id")
 	if in.Password != "" {
 		enc, err := auth.Encrypt(key, in.Password)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "加密失败")
+			writeErr(w, http.StatusInternalServerError, "encryption failed")
 			return
 		}
 		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, imap_host=?, imap_port=?, imap_tls=?,
@@ -687,7 +688,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
 			in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, enc, in.Signature, in.FromName, in.TLSSkipVerify, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "更新失败")
+			writeErr(w, http.StatusInternalServerError, "failed to update")
 			return
 		}
 	} else {
@@ -696,7 +697,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			in.Label, in.Email, in.ImapHost, imapPort, in.ImapTLS,
 			in.SmtpHost, smtpPort, in.SmtpTLS, in.Username, in.Signature, in.FromName, in.TLSSkipVerify, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "更新失败")
+			writeErr(w, http.StatusInternalServerError, "failed to update")
 			return
 		}
 	}
@@ -710,12 +711,12 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	idNum, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "账号编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid account id")
 		return
 	}
 	s.mgr.Stop(idNum)
 	if err := s.st.DeleteAccount(idNum); err != nil {
-		writeErr(w, http.StatusInternalServerError, "删除失败")
+		writeErr(w, http.StatusInternalServerError, "failed to delete")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -762,7 +763,7 @@ func (s *Server) authorizeProton(in *accountIn) (string, error) {
 
 func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *accountIn) {
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" || in.Password == "" {
-		writeErr(w, http.StatusBadRequest, "请填写名称、邮箱和密码")
+		writeErr(w, http.StatusBadRequest, "name, email and password are required")
 		return
 	}
 	bridgePassword, err := s.authorizeProton(in)
@@ -776,12 +777,12 @@ func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *acco
 		return
 	}
 	if err != nil {
-		writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱和密码", err)
+		writeUserErr(w, http.StatusBadRequest, "sign-in failed, check the email and password", err)
 		return
 	}
 	enc, err := auth.Encrypt(key, bridgePassword)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "加密失败")
+		writeErr(w, http.StatusInternalServerError, "encryption failed")
 		return
 	}
 	username := in.Username
@@ -794,7 +795,7 @@ func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *acco
 		in.Label, in.Email, "", 0, "none",
 		"", 0, "none", username, enc, in.Signature, in.FromName, false, "proton", time.Now().Unix())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save")
 		return
 	}
 	id, _ := res.LastInsertId()
@@ -805,7 +806,7 @@ func (s *Server) createProtonAccount(w http.ResponseWriter, key []byte, in *acco
 func (s *Server) updateProtonAccount(w http.ResponseWriter, r *http.Request, key []byte, in *accountIn) {
 	id := r.PathValue("id")
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" {
-		writeErr(w, http.StatusBadRequest, "请填写名称和邮箱")
+		writeErr(w, http.StatusBadRequest, "name and email are required")
 		return
 	}
 	username := in.Username
@@ -824,25 +825,25 @@ func (s *Server) updateProtonAccount(w http.ResponseWriter, r *http.Request, key
 			return
 		}
 		if err != nil {
-			writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱和密码", err)
+			writeUserErr(w, http.StatusBadRequest, "sign-in failed, check the email and password", err)
 			return
 		}
 		enc, err := auth.Encrypt(key, bridgePassword)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "加密失败")
+			writeErr(w, http.StatusInternalServerError, "encryption failed")
 			return
 		}
 		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, enc_password=?, signature=?, from_name=? WHERE id=?`,
 			in.Label, in.Email, username, enc, in.Signature, in.FromName, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "更新失败")
+			writeErr(w, http.StatusInternalServerError, "failed to update")
 			return
 		}
 	} else {
 		_, err := s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, signature=?, from_name=? WHERE id=?`,
 			in.Label, in.Email, username, in.Signature, in.FromName, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "更新失败")
+			writeErr(w, http.StatusInternalServerError, "failed to update")
 			return
 		}
 	}
@@ -855,7 +856,7 @@ func (s *Server) updateProtonAccount(w http.ResponseWriter, r *http.Request, key
 
 func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accountIn) {
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" || in.Password == "" {
-		writeErr(w, http.StatusBadRequest, "请填写名称、邮箱和密码")
+		writeErr(w, http.StatusBadRequest, "name, email and password are required")
 		return
 	}
 	start := time.Now()
@@ -866,13 +867,13 @@ func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accoun
 	}
 	if err != nil {
 		log.Printf("tuta: create account authorize failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
-		writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱、密码和两步验证码", err)
+		writeUserErr(w, http.StatusBadRequest, "sign-in failed, check the email, password and two-factor code", err)
 		return
 	}
 	log.Printf("tuta: create account authorize ok in %s", time.Since(start).Round(time.Millisecond))
 	enc, err := auth.Encrypt(key, in.Password)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "加密失败")
+		writeErr(w, http.StatusInternalServerError, "encryption failed")
 		return
 	}
 	username := in.Username
@@ -885,12 +886,12 @@ func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accoun
 		in.Label, in.Email, "", 0, "none",
 		"", 0, "none", username, enc, in.Signature, in.FromName, false, "tuta", time.Now().Unix())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save")
 		return
 	}
 	id, _ := res.LastInsertId()
 	if err := s.st.SaveTutaSession(id, userID, accessToken); err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存会话失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save the session")
 		return
 	}
 	s.startWorkerFor(id, key)
@@ -900,7 +901,7 @@ func (s *Server) createTutaAccount(w http.ResponseWriter, key []byte, in *accoun
 func (s *Server) updateTutaAccount(w http.ResponseWriter, r *http.Request, key []byte, in *accountIn) {
 	id := r.PathValue("id")
 	if strings.TrimSpace(in.Label) == "" || strings.TrimSpace(in.Email) == "" {
-		writeErr(w, http.StatusBadRequest, "请填写名称和邮箱")
+		writeErr(w, http.StatusBadRequest, "name and email are required")
 		return
 	}
 	username := in.Username
@@ -917,19 +918,19 @@ func (s *Server) updateTutaAccount(w http.ResponseWriter, r *http.Request, key [
 		}
 		if err != nil {
 			log.Printf("tuta: update account %d authorize failed after %s: %v", idNum, time.Since(start).Round(time.Millisecond), err)
-			writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱、密码和两步验证码", err)
+			writeUserErr(w, http.StatusBadRequest, "sign-in failed, check the email, password and two-factor code", err)
 			return
 		}
 		log.Printf("tuta: update account %d authorize ok in %s", idNum, time.Since(start).Round(time.Millisecond))
 		enc, err := auth.Encrypt(key, in.Password)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "加密失败")
+			writeErr(w, http.StatusInternalServerError, "encryption failed")
 			return
 		}
 		_, err = s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, enc_password=<redacted>, signature=?, from_name=? WHERE id=?`,
 			in.Label, in.Email, username, enc, in.Signature, in.FromName, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "更新失败")
+			writeErr(w, http.StatusInternalServerError, "failed to update")
 			return
 		}
 		if idNum > 0 {
@@ -939,7 +940,7 @@ func (s *Server) updateTutaAccount(w http.ResponseWriter, r *http.Request, key [
 		_, err := s.st.DB.Exec(`UPDATE accounts SET label=?, email=?, username=?, signature=?, from_name=? WHERE id=?`,
 			in.Label, in.Email, username, in.Signature, in.FromName, id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "更新失败")
+			writeErr(w, http.StatusInternalServerError, "failed to update")
 			return
 		}
 	}
@@ -1019,7 +1020,7 @@ func (s *Server) handleTestAccountForm(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var in accountTestIn
 	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	if in.Kind == "proton" {
@@ -1040,11 +1041,11 @@ func (s *Server) handleTestAccountForm(w http.ResponseWriter, r *http.Request) {
 func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
 	if strings.TrimSpace(in.ImapHost) == "" || strings.TrimSpace(in.SmtpHost) == "" ||
 		strings.TrimSpace(in.Username) == "" {
-		writeErr(w, http.StatusBadRequest, "请填写服务器地址和用户名")
+		writeErr(w, http.StatusBadRequest, "server address and username are required")
 		return
 	}
 	if !auth.ValidTLSMode(in.ImapTLS) || !auth.ValidTLSMode(in.SmtpTLS) {
-		writeErr(w, http.StatusBadRequest, "加密方式只能是 tls、starttls 或 none")
+		writeErr(w, http.StatusBadRequest, "encryption must be tls, starttls or none")
 		return
 	}
 	imapPort, err := auth.ParsePort(in.ImapPort)
@@ -1061,13 +1062,13 @@ func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountT
 	if password == "" && in.ID > 0 {
 		stored, err := s.loadMailAccount(in.ID, key)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, "保存的登录凭据不可用，请重新登录")
+			writeErr(w, http.StatusBadRequest, "the saved credentials are unusable, sign in again")
 			return
 		}
 		password = stored.Password
 	}
 	if password == "" {
-		writeErr(w, http.StatusBadRequest, "请填写密码")
+		writeErr(w, http.StatusBadRequest, "password is required")
 		return
 	}
 	acct := mail.Account{
@@ -1093,7 +1094,7 @@ func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountT
 		cl.Close()
 		if ferr != nil {
 			log.Printf("namakani: test imap list folders: %v", ferr)
-			imapRes.Error = "读取文件夹列表失败"
+			imapRes.Error = "failed to read the folder list"
 		} else {
 			imapRes.OK = true
 			imapRes.Folders = len(folders)
@@ -1112,12 +1113,12 @@ func (s *Server) testIMAPAccount(w http.ResponseWriter, key []byte, in *accountT
 
 func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
 	if strings.TrimSpace(in.Email) == "" {
-		writeErr(w, http.StatusBadRequest, "请填写邮箱")
+		writeErr(w, http.StatusBadRequest, "email is required")
 		return
 	}
 	if in.Password == "" {
 		if in.ID <= 0 {
-			writeErr(w, http.StatusBadRequest, "请填写密码")
+			writeErr(w, http.StatusBadRequest, "password is required")
 			return
 		}
 		s.testProtonStored(w, key, in.ID)
@@ -1134,19 +1135,19 @@ func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accoun
 			writeJSON(w, http.StatusOK, map[string]any{"needs_captcha": true, "captcha_url": capErr.URL, "captcha_token": capErr.Token})
 			return
 		}
-		writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱和密码", err)
+		writeUserErr(w, http.StatusBadRequest, "sign-in failed, check the email and password", err)
 		return
 	}
 	acct := mail.Account{Kind: "proton", Email: in.Email, Username: in.Email, Password: bridgePassword}
 	cl, err := proton.Connect(s.st, acct)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
+		writeUserErr(w, http.StatusBadGateway, "connection failed, check the server settings and account password", err)
 		return
 	}
 	defer cl.Close()
 	folders, err := cl.ListFolders()
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to read the folder list", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
@@ -1155,18 +1156,18 @@ func (s *Server) testProtonAccount(w http.ResponseWriter, key []byte, in *accoun
 func (s *Server) testProtonStored(w http.ResponseWriter, key []byte, id int64) {
 	acct, err := s.loadMailAccount(id, key)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "保存的登录凭据不可用，请重新登录")
+		writeErr(w, http.StatusBadRequest, "the saved credentials are unusable, sign in again")
 		return
 	}
 	cl, err := proton.Connect(s.st, acct)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
+		writeUserErr(w, http.StatusBadGateway, "connection failed, check the server settings and account password", err)
 		return
 	}
 	defer cl.Close()
 	folders, err := cl.ListFolders()
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to read the folder list", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
@@ -1174,31 +1175,31 @@ func (s *Server) testProtonStored(w http.ResponseWriter, key []byte, id int64) {
 
 func (s *Server) testGmailAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
 	if in.ID <= 0 {
-		writeErr(w, http.StatusBadRequest, "请先完成授权")
+		writeErr(w, http.StatusBadRequest, "complete authorization first")
 		return
 	}
 	acct, err := s.loadMailAccount(in.ID, key)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "保存的登录凭据不可用，请重新登录")
+		writeErr(w, http.StatusBadRequest, "the saved credentials are unusable, sign in again")
 		return
 	}
 	if acct.Kind != "gmail" {
-		writeErr(w, http.StatusNotFound, "账号不存在")
+		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
 	cl, err := gmail.Connect(s.st, acct)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
+		writeUserErr(w, http.StatusBadGateway, "connection failed, check the server settings and account password", err)
 		return
 	}
 	defer cl.Close()
 	folders, err := cl.ListFolders()
 	if err != nil {
 		if gmail.IsAuthError(err) {
-			writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
+			writeUserErr(w, http.StatusBadGateway, "connection failed, check the server settings and account password", err)
 			return
 		}
-		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to read the folder list", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
@@ -1206,12 +1207,12 @@ func (s *Server) testGmailAccount(w http.ResponseWriter, key []byte, in *account
 
 func (s *Server) testTutaAccount(w http.ResponseWriter, key []byte, in *accountTestIn) {
 	if strings.TrimSpace(in.Email) == "" {
-		writeErr(w, http.StatusBadRequest, "请填写邮箱")
+		writeErr(w, http.StatusBadRequest, "email is required")
 		return
 	}
 	if in.Password == "" {
 		if in.ID <= 0 {
-			writeErr(w, http.StatusBadRequest, "请填写密码")
+			writeErr(w, http.StatusBadRequest, "password is required")
 			return
 		}
 		s.testTutaStored(w, key, in.ID)
@@ -1225,14 +1226,14 @@ func (s *Server) testTutaAccount(w http.ResponseWriter, key []byte, in *accountT
 			return
 		}
 		log.Printf("tuta: test authorize failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
-		writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱、密码和两步验证码", err)
+		writeUserErr(w, http.StatusBadRequest, "sign-in failed, check the email, password and two-factor code", err)
 		return
 	}
 	log.Printf("tuta: test authorize ok in %s", time.Since(start).Round(time.Millisecond))
 	folders, err := listFoldersBounded(cl, listFoldersTimeout)
 	if err != nil {
 		log.Printf("tuta: test list folders failed after %s: %v", time.Since(start).Round(time.Millisecond), err)
-		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to read the folder list", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "folders": len(folders), "capabilities": cl.Capabilities()})
@@ -1262,20 +1263,20 @@ func (s *Server) testTutaStored(w http.ResponseWriter, key []byte, id int64) {
 	start := time.Now()
 	acct, err := s.loadMailAccount(id, key)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "保存的登录凭据不可用，请重新登录")
+		writeErr(w, http.StatusBadRequest, "the saved credentials are unusable, sign in again")
 		return
 	}
 	cl, err := tuta.Connect(s.st, acct)
 	if err != nil {
 		log.Printf("tuta: test stored account %d connect failed after %s: %v", id, time.Since(start).Round(time.Millisecond), err)
-		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
+		writeUserErr(w, http.StatusBadGateway, "connection failed, check the server settings and account password", err)
 		return
 	}
 	defer cl.Close()
 	folders, err := listFoldersBounded(cl, listFoldersTimeout)
 	if err != nil {
 		log.Printf("tuta: test stored account %d list folders failed after %s: %v", id, time.Since(start).Round(time.Millisecond), err)
-		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to read the folder list", err)
 		return
 	}
 	log.Printf("tuta: test stored account %d ok in %s (%d folders)", id, time.Since(start).Round(time.Millisecond), len(folders))
@@ -1286,12 +1287,12 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "账号编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid account id")
 		return
 	}
 	acct, err := s.loadMailAccount(id, key)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "账号不存在")
+		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
 	var cl mail.Conn
@@ -1305,7 +1306,7 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 		cl, err = mail.Connect(acct, nil)
 	}
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "连接失败，请检查服务器设置和账号密码", err)
+		writeUserErr(w, http.StatusBadGateway, "connection failed, check the server settings and account password", err)
 		return
 	}
 	defer cl.Close()
@@ -1320,7 +1321,7 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 		if acct.Kind == "tuta" {
 			log.Printf("tuta: test account %d list folders failed: %v", id, err)
 		}
-		writeUserErr(w, http.StatusBadGateway, "读取文件夹列表失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to read the folder list", err)
 		return
 	}
 	type folderJSON struct {
@@ -1340,7 +1341,7 @@ func (s *Server) handleTestAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "账号编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid account id")
 		return
 	}
 	writeJSON(w, http.StatusOK, s.mgr.Status(id))
@@ -1356,23 +1357,23 @@ type reconnectIn struct {
 func (s *Server) handleReconnectAccount(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "账号编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid account id")
 		return
 	}
 	key, ok := s.credentialKey(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		writeErr(w, http.StatusUnauthorized, "not signed in")
 		return
 	}
 	acct, err := s.loadMailAccount(id, key)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "账号不存在")
+		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
 	var in reconnectIn
 	if r.ContentLength > 0 {
 		if err := decodeJSON(r, &in); err != nil {
-			writeErr(w, http.StatusBadRequest, "请求格式不对")
+			writeErr(w, http.StatusBadRequest, "malformed request")
 			return
 		}
 	}
@@ -1389,16 +1390,16 @@ func (s *Server) handleReconnectAccount(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if err != nil {
-			writeUserErr(w, http.StatusBadRequest, "登录失败，请检查邮箱和密码", err)
+			writeUserErr(w, http.StatusBadRequest, "sign-in failed, check the email and password", err)
 			return
 		}
 		enc, err := auth.Encrypt(key, bridgePassword)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "加密失败")
+			writeErr(w, http.StatusInternalServerError, "encryption failed")
 			return
 		}
 		if _, err := s.st.DB.Exec(`UPDATE accounts SET enc_password = ? WHERE id = ?`, enc, id); err != nil {
-			writeErr(w, http.StatusInternalServerError, "更新失败")
+			writeErr(w, http.StatusInternalServerError, "failed to update")
 			return
 		}
 		acct.Password = bridgePassword
@@ -1420,22 +1421,22 @@ type folderOut struct {
 func (s *Server) handlePurgeFolder(w http.ResponseWriter, r *http.Request) {
 	folderID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "文件夹编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid folder id")
 		return
 	}
 	var accountID int64
 	var name, special string
 	if err := s.st.DB.QueryRow("SELECT account_id, name, COALESCE(special_use, '') FROM folders WHERE id = ?", folderID).Scan(&accountID, &name, &special); err != nil {
-		writeErr(w, http.StatusNotFound, "文件夹不存在")
+		writeErr(w, http.StatusNotFound, "folder not found")
 		return
 	}
 	if special != "trash" && special != "junk" {
-		writeErr(w, http.StatusBadRequest, "只有回收站和垃圾箱可以清空")
+		writeErr(w, http.StatusBadRequest, "only trash and spam can be emptied")
 		return
 	}
 	rows, err := s.st.DB.Query("SELECT id FROM messages WHERE folder_id = ?", folderID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the message list")
 		return
 	}
 	var ids []int64
@@ -1465,7 +1466,7 @@ func (s *Server) handleListFolders(w http.ResponseWriter, r *http.Request) {
 		FROM folders f JOIN accounts a ON a.id = f.account_id
 		ORDER BY f.account_id, f.id`)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "文件夹列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the folder list")
 		return
 	}
 	defer rows.Close()
@@ -1473,7 +1474,7 @@ func (s *Server) handleListFolders(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var f folderOut
 		if err := rows.Scan(&f.ID, &f.AccountID, &f.AccountLabel, &f.Name, &f.SpecialUse, &f.Total, &f.Unread); err != nil {
-			writeErr(w, http.StatusInternalServerError, "文件夹列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load the folder list")
 			return
 		}
 		out = append(out, f)
@@ -1619,7 +1620,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		if acctID, perr := strconv.ParseInt(q.Get("account_id"), 10, 64); perr == nil && acctID > 0 {
 			ids, err := s.st.ThreadMembers(acctID, tk)
 			if err != nil {
-				writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+				writeErr(w, http.StatusInternalServerError, "failed to load the message list")
 				return
 			}
 			byID := make(map[int64]messageOut, len(ids))
@@ -1638,7 +1639,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 
 	tx, err := s.st.DB.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the message list")
 		return
 	}
 	defer tx.Rollback()
@@ -1660,21 +1661,21 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		GROUP BY m.account_id, m.thread_key
 		ORDER BY MAX(m.date_ts) DESC, MAX(m.id) DESC`, args...)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the conversation list")
 		return
 	}
 	for kRows.Next() {
 		var t pageThread
 		if err := kRows.Scan(&t.acct, &t.tk, &t.lastTS, &t.tieID); err != nil {
 			kRows.Close()
-			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load the conversation list")
 			return
 		}
 		threads = append(threads, t)
 	}
 	kRows.Close()
 	if err := kRows.Err(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the conversation list")
 		return
 	}
 	sRows, err := tx.Query(`SELECT m.id, m.account_id, m.date_ts,
@@ -1683,14 +1684,14 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 		WHERE `+where+` AND m.thread_key = ''
 		ORDER BY m.date_ts DESC, m.id DESC`, args...)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the conversation list")
 		return
 	}
 	for sRows.Next() {
 		var t pageThread
 		if err := sRows.Scan(&t.repID, &t.acct, &t.lastTS, &t.unread); err != nil {
 			sRows.Close()
-			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load the conversation list")
 			return
 		}
 		t.tk = "id:" + strconv.FormatInt(t.repID, 10)
@@ -1700,7 +1701,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	sRows.Close()
 	if err := sRows.Err(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the conversation list")
 		return
 	}
 	sort.Slice(threads, func(i, j int) bool {
@@ -1726,7 +1727,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	for acct, keys := range keysByAcct {
 		counts, err := s.st.ThreadGroupCountsQ(tx, acct, keys)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load the conversation list")
 			return
 		}
 		for i := range page {
@@ -1747,7 +1748,7 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 				FROM messages m JOIN folders f ON f.id = m.folder_id
 				WHERE `+where+` AND m.account_id = ? AND m.thread_key = ?
 				ORDER BY m.date_ts DESC, m.id DESC LIMIT 1`, repArgs...).Scan(&id); err != nil {
-				writeErr(w, http.StatusInternalServerError, "会话列表加载失败")
+				writeErr(w, http.StatusInternalServerError, "failed to load the conversation list")
 				return
 			}
 			page[i].repID = id
@@ -1772,11 +1773,11 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	wm, err := listVersionTx(tx)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the message list")
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "邮件列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load the message list")
 		return
 	}
 	w.Header().Set("X-WM-Ver", strconv.FormatInt(wm, 10))
@@ -1923,7 +1924,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "邮件编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid message id")
 		return
 	}
 	var (
@@ -1940,7 +1941,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		Scan(&d.AccountID, &d.AccountLabel, &d.FolderID, &d.FolderName, &d.Subject,
 			&fromJSON, &toJSON, &ccJSON, &d.DateTS, &d.Flags, &d.Size, &hasAttach, &d.ThreadKey, &d.FolderSpecial)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "邮件不存在")
+		writeErr(w, http.StatusNotFound, "message not found")
 		return
 	}
 	d.ID = id
@@ -1957,12 +1958,12 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "定位邮件失败")
+		writeErr(w, http.StatusInternalServerError, "failed to locate the message")
 		return
 	}
 	text, html, atts, truncated, err := s.ensureBody(key, id, route)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "正文加载失败，请稍后重试", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to load the body, try again later", err)
 		return
 	}
 	d.Text = text
@@ -1987,17 +1988,17 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "邮件编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid message id")
 		return
 	}
 	attID, err := strconv.ParseInt(r.PathValue("attId"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "附件编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid attachment id")
 		return
 	}
 	att, err := s.st.GetAttachment(id, attID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "附件不存在")
+		writeErr(w, http.StatusNotFound, "attachment not found")
 		return
 	}
 	if att.LocalPath != "" {
@@ -2020,27 +2021,27 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 	}
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "定位邮件失败")
+		writeErr(w, http.StatusInternalServerError, "failed to locate the message")
 		return
 	}
 	cl, err := s.openConn(key, route.AccountID)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "邮件不存在或已被删除", err)
+		writeUserErr(w, http.StatusBadGateway, "the message no longer exists or was deleted", err)
 		return
 	}
 	defer cl.Close()
 	if _, err := cl.Select(route.Folder); err != nil {
-		writeUserErr(w, http.StatusBadGateway, "连接邮件服务器失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to connect to the mail server", err)
 		return
 	}
 	raw, err := cl.FetchRaw(route.UID)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "打开文件夹失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to open the folder", err)
 		return
 	}
 	part, err := mail.ParseBodyPart(raw, att.PartPath)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "读取邮件内容失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to read the message content", err)
 		return
 	}
 	filename := att.Filename
@@ -2067,22 +2068,22 @@ type flagsReq struct {
 func (s *Server) handleSetFlags(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "邮件编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid message id")
 		return
 	}
 	var req flagsReq
 	if err := decodeJSON(r, &req); err != nil || (req.Seen == nil && req.Flagged == nil) {
-		writeErr(w, http.StatusBadRequest, "缺少标记参数")
+		writeErr(w, http.StatusBadRequest, "missing flag parameter")
 		return
 	}
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "邮件不存在")
+		writeErr(w, http.StatusNotFound, "message not found")
 		return
 	}
 	opID, flags, err := s.st.EnqueueFlags(route.AccountID, id, req.Seen, req.Flagged, req.ClientKey)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "操作入队失败")
+		writeErr(w, http.StatusInternalServerError, "failed to queue the operation")
 		return
 	}
 	s.broadcastFlags([]int64{id})
@@ -2112,7 +2113,7 @@ type batchFailOut struct {
 func (s *Server) handleBatchFlags(w http.ResponseWriter, r *http.Request) {
 	var req batchFlagsReq
 	if err := decodeJSON(r, &req); err != nil || len(req.IDs) == 0 || (req.Seen == nil && req.Flagged == nil) {
-		writeErr(w, http.StatusBadRequest, "缺少标记参数")
+		writeErr(w, http.StatusBadRequest, "missing flag parameter")
 		return
 	}
 	items := []batchItemOut{}
@@ -2122,7 +2123,7 @@ func (s *Server) handleBatchFlags(w http.ResponseWriter, r *http.Request) {
 	for _, id := range req.IDs {
 		route, err := s.st.MessageRoute(id)
 		if err != nil {
-			failed = append(failed, batchFailOut{ID: id, Error: "邮件不存在"})
+			failed = append(failed, batchFailOut{ID: id, Error: "message not found"})
 			continue
 		}
 		key := ""
@@ -2131,7 +2132,7 @@ func (s *Server) handleBatchFlags(w http.ResponseWriter, r *http.Request) {
 		}
 		opID, flags, err := s.st.EnqueueFlags(route.AccountID, id, req.Seen, req.Flagged, key)
 		if err != nil {
-			failed = append(failed, batchFailOut{ID: id, Error: "操作入队失败"})
+			failed = append(failed, batchFailOut{ID: id, Error: "failed to queue the operation"})
 			continue
 		}
 		items = append(items, batchItemOut{ID: id, Flags: flags, OpID: opID})
@@ -2184,17 +2185,17 @@ func (s *Server) findMovedUID(cl mail.Conn, id int64, destFolder string) uint32 
 func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "邮件编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid message id")
 		return
 	}
 	var req moveReq
 	if err := decodeJSON(r, &req); err != nil || (req.ToFolderID == 0 && req.To == "") {
-		writeErr(w, http.StatusBadRequest, "请选择目标文件夹")
+		writeErr(w, http.StatusBadRequest, "choose a destination folder")
 		return
 	}
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "邮件不存在")
+		writeErr(w, http.StatusNotFound, "message not found")
 		return
 	}
 	destID := req.ToFolderID
@@ -2202,7 +2203,7 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		destID, _, ok, err = s.st.FolderBySpecial(route.AccountID, req.To)
 		if err != nil || !ok {
-			writeErr(w, http.StatusBadRequest, "目标文件夹不存在")
+			writeErr(w, http.StatusBadRequest, "destination folder not found")
 			return
 		}
 	}
@@ -2212,7 +2213,7 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	opID, err := s.st.EnqueueMove(route.AccountID, id, destID, req.ClientKey)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "操作入队失败")
+		writeErr(w, http.StatusInternalServerError, "failed to queue the operation")
 		return
 	}
 	o, _ := s.st.GetOp(opID)
@@ -2226,19 +2227,19 @@ func (s *Server) handleMoveMessage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRestoreMessage(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "邮件编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid message id")
 		return
 	}
 	var req moveReq
 	_ = decodeJSON(r, &req)
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "邮件不存在")
+		writeErr(w, http.StatusNotFound, "message not found")
 		return
 	}
 	destID, err := s.st.ResolveRestoreFolder(route.AccountID, id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "确定还原位置失败")
+		writeErr(w, http.StatusInternalServerError, "failed to determine the restore destination")
 		return
 	}
 	if destID == route.FolderID {
@@ -2247,7 +2248,7 @@ func (s *Server) handleRestoreMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	opID, err := s.st.EnqueueMove(route.AccountID, id, destID, req.ClientKey)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "操作入队失败")
+		writeErr(w, http.StatusInternalServerError, "failed to queue the operation")
 		return
 	}
 	o, _ := s.st.GetOp(opID)
@@ -2261,7 +2262,7 @@ func (s *Server) handleRestoreMessage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "邮件编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid message id")
 		return
 	}
 	var req deleteReq
@@ -2269,7 +2270,7 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	permanent := req.Permanent != nil && *req.Permanent
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "邮件不存在")
+		writeErr(w, http.StatusNotFound, "message not found")
 		return
 	}
 	var special string
@@ -2297,7 +2298,7 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "操作入队失败")
+		writeErr(w, http.StatusInternalServerError, "failed to queue the operation")
 		return
 	}
 	o, _ := s.st.GetOp(opID)
@@ -2316,7 +2317,7 @@ type markAllReadReq struct {
 func (s *Server) handleMarkAllRead(w http.ResponseWriter, r *http.Request) {
 	var req markAllReadReq
 	if err := decodeJSON(r, &req); err != nil || (req.FolderID == 0 && req.Special == "") {
-		writeErr(w, http.StatusBadRequest, "缺少文件夹参数")
+		writeErr(w, http.StatusBadRequest, "missing folder parameter")
 		return
 	}
 	type folderRef struct {
@@ -2331,14 +2332,14 @@ func (s *Server) handleMarkAllRead(w http.ResponseWriter, r *http.Request) {
 		err := s.st.DB.QueryRow("SELECT account_id, name FROM folders WHERE id = ?", req.FolderID).
 			Scan(&fr.accountID, &fr.name)
 		if err != nil {
-			writeErr(w, http.StatusNotFound, "文件夹不存在")
+			writeErr(w, http.StatusNotFound, "folder not found")
 			return
 		}
 		refs = append(refs, fr)
 	} else {
 		rows, err := s.st.DB.Query("SELECT id, account_id, name FROM folders WHERE special_use = ?", req.Special)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "查找文件夹失败")
+			writeErr(w, http.StatusInternalServerError, "failed to look up the folder")
 			return
 		}
 		defer rows.Close()
@@ -2357,7 +2358,7 @@ func (s *Server) handleMarkAllRead(w http.ResponseWriter, r *http.Request) {
 			AND NOT EXISTS (SELECT 1 FROM ops o WHERE o.message_id = m.id AND o.type = 'expunge'
 				AND o.status IN ('pending', 'in_flight', 'needs_attention'))`, fr.id)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "查找邮件失败")
+			writeErr(w, http.StatusInternalServerError, "failed to look up the message")
 			return
 		}
 		var ids []int64
@@ -2447,15 +2448,15 @@ func (s *Server) prepareOutgoing(key []byte, req composeReq, requireRcpts bool) 
 	}
 	to, err := parseAddrList(req.To)
 	if err != nil {
-		return nil, userFacing("收件人格式不对")
+		return nil, userFacing("invalid recipient format")
 	}
 	cc, err := parseAddrList(req.Cc)
 	if err != nil {
-		return nil, userFacing("抄送格式不对")
+		return nil, userFacing("invalid cc format")
 	}
 	bcc, err := parseAddrList(req.Bcc)
 	if err != nil {
-		return nil, userFacing("密送格式不对")
+		return nil, userFacing("invalid bcc format")
 	}
 	rcpts := []string{}
 	for _, group := range [][]mail.Addr{to, cc, bcc} {
@@ -2464,7 +2465,7 @@ func (s *Server) prepareOutgoing(key []byte, req composeReq, requireRcpts bool) 
 		}
 	}
 	if requireRcpts && len(rcpts) == 0 {
-		return nil, userFacing("至少填写一个收件人")
+		return nil, userFacing("add at least one recipient")
 	}
 	from := mail.Addr{Name: acct.FromName, Email: acct.Email}
 
@@ -2473,11 +2474,11 @@ func (s *Server) prepareOutgoing(key []byte, req composeReq, requireRcpts bool) 
 	for _, a := range req.Attachments {
 		data, err := base64.StdEncoding.DecodeString(a.DataB64)
 		if err != nil {
-			return nil, userFacing(fmt.Sprintf("附件 %s 的数据无效", a.Filename))
+			return nil, userFacing(fmt.Sprintf("attachment %s has invalid data", a.Filename))
 		}
 		totalAttach += len(data)
 		if int64(totalAttach) > s.st.AppSettings().MaxAttachmentMB<<20 {
-			return nil, userFacing(fmt.Sprintf("附件总大小超过 %d MB 上限", s.st.AppSettings().MaxAttachmentMB))
+			return nil, userFacing(fmt.Sprintf("attachments exceed the %d MB total size limit", s.st.AppSettings().MaxAttachmentMB))
 		}
 		attachments = append(attachments, mail.OutgoingAttachment{
 			Filename: a.Filename, ContentType: a.ContentType, Data: data,
@@ -2544,7 +2545,7 @@ func (s *Server) appendCopy(key []byte, accountID int64, special string,
 		return 0, err
 	}
 	if !ok {
-		return 0, fmt.Errorf("该账号没有 %s 文件夹", special)
+		return 0, fmt.Errorf("this account has no %s folder", special)
 	}
 	var existing int64
 	if err := s.st.DB.QueryRow("SELECT id FROM messages WHERE folder_id = ? AND message_id = ?",
@@ -2608,7 +2609,7 @@ func (s *Server) fileSentCopy(acct mail.Account, sess uidAssigner, sentID string
 		return 0, err
 	}
 	if !ok {
-		return 0, fmt.Errorf("该账号没有 %s 文件夹", "sent")
+		return 0, fmt.Errorf("this account has no %s folder", "sent")
 	}
 	uid, err := sess.AssignUID(folderName, sentID)
 	if err != nil {
@@ -2670,18 +2671,18 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var req composeReq
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	out, err := s.prepareOutgoing(key, req, false)
 	if err != nil {
-		writeUserErr(w, http.StatusBadRequest, "邮件准备失败，请检查内容后重试", err)
+		writeUserErr(w, http.StatusBadRequest, "failed to prepare the message, check the content and try again", err)
 		return
 	}
 	id, err := s.appendCopy(key, req.AccountID, "drafts",
 		[]imap.Flag{imap.FlagDraft}, mail.FlagSeen|mail.FlagDraft, out)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "保存草稿失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to save the draft", err)
 		return
 	}
 	s.broadcastMessages([]int64{id})
@@ -2689,7 +2690,7 @@ func (s *Server) handleSaveDraft(w http.ResponseWriter, r *http.Request) {
 	if req.DraftID > 0 && req.DraftID != id {
 		route, rerr := s.st.MessageRoute(req.DraftID)
 		if err := s.deleteMessageEverywhere(key, req.DraftID); err != nil {
-			warning = "新草稿已保存，但旧草稿删除失败：" + err.Error()
+			warning = "the new draft was saved, but deleting the old draft failed: " + err.Error()
 		} else if rerr == nil {
 			s.broadcastRemoved(route.FolderID, []int64{req.DraftID})
 		}
@@ -2720,14 +2721,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := s.searchPage(q, limit, offset)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "搜索失败")
+		writeErr(w, http.StatusInternalServerError, "search failed")
 		return
 	}
 	out := []threadOut{}
 	if len(page) > 0 {
 		out, err = s.searchDetails(page)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "读取数据失败")
+			writeErr(w, http.StatusInternalServerError, "failed to read data")
 			return
 		}
 	}
@@ -3046,7 +3047,7 @@ func (s *Server) handleContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := s.st.DB.Query("SELECT from_json, to_json, cc_json FROM messages")
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取通讯录失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load contacts")
 		return
 	}
 	defer rows.Close()
@@ -3091,7 +3092,7 @@ func (s *Server) spaHandler() http.Handler {
 			log.Printf("entry: %s %s ua=%q referer=%q", r.Method, r.URL.Path, r.UserAgent(), r.Referer())
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			writeErr(w, http.StatusNotFound, "接口不存在")
+			writeErr(w, http.StatusNotFound, "not found")
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/assets/") {
@@ -3114,7 +3115,7 @@ func (s *Server) spaHandler() http.Handler {
 func (s *Server) handleGetAppSettings(w http.ResponseWriter, r *http.Request) {
 	used, err := s.st.CacheUsedBytes()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取缓存用量失败")
+		writeErr(w, http.StatusInternalServerError, "failed to read cache usage")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -3127,24 +3128,24 @@ func (s *Server) handleGetAppSettings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePutAppSettings(w http.ResponseWriter, r *http.Request) {
 	var req store.AppSettings
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "设置内容不对")
+		writeErr(w, http.StatusBadRequest, "invalid settings")
 		return
 	}
 	if req.CacheBudgetGB < 0 || req.CacheBudgetGB > 1024 ||
 		req.SyncBatch < 1 || req.SyncBatch > 1000 ||
 		req.MaxAttachmentMB < 1 || req.MaxAttachmentMB > 200 ||
 		req.PushWindowMinutes < 0 || req.PushWindowMinutes > 43200 {
-		writeErr(w, http.StatusBadRequest, "设置超出允许范围")
+		writeErr(w, http.StatusBadRequest, "settings out of allowed range")
 		return
 	}
 	baseURL, ok := normalizeBaseURL(req.BaseURL)
 	if !ok {
-		writeErr(w, http.StatusBadRequest, "Base URL 格式不对，应以 http:// 或 https:// 开头，例如 https://mail.example.com")
+		writeErr(w, http.StatusBadRequest, "invalid base URL: it must start with http:// or https://, for example https://mail.example.com")
 		return
 	}
 	req.BaseURL = baseURL
 	if err := s.st.SaveAppSettings(req); err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存设置失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save settings")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

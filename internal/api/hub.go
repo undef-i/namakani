@@ -56,7 +56,7 @@ func (h *hub) broadcast(v any) {
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeErr(w, http.StatusInternalServerError, "服务器不支持流式推送")
+		writeErr(w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")

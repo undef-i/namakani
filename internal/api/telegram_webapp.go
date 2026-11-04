@@ -139,25 +139,25 @@ func (s *Server) handleTelegramWebAppAuth(w http.ResponseWriter, r *http.Request
 	}
 	if err := decodeJSON(r, &req); err != nil || req.InitData == "" {
 		log.Printf("tg webapp-auth: bad request from %s: init_data empty or invalid json", r.RemoteAddr)
-		writeErr(w, http.StatusBadRequest, "缺少登录数据")
+		writeErr(w, http.StatusBadRequest, "missing sign-in data")
 		return
 	}
 	log.Printf("tg webapp-auth: request from %s ua=%q init_data_len=%d", r.RemoteAddr, r.UserAgent(), len(req.InitData))
 	cfg := s.tgLoadConfig()
 	if cfg.Token == "" || cfg.ChatID == "" {
 		log.Printf("tg webapp-auth: rejected: telegram not configured (token set=%v chat set=%v)", cfg.Token != "", cfg.ChatID != "")
-		writeErr(w, http.StatusServiceUnavailable, "尚未配置 Telegram")
+		writeErr(w, http.StatusServiceUnavailable, "telegram is not configured")
 		return
 	}
 	init, err := verifyTGInitData(cfg.Token, req.InitData, time.Now())
 	if err != nil {
 		log.Printf("tg webapp-auth: verify failed: %v", err)
-		writeErr(w, http.StatusUnauthorized, "Telegram 登录校验失败")
+		writeErr(w, http.StatusUnauthorized, "telegram sign-in verification failed")
 		return
 	}
 	if strconv.FormatInt(init.UserID, 10) != cfg.ChatID {
 		log.Printf("tg webapp-auth: user mismatch: got %d, bound chat is %s", init.UserID, cfg.ChatID)
-		writeErr(w, http.StatusForbidden, "Telegram 账号与绑定的聊天不一致")
+		writeErr(w, http.StatusForbidden, "the telegram account does not match the bound chat")
 		return
 	}
 	fp := tgInitDataFingerprint(req.InitData)
@@ -177,7 +177,7 @@ func (s *Server) handleTelegramWebAppAuth(w http.ResponseWriter, r *http.Request
 			}
 		}
 		log.Printf("tg webapp-auth: replayed init data rejected for user %d", init.UserID)
-		writeErr(w, http.StatusUnauthorized, "Telegram 登录数据已使用，请重新打开小程序")
+		writeErr(w, http.StatusUnauthorized, "telegram sign-in data has already been used, reopen the mini app")
 		return
 	}
 	claimed := true
@@ -189,13 +189,13 @@ func (s *Server) handleTelegramWebAppAuth(w http.ResponseWriter, r *http.Request
 	key, ok := s.recoverCredentialKey()
 	if !ok {
 		log.Printf("tg webapp-auth: rejected: credential key not recoverable")
-		writeErr(w, http.StatusConflict, "当前没有可用的登录会话，请先用主密码登录一次")
+		writeErr(w, http.StatusConflict, "no sign-in session is available, sign in with the master password once first")
 		return
 	}
 	token, err := s.startSession(w, r, key)
 	if err != nil {
 		log.Printf("tg webapp-auth: start session failed: %v", err)
-		writeErr(w, http.StatusInternalServerError, "会话处理失败")
+		writeErr(w, http.StatusInternalServerError, "session handling failed")
 		return
 	}
 	s.bindTGInitDataSession(fp, token)

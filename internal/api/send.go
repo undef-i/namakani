@@ -112,13 +112,13 @@ func errInvalidAttachment(name string) error {
 
 type attachmentError struct{ name string }
 
-func (e *attachmentError) Error() string { return "附件 " + e.name + " 的数据无效" }
+func (e *attachmentError) Error() string { return "attachment " + e.name + " has invalid data" }
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var req sendReq
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	undo := req.UndoSeconds
@@ -131,7 +131,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	notBefore := time.Now().Unix() + int64(undo)
 	opID, err := s.enqueueSendOp(key, req.composeReq, notBefore, req.ClientKey)
 	if err != nil {
-		writeUserErr(w, http.StatusBadRequest, "发送失败，请稍后重试", err)
+		writeUserErr(w, http.StatusBadRequest, "send failed, try again later", err)
 		return
 	}
 	s.kickDrain()
@@ -384,17 +384,17 @@ var errAttachmentMissing = &attachmentMissingError{}
 
 type attachmentMissingError struct{}
 
-func (*attachmentMissingError) Error() string { return "附件文件缺失，请重新编写这封邮件再发送" }
+func (*attachmentMissingError) Error() string { return "an attachment file is missing, compose the message again and resend" }
 
 func (s *Server) handleScheduleSend(w http.ResponseWriter, r *http.Request) {
 	key, _ := s.credentialKey(r)
 	var req scheduleReq
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	if req.SendAt <= 0 {
-		writeErr(w, http.StatusBadRequest, "请填写发送时间")
+		writeErr(w, http.StatusBadRequest, "send time is required")
 		return
 	}
 	clientKey := req.ClientKey
@@ -405,7 +405,7 @@ func (s *Server) handleScheduleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	opID, err := s.enqueueSendOp(key, req.composeReq, req.SendAt, clientKey)
 	if err != nil {
-		writeUserErr(w, http.StatusBadRequest, "发送失败，请稍后重试", err)
+		writeUserErr(w, http.StatusBadRequest, "send failed, try again later", err)
 		return
 	}
 	if req.DraftID > 0 {
@@ -437,7 +437,7 @@ func (s *Server) handleListScheduled(w http.ResponseWriter, r *http.Request) {
 		FROM ops WHERE type = 'send' AND status IN ('pending', 'in_flight', 'needs_attention')
 		ORDER BY not_before ASC LIMIT 100`)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load list")
 		return
 	}
 	defer rows.Close()
@@ -447,7 +447,7 @@ func (s *Server) handleListScheduled(w http.ResponseWriter, r *http.Request) {
 		var payload string
 		var status string
 		if err := rows.Scan(&o.ID, &o.AccountID, &payload, &o.SendAt, &o.CreatedAt, &status, &o.Error); err != nil {
-			writeErr(w, http.StatusInternalServerError, "列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load list")
 			return
 		}
 		o.ID = -o.ID
@@ -473,7 +473,7 @@ func (s *Server) handleListScheduled(w http.ResponseWriter, r *http.Request) {
 func (s *Server) scheduledOpID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id >= 0 {
-		writeErr(w, http.StatusBadRequest, "编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid id")
 		return 0, false
 	}
 	return -id, true
@@ -517,7 +517,7 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 		key, ok = s.anyCredentialKey()
 	}
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "登录已过期，请重新登录")
+		writeErr(w, http.StatusUnauthorized, "session expired, sign in again")
 		return
 	}
 	opID, ok := s.scheduledOpID(w, r)
@@ -526,37 +526,37 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 	}
 	o, err := s.st.GetOp(opID)
 	if err != nil || o.Type != store.OpSend {
-		writeErr(w, http.StatusNotFound, "不存在")
+		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
 	var sp sendOpPayload
 	if err := json.Unmarshal([]byte(o.Payload), &sp); err != nil {
-		writeErr(w, http.StatusInternalServerError, "定时邮件内容读取失败")
+		writeErr(w, http.StatusInternalServerError, "failed to read the scheduled message content")
 		return
 	}
 	if o.Status == store.OpInFlight {
 		purge := r.URL.Query().Get("purge") == "1"
-		verb := "取消"
+		verb := "cancelled"
 		if purge {
-			verb = "删除"
+			verb = "deleted"
 		}
 		if sp.Sent {
-			writeErr(w, http.StatusConflict, "这封定时邮件已经发出，无法"+verb)
+			writeErr(w, http.StatusConflict, "this scheduled message has already been sent and cannot be "+verb)
 			return
 		}
 		if o.Sealed {
-			writeErr(w, http.StatusConflict, "这封定时邮件已经在发送，无法"+verb)
+			writeErr(w, http.StatusConflict, "this scheduled message is already being sent and cannot be "+verb)
 			return
 		}
 		if !purge {
 			if _, err := s.st.SetSendReturnToDraft(opID); err != nil {
-				writeErr(w, http.StatusInternalServerError, "取消失败，请稍后重试")
+				writeErr(w, http.StatusInternalServerError, "cancellation failed, try again later")
 				return
 			}
 		}
 		res, err := s.st.UndoOp(opID)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "取消失败，请稍后重试")
+			writeErr(w, http.StatusInternalServerError, "cancellation failed, try again later")
 			return
 		}
 		switch res.Mode {
@@ -573,7 +573,7 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 			}
 			draftID, merr := s.materializeScheduledDraft(key, o, &sp)
 			if merr != nil {
-				writeUserErr(w, http.StatusBadGateway, "保存草稿失败", merr)
+				writeUserErr(w, http.StatusBadGateway, "failed to save the draft", merr)
 				return
 			}
 			_ = os.RemoveAll(outgoingDir(s.st.DataDir(), opID))
@@ -581,15 +581,15 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 			s.broadcastOps()
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "draft_id": draftID})
 		case "already_sent":
-			writeErr(w, http.StatusConflict, "这封定时邮件已经发出，无法"+verb)
+			writeErr(w, http.StatusConflict, "this scheduled message has already been sent and cannot be "+verb)
 		default:
-			writeErr(w, http.StatusConflict, "这封定时邮件已经在发送，无法"+verb)
+			writeErr(w, http.StatusConflict, "this scheduled message is already being sent and cannot be "+verb)
 		}
 		return
 	}
 	if r.URL.Query().Get("purge") == "1" {
 		if err := s.st.CancelOp(opID); err != nil {
-			writeErr(w, http.StatusConflict, "这封定时邮件已经不能删除了")
+			writeErr(w, http.StatusConflict, "this scheduled message can no longer be deleted")
 			return
 		}
 		_ = os.RemoveAll(outgoingDir(s.st.DataDir(), opID))
@@ -605,7 +605,7 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 	for _, a := range sp.Attachments {
 		data, err := os.ReadFile(filepath.Join(dir, a.File))
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "定时邮件的附件文件缺失")
+			writeErr(w, http.StatusInternalServerError, "the scheduled message has a missing attachment file")
 			return
 		}
 		req.Attachments = append(req.Attachments, attachmentIn{
@@ -616,18 +616,18 @@ func (s *Server) handleCancelScheduled(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := s.prepareOutgoing(key, req, false)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "保存草稿失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to save the draft", err)
 		return
 	}
 	draftID, err := s.appendCopy(key, o.AccountID, "drafts",
 		[]imap.Flag{imap.FlagDraft}, mail.FlagSeen|mail.FlagDraft, out)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "保存草稿失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to save the draft", err)
 		return
 	}
 	if err := s.st.CancelOp(opID); err != nil {
 		_ = s.deleteMessageEverywhere(key, draftID)
-		writeErr(w, http.StatusConflict, "这封定时邮件已经不能取消了")
+		writeErr(w, http.StatusConflict, "this scheduled message can no longer be cancelled")
 		return
 	}
 	_ = os.RemoveAll(dir)
@@ -668,12 +668,12 @@ func (s *Server) handleGetScheduled(w http.ResponseWriter, r *http.Request) {
 	}
 	o, err := s.st.GetOp(opID)
 	if err != nil || o.Type != store.OpSend {
-		writeErr(w, http.StatusNotFound, "不存在")
+		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
 	var sp sendOpPayload
 	if err := json.Unmarshal([]byte(o.Payload), &sp); err != nil {
-		writeErr(w, http.StatusInternalServerError, "内容格式不对")
+		writeErr(w, http.StatusInternalServerError, "malformed content")
 		return
 	}
 	d := scheduledDetail{
@@ -707,24 +707,24 @@ func (s *Server) handleUpdateScheduled(w http.ResponseWriter, r *http.Request) {
 	}
 	o, err := s.st.GetOp(opID)
 	if err != nil || o.Type != store.OpSend {
-		writeErr(w, http.StatusNotFound, "不存在")
+		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
 	if o.Status != store.OpPending {
-		writeErr(w, http.StatusConflict, "这封定时邮件已经不能修改了")
+		writeErr(w, http.StatusConflict, "this scheduled message can no longer be edited")
 		return
 	}
 	var req scheduleUpdateReq
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	if req.SendAt <= 0 {
-		writeErr(w, http.StatusBadRequest, "请填写发送时间")
+		writeErr(w, http.StatusBadRequest, "send time is required")
 		return
 	}
 	if _, err := s.prepareOutgoing(key, req.composeReq, true); err != nil {
-		writeUserErr(w, http.StatusBadRequest, "发送失败，请稍后重试", err)
+		writeUserErr(w, http.StatusBadRequest, "send failed, try again later", err)
 		return
 	}
 	var old sendOpPayload
@@ -735,7 +735,7 @@ func (s *Server) handleUpdateScheduled(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := outgoingDir(s.st.DataDir(), opID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		writeErr(w, http.StatusInternalServerError, "更新失败")
+		writeErr(w, http.StatusInternalServerError, "failed to update")
 		return
 	}
 	sp := sendOpPayload{Req: req.composeReq}
@@ -753,7 +753,7 @@ func (s *Server) handleUpdateScheduled(w http.ResponseWriter, r *http.Request) {
 	for _, a := range req.Attachments {
 		data, err := base64.StdEncoding.DecodeString(a.DataB64)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, "附件 "+a.Filename+" 的数据无效")
+			writeErr(w, http.StatusBadRequest, "attachment "+a.Filename+" has invalid data")
 			return
 		}
 		var name string
@@ -766,27 +766,27 @@ func (s *Server) handleUpdateScheduled(w http.ResponseWriter, r *http.Request) {
 		}
 		used[name] = true
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
-			writeErr(w, http.StatusInternalServerError, "更新失败")
+			writeErr(w, http.StatusInternalServerError, "failed to update")
 			return
 		}
 		sp.Attachments = append(sp.Attachments, sendOpAttachment{Filename: a.Filename, ContentType: a.ContentType, File: name})
 	}
 	raw, err := json.Marshal(sp)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "更新失败")
+		writeErr(w, http.StatusInternalServerError, "failed to update")
 		return
 	}
 	applied, err := s.st.UpdateOpPayload(opID, string(raw))
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "更新失败")
+		writeErr(w, http.StatusInternalServerError, "failed to update")
 		return
 	}
 	if !applied {
-		writeErr(w, http.StatusConflict, "这封定时邮件已经不能修改了")
+		writeErr(w, http.StatusConflict, "this scheduled message can no longer be edited")
 		return
 	}
 	if _, err := s.st.DB.Exec("UPDATE ops SET not_before = ? WHERE id = ? AND status = 'pending'", req.SendAt, opID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "更新失败")
+		writeErr(w, http.StatusInternalServerError, "failed to update")
 		return
 	}
 	s.broadcastScheduled()
@@ -796,16 +796,16 @@ func (s *Server) handleUpdateScheduled(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSendNowOp(w http.ResponseWriter, r *http.Request) {
 	opID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "操作编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid operation id")
 		return
 	}
 	o, err := s.st.GetOp(opID)
 	if err != nil || o.Type != store.OpSend {
-		s.writeOpStateErr(w, http.StatusNotFound, "操作不存在", opID)
+		s.writeOpStateErr(w, http.StatusNotFound, "operation not found", opID)
 		return
 	}
 	if err := s.st.AccelerateSendOp(opID); err != nil {
-		s.writeOpStateErr(w, http.StatusConflict, "这封邮件已经不能立即发送了", opID)
+		s.writeOpStateErr(w, http.StatusConflict, "this message can no longer be sent immediately", opID)
 		return
 	}
 	s.broadcastOps()
@@ -853,7 +853,7 @@ func (s *Server) listScheduledAsMessages(w http.ResponseWriter, q url.Values, li
 	rows, err := s.st.DB.Query(`SELECT id, account_id, payload, not_before, status FROM ops
 		WHERE type = 'send' AND status IN ('pending', 'in_flight') ORDER BY not_before ASC`)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load list")
 		return
 	}
 	defer rows.Close()
@@ -862,7 +862,7 @@ func (s *Server) listScheduledAsMessages(w http.ResponseWriter, q url.Values, li
 		var id, accountID, sendAt int64
 		var payload, status string
 		if err := rows.Scan(&id, &accountID, &payload, &sendAt, &status); err != nil {
-			writeErr(w, http.StatusInternalServerError, "列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load list")
 			return
 		}
 		mo := messageOut{

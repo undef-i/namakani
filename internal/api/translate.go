@@ -81,13 +81,13 @@ func (s *Server) handlePutTranslateSettings(w http.ResponseWriter, r *http.Reque
 		LLMAPIKey string `json:"llm_api_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "设置内容不对")
+		writeErr(w, http.StatusBadRequest, "invalid settings")
 		return
 	}
 	switch req.Engine {
 	case "google", "llm":
 	default:
-		writeErr(w, http.StatusBadRequest, "翻译引擎不可用")
+		writeErr(w, http.StatusBadRequest, "translation engine unavailable")
 		return
 	}
 	if req.LLMFormat == "" {
@@ -96,7 +96,7 @@ func (s *Server) handlePutTranslateSettings(w http.ResponseWriter, r *http.Reque
 	switch req.LLMFormat {
 	case "openai", "responses", "anthropic":
 	default:
-		writeErr(w, http.StatusBadRequest, "翻译服务格式不对")
+		writeErr(w, http.StatusBadRequest, "invalid translation service format")
 		return
 	}
 	for key, val := range map[string]string{
@@ -107,22 +107,22 @@ func (s *Server) handlePutTranslateSettings(w http.ResponseWriter, r *http.Reque
 		settingTrLLMModel:  strings.TrimSpace(req.LLMModel),
 	} {
 		if err := s.st.SetSetting(key, val); err != nil {
-			writeErr(w, http.StatusInternalServerError, "保存设置失败")
+			writeErr(w, http.StatusInternalServerError, "failed to save settings")
 			return
 		}
 	}
 	if req.LLMAPIKey != "" {
 		if s.serverKey == nil {
-			writeErr(w, http.StatusInternalServerError, "服务器密钥不可用")
+			writeErr(w, http.StatusInternalServerError, "server key unavailable")
 			return
 		}
 		enc, err := auth.Encrypt(s.serverKey, req.LLMAPIKey)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "密钥加密失败")
+			writeErr(w, http.StatusInternalServerError, "failed to encrypt the key")
 			return
 		}
 		if err := s.st.SetSetting(settingTrLLMKeyEnc, enc); err != nil {
-			writeErr(w, http.StatusInternalServerError, "保存设置失败")
+			writeErr(w, http.StatusInternalServerError, "failed to save settings")
 			return
 		}
 	}
@@ -184,7 +184,7 @@ func (s *Server) handleTranslateMessage(w http.ResponseWriter, r *http.Request) 
 	key, _ := s.credentialKey(r)
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "邮件编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid message id")
 		return
 	}
 	var req struct {
@@ -197,22 +197,22 @@ func (s *Server) handleTranslateMessage(w http.ResponseWriter, r *http.Request) 
 		target = cfg.Target
 	}
 	if target == "" || target == "auto" {
-		writeErr(w, http.StatusBadRequest, "请选择目标语言")
+		writeErr(w, http.StatusBadRequest, "choose a target language")
 		return
 	}
 	var subject string
 	if err := s.st.DB.QueryRow("SELECT subject FROM messages WHERE id = ?", id).Scan(&subject); err != nil {
-		writeErr(w, http.StatusNotFound, "邮件不存在")
+		writeErr(w, http.StatusNotFound, "message not found")
 		return
 	}
 	route, err := s.st.MessageRoute(id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "定位邮件失败")
+		writeErr(w, http.StatusInternalServerError, "failed to locate the message")
 		return
 	}
 	text, rawHTML, atts, _, err := s.ensureBody(key, id, route)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "正文加载失败，请稍后重试", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to load the body, try again later", err)
 		return
 	}
 	cidURLs := map[string]string{}
@@ -235,7 +235,7 @@ func (s *Server) handleTranslateMessage(w http.ResponseWriter, r *http.Request) 
 	}
 	engineKey, err := s.translateEngineKey(cfg, rawKey, src, target)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "翻译服务不可用，请检查翻译设置", err)
+		writeUserErr(w, http.StatusBadGateway, "translation service unavailable, check the translation settings", err)
 		return
 	}
 	if row, ok, err := s.st.GetTranslation(id, target, engineKey); err == nil && ok {
@@ -246,7 +246,7 @@ func (s *Server) handleTranslateMessage(w http.ResponseWriter, r *http.Request) 
 	}
 	eng, err := s.buildTranslateEngine(cfg, rawKey)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "翻译服务不可用，请检查翻译设置", err)
+		writeUserErr(w, http.StatusBadGateway, "translation service unavailable, check the translation settings", err)
 		return
 	}
 	svc := translate.NewService(eng)
@@ -256,7 +256,7 @@ func (s *Server) handleTranslateMessage(w http.ResponseWriter, r *http.Request) 
 	if strings.TrimSpace(subject) != "" {
 		segs, err := svc.TranslateSegments(ctx, []translate.Segment{{ID: 1, Text: subject}}, src, target)
 		if err != nil {
-			writeUserErr(w, http.StatusBadGateway, "翻译失败，请稍后重试", err)
+			writeUserErr(w, http.StatusBadGateway, "translation failed, try again later", err)
 			return
 		}
 		trSubject = segs[0].Text
@@ -266,19 +266,19 @@ func (s *Server) handleTranslateMessage(w http.ResponseWriter, r *http.Request) 
 	if sanitized != "" {
 		trHTML, err = svc.TranslateHTML(ctx, sanitized, src, target)
 		if err != nil {
-			writeUserErr(w, http.StatusBadGateway, "翻译失败，请稍后重试", err)
+			writeUserErr(w, http.StatusBadGateway, "translation failed, try again later", err)
 			return
 		}
 	} else if text != "" {
 		trText, err = svc.TranslateText(ctx, text, src, target)
 		if err != nil {
-			writeUserErr(w, http.StatusBadGateway, "翻译失败，请稍后重试", err)
+			writeUserErr(w, http.StatusBadGateway, "translation failed, try again later", err)
 			return
 		}
 	}
 	row := &store.TranslationRow{Subject: trSubject, HTML: trHTML, Text: trText, SrcLang: src}
 	if err := s.st.PutTranslation(id, target, engineKey, row); err != nil {
-		writeErr(w, http.StatusInternalServerError, "写入缓存失败")
+		writeErr(w, http.StatusInternalServerError, "failed to write the cache")
 		return
 	}
 	writeJSON(w, http.StatusOK, translateResult{
@@ -293,7 +293,7 @@ func (s *Server) handleLLMModels(w http.ResponseWriter, r *http.Request) {
 		LLMAPIKey   string `json:"llm_api_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	format := req.LLMFormat
@@ -303,12 +303,12 @@ func (s *Server) handleLLMModels(w http.ResponseWriter, r *http.Request) {
 	switch format {
 	case "openai", "responses", "anthropic":
 	default:
-		writeErr(w, http.StatusBadRequest, "翻译服务格式不对")
+		writeErr(w, http.StatusBadRequest, "invalid translation service format")
 		return
 	}
 	endpoint := strings.TrimSpace(req.LLMEndpoint)
 	if endpoint == "" {
-		writeErr(w, http.StatusBadRequest, "请填写翻译服务地址")
+		writeErr(w, http.StatusBadRequest, "translation service URL is required")
 		return
 	}
 	key := req.LLMAPIKey
@@ -321,7 +321,7 @@ func (s *Server) handleLLMModels(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	ids, err := eng.ListModels(ctx)
 	if err != nil {
-		writeUserErr(w, http.StatusBadGateway, "读取模型列表失败", err)
+		writeUserErr(w, http.StatusBadGateway, "failed to read the model list", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": ids})
@@ -340,7 +340,7 @@ func (s *Server) handleTranslateLanguages(w http.ResponseWriter, r *http.Request
 		}
 		fetched, err := fetch(r.Context())
 		if err != nil {
-			writeUserErr(w, http.StatusBadGateway, "读取语言名单失败，请稍后重试", err)
+			writeUserErr(w, http.StatusBadGateway, "failed to read the language list, try again later", err)
 			return
 		}
 		s.trLangsMu.Lock()
@@ -356,7 +356,7 @@ func (s *Server) handleTranslateLanguages(w http.ResponseWriter, r *http.Request
 func (s *Server) handleTranslateModels(w http.ResponseWriter, r *http.Request) {
 	pairs, err := s.trMgr.Pairs()
 	if err != nil {
-		writeUserErr(w, http.StatusInternalServerError, "读取翻译设置失败", err)
+		writeUserErr(w, http.StatusInternalServerError, "failed to read the translation settings", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"pairs": pairViews(pairs)})

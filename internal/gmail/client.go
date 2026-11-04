@@ -34,6 +34,31 @@ type Label struct {
 	Type string `json:"type"`
 }
 
+type WatchResult struct {
+	HistoryID  string
+	Expiration int64
+}
+
+func (c *Client) Watch(ctx context.Context, topic string) (*WatchResult, error) {
+	body := map[string]any{"topicName": topic}
+	data, _, err := c.do(ctx, http.MethodPost, "/watch", nil, body)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		HistoryID  string `json:"historyId"`
+		Expiration string `json:"expiration"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	exp, err := strconv.ParseInt(out.Expiration, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &WatchResult{HistoryID: out.HistoryID, Expiration: exp}, nil
+}
+
 func (c *Client) ListLabels(ctx context.Context) ([]Label, error) {
 	data, _, err := c.do(ctx, http.MethodGet, "/labels", nil, nil)
 	if err != nil {

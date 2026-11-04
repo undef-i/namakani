@@ -69,21 +69,21 @@ func (s *Server) broadcastOpReverted(o *store.Op) {
 func cannotUndoText(o *store.Op) string {
 	switch o.Type {
 	case store.OpExpunge:
-		return "这封邮件已经被彻底删除，无法撤销"
+		return "this message has been permanently deleted and cannot be undone"
 	case store.OpSend:
-		return "这封邮件已经发出，无法撤销"
+		return "this message has already been sent and cannot be undone"
 	}
-	return "这条操作已经完成，无法撤销"
+	return "this operation has already completed and cannot be undone"
 }
 
 func undoErrText(o *store.Op, err error) (string, bool) {
 	switch {
 	case errors.Is(err, store.ErrUndoTargetGone):
-		return "这封邮件已不存在，无法撤销", true
+		return "this message no longer exists and cannot be undone", true
 	case errors.Is(err, store.ErrOpCannotUndo):
 		return cannotUndoText(o), true
 	case errors.Is(err, store.ErrOpSuperseded):
-		return "这条操作后面还有更新的操作，请先撤销最新的一条", true
+		return "a newer operation follows this one, undo the newest first", true
 	}
 	return "", false
 }
@@ -99,12 +99,12 @@ func (s *Server) writeOpStateErr(w http.ResponseWriter, code int, msg string, op
 func (s *Server) handleUndoOp(w http.ResponseWriter, r *http.Request) {
 	opID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "操作编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid operation id")
 		return
 	}
 	before, err := s.st.GetOp(opID)
 	if err != nil {
-		s.writeOpStateErr(w, http.StatusNotFound, "操作不存在", opID)
+		s.writeOpStateErr(w, http.StatusNotFound, "operation not found", opID)
 		return
 	}
 	if before.Type == store.OpSend {
@@ -120,7 +120,7 @@ func (s *Server) handleUndoOp(w http.ResponseWriter, r *http.Request) {
 		if msg, ok := undoErrText(before, err); ok {
 			s.writeOpStateErr(w, http.StatusConflict, msg, opID)
 		} else {
-			writeErr(w, http.StatusInternalServerError, "撤销失败")
+			writeErr(w, http.StatusInternalServerError, "undo failed")
 		}
 		return
 	}
@@ -151,12 +151,12 @@ func (s *Server) handleUndoOp(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetOp(w http.ResponseWriter, r *http.Request) {
 	opID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "操作编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid operation id")
 		return
 	}
 	o, err := s.st.GetOp(opID)
 	if err != nil {
-		s.writeOpStateErr(w, http.StatusNotFound, "操作不存在", opID)
+		s.writeOpStateErr(w, http.StatusNotFound, "operation not found", opID)
 		return
 	}
 	out := map[string]any{
@@ -205,7 +205,7 @@ func (s *Server) handleListAttention(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN messages m ON m.id = o.message_id
 		WHERE o.status = 'needs_attention' ORDER BY o.created_at ASC LIMIT 200`)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load list")
 		return
 	}
 	out := []attentionOut{}
@@ -217,7 +217,7 @@ func (s *Server) handleListAttention(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(&it.OpID, &it.AccountID, &it.AccountLabel, &email, &it.Type, &it.MessageID,
 			&it.Subject, &payload, &it.Error, &it.CreatedAt, &it.Attempts, &o.Identity, &o.PriorFolderID); err != nil {
 			rows.Close()
-			writeErr(w, http.StatusInternalServerError, "列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load list")
 			return
 		}
 		if it.AccountLabel == "" {
@@ -277,7 +277,7 @@ func (s *Server) handleListPending(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN folders tf ON tf.id = o.to_folder_id
 		WHERE o.status IN ('pending', 'in_flight') ORDER BY o.id ASC LIMIT 500`)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "列表加载失败")
+		writeErr(w, http.StatusInternalServerError, "failed to load list")
 		return
 	}
 	out := []pendingOut{}
@@ -291,7 +291,7 @@ func (s *Server) handleListPending(w http.ResponseWriter, r *http.Request) {
 			&it.Subject, &payload, &it.PriorFolderID, &it.PriorSpecial,
 			&it.ToFolderID, &it.ToSpecial, &it.NotBefore, &it.Attempts, &it.NextAttempt, &it.CreatedAt, &o.Identity, &sealed); err != nil {
 			rows.Close()
-			writeErr(w, http.StatusInternalServerError, "列表加载失败")
+			writeErr(w, http.StatusInternalServerError, "failed to load list")
 			return
 		}
 		it.Sealed = sealed != 0
@@ -333,7 +333,7 @@ type byKeyOut struct {
 func (s *Server) handleOpsByKeys(w http.ResponseWriter, r *http.Request) {
 	var req byKeysReq
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	out := []byKeyOut{}
@@ -353,16 +353,16 @@ func (s *Server) handleOpsByKeys(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRetryOp(w http.ResponseWriter, r *http.Request) {
 	opID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "操作编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid operation id")
 		return
 	}
 	o, err := s.st.GetOp(opID)
 	if err != nil {
-		s.writeOpStateErr(w, http.StatusNotFound, "操作不存在", opID)
+		s.writeOpStateErr(w, http.StatusNotFound, "operation not found", opID)
 		return
 	}
 	if err := s.st.RetryOp(opID); err != nil {
-		s.writeOpStateErr(w, http.StatusConflict, "这条操作当前不需要重试", opID)
+		s.writeOpStateErr(w, http.StatusConflict, "this operation does not need a retry", opID)
 		return
 	}
 	_ = o
@@ -374,16 +374,16 @@ func (s *Server) handleRetryOp(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDiscardOp(w http.ResponseWriter, r *http.Request) {
 	opID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "操作编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid operation id")
 		return
 	}
 	o, err := s.st.GetOp(opID)
 	if err != nil {
-		s.writeOpStateErr(w, http.StatusNotFound, "操作不存在", opID)
+		s.writeOpStateErr(w, http.StatusNotFound, "operation not found", opID)
 		return
 	}
 	if err := s.st.CancelOp(opID); err != nil {
-		s.writeOpStateErr(w, http.StatusConflict, "这条操作已经执行完了，无法丢弃", opID)
+		s.writeOpStateErr(w, http.StatusConflict, "this operation has already finished and cannot be discarded", opID)
 		return
 	}
 	s.broadcastOpReverted(o)

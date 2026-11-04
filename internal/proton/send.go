@@ -117,6 +117,10 @@ func (s *Session) createMessageLocked(r io.Reader) (msg *protonmail.Message, att
 		Subject:   subject,
 		Header:    formatHeader(mr.Header),
 		AddressID: fromAddr.ID,
+		Sender: &protonmail.MessageAddress{
+			Address: fromList[0].Address,
+			Name:    fromList[0].Name,
+		},
 	}
 
 	plaintext, err := msg.Encrypt([]*openpgp.Entity{privateKey}, privateKey)

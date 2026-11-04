@@ -24,6 +24,7 @@ const (
 
 	modelVersionSys      = "156"
 	modelVersionTutanota = "115"
+	modelVersionSend     = "116"
 	modelVersionStorage  = "15"
 
 	clientPlatformWeb = "7"

@@ -211,6 +211,14 @@ func (s *Session) AckHistory(mark string) error {
 	return s.st.SetGmailHistoryID(s.acct.ID, mark)
 }
 
+func (s *Session) Watch(topic string) (time.Time, error) {
+	res, err := s.cl.Watch(s.ctx, topic)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.UnixMilli(res.Expiration), nil
+}
+
 func (s *Session) resolveLocked() error {
 	if s.resolved {
 		return nil
@@ -704,7 +712,7 @@ func moveDelta(src, dst folderDef, m *MessageMeta) (add, remove []string) {
 		removeSet["TRASH"] = true
 		removeSet["SPAM"] = true
 	}
-	if src.labelID != "" {
+	if src.labelID != "" && !(dst.labelID == "" && src.labelID == "SENT") {
 		removeSet[src.labelID] = true
 	}
 	if addSet["TRASH"] {

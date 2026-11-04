@@ -312,7 +312,7 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 		BotToken string `json:"bot_token"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	req.ChatID = strings.TrimSpace(req.ChatID)
@@ -320,21 +320,21 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 
 	if req.BotToken != "" {
 		if s.serverKey == nil {
-			writeErr(w, http.StatusInternalServerError, "服务器密钥不可用，无法保存令牌")
+			writeErr(w, http.StatusInternalServerError, "server key unavailable, cannot save the token")
 			return
 		}
 		enc, err := auth.Encrypt(s.serverKey, req.BotToken)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "令牌加密失败")
+			writeErr(w, http.StatusInternalServerError, "failed to encrypt the token")
 			return
 		}
 		if err := s.st.SetSetting(settingTGTokenEnc, enc); err != nil {
-			writeErr(w, http.StatusInternalServerError, "保存令牌失败")
+			writeErr(w, http.StatusInternalServerError, "failed to save the token")
 			return
 		}
 	}
 	if err := s.st.SetSetting(settingTGChatID, req.ChatID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存聊天编号失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save the chat id")
 		return
 	}
 	enabled := "0"
@@ -342,7 +342,7 @@ func (s *Server) handlePutTelegram(w http.ResponseWriter, r *http.Request) {
 		enabled = "1"
 	}
 	if err := s.st.SetSetting(settingTGEnabled, enabled); err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存开关失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save the toggle")
 		return
 	}
 	s.tgReconcile()
@@ -375,11 +375,11 @@ func (s *Server) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		chatID = cfg.ChatID
 	}
 	if token == "" || chatID == "" {
-		writeErr(w, http.StatusBadRequest, "先填写 Bot Token 和 Chat ID")
+		writeErr(w, http.StatusBadRequest, "fill in the bot token and chat id first")
 		return
 	}
 	if err := tgSendMessage(token, chatID, chatID); err != nil {
-		writeUserErr(w, http.StatusBadGateway, "Telegram 发送失败，请检查 Bot Token 和 Chat ID", err)
+		writeUserErr(w, http.StatusBadGateway, "telegram send failed, check the bot token and chat id", err)
 		return
 	}
 	if cfg.PublicBase != "" {

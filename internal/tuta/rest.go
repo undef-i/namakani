@@ -232,6 +232,13 @@ func (c *restClient) do(req restRequest) ([]byte, int, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		err := parseRestError(resp.StatusCode, data)
 		if re, ok := err.(*RestError); ok {
+			if pre := resp.Header.Get("precondition"); pre != "" {
+				if re.Message == "" {
+					re.Message = "precondition: " + pre
+				} else {
+					re.Message += " (precondition: " + pre + ")"
+				}
+			}
 			if eid := resp.Header.Get("error-id"); eid != "" {
 				if re.Message == "" {
 					re.Message = "error-id: " + eid

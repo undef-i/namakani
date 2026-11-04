@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"net/url"
 	"strings"
@@ -146,6 +147,14 @@ func (s *Session) WatchEvents(stop <-chan struct{}, notify func(), onTerminal fu
 			}
 			return
 		}
+		if err != nil {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			log.Printf("tuta: event stream: %v", err)
+		}
 		s.InvalidateCaches()
 		delay := streak.record(time.Since(started))
 		select {
@@ -173,6 +182,11 @@ func (s *Session) eventLoop(stop <-chan struct{}, state *eventState, notify func
 		return err
 	}
 	defer conn.CloseNow()
+	return s.eventReadLoop(ctx, conn, state, notify)
+}
+
+func (s *Session) eventReadLoop(ctx context.Context, conn *websocket.Conn, state *eventState, notify func()) error {
+	conn.SetReadLimit(-1)
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {

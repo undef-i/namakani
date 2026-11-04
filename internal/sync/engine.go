@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,6 +70,7 @@ type Manager struct {
 	folderLocks map[int64]*sync.Mutex
 	initTurn    chan struct{}
 	ftsOnce     sync.Once
+	gmailPush   map[int64]chan struct{}
 
 	OnChange func(Change)
 }
@@ -87,13 +89,57 @@ type worker struct {
 
 func NewManager(st *store.Store) *Manager {
 	return &Manager{
-		st:       st,
-		workers:  make(map[int64]*worker),
-		status:   make(map[int64]*Status),
+		st:        st,
+		workers:   make(map[int64]*worker),
+		status:    make(map[int64]*Status),
 		lastCache: make(map[int64]store.AccountCacheStats),
-		live:     make(map[int64]bool),
-		repair:   make(map[int64]repairInfo),
-		initTurn: make(chan struct{}, 1),
+		live:      make(map[int64]bool),
+		repair:    make(map[int64]repairInfo),
+		initTurn:  make(chan struct{}, 1),
+		gmailPush: make(map[int64]chan struct{}),
+	}
+}
+
+func (m *Manager) registerGmailPush(acctID int64) chan struct{} {
+	ch := make(chan struct{}, 1)
+	m.mu.Lock()
+	m.gmailPush[acctID] = ch
+	m.mu.Unlock()
+	return ch
+}
+
+func (m *Manager) unregisterGmailPush(acctID int64) {
+	m.mu.Lock()
+	delete(m.gmailPush, acctID)
+	m.mu.Unlock()
+}
+
+func (m *Manager) workerRetry(acctID int64) chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if w, ok := m.workers[acctID]; ok {
+		return w.retry
+	}
+	return nil
+}
+
+func (m *Manager) NotifyGmailPush(email string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, w := range m.workers {
+		if w.acct.Kind != "gmail" {
+			continue
+		}
+		if !strings.EqualFold(w.acct.Email, email) && !strings.EqualFold(w.acct.Username, email) {
+			continue
+		}
+		if ch, ok := m.gmailPush[id]; ok {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+		return
 	}
 }
 
@@ -247,16 +293,16 @@ func classifySessionError(acct mail.Account, err error) (bool, string) {
 	case "tuta":
 		var re *tuta.RestError
 		if errors.As(err, &re) && (re.StatusCode == 401 || re.StatusCode == 403) {
-			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。"
+			return true, "the saved credentials were rejected, update the password and use reconnect"
 		}
 	case "gmail":
 		if gmail.IsAuthError(err) {
-			return true, "保存的登录凭据已被拒绝，请点「重新连接」重新授权。"
+			return true, "the saved credentials were rejected, use reconnect to authorize again"
 		}
 	default:
 		var ie *imap.Error
 		if errors.As(err, &ie) && ie.Code == imap.ResponseCodeAuthenticationFailed {
-			return true, "保存的登录凭据已被拒绝，请更新密码后点「重新连接」。"
+			return true, "the saved credentials were rejected, update the password and use reconnect"
 		}
 	}
 	return false, ""
@@ -482,14 +528,6 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 			m.watchFolder(fctx, acct, r, kick)
 		}()
 	}
-	stopWatcher := func(id int64) {
-		watchedMu.Lock()
-		defer watchedMu.Unlock()
-		if c, ok := watched[id]; ok {
-			c()
-			delete(watched, id)
-		}
-	}
 	for _, r := range refs {
 		startWatcher(r)
 	}
@@ -498,34 +536,12 @@ func (m *Manager) session(ctx context.Context, acct mail.Account) error {
 		wg.Wait()
 	}()
 
-	sweep := time.NewTicker(10 * time.Minute)
-	defer sweep.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-kick:
 			m.prewarm(ctx, cl, acct)
-		case <-sweep.C:
-			if newRefs, _, err := listRefs(); err == nil {
-				seen := make(map[int64]bool, len(newRefs))
-				for _, r := range newRefs {
-					seen[r.id] = true
-				}
-				for _, r := range refs {
-					if !seen[r.id] {
-						stopWatcher(r.id)
-					}
-				}
-				refs = newRefs
-				m.setStatus(acct.ID, &Status{State: "idle", Folders: len(refs)})
-				for _, r := range refs {
-					startWatcher(r)
-				}
-			} else {
-				log.Printf("sync account %d list folders: %v", acct.ID, err)
-			}
-			syncAll()
 		}
 	}
 }
@@ -534,6 +550,8 @@ const (
 	watchRetryBase = 5 * time.Second
 	watchRetryCap  = 2 * time.Minute
 )
+
+const idleRenewInterval = 29 * time.Minute
 
 func (m *Manager) watchFolder(ctx context.Context, acct mail.Account, r folderRef, kick chan<- struct{}) {
 	failures := 0
@@ -619,7 +637,7 @@ func (m *Manager) watchSession(ctx context.Context, acct mail.Account, r folderR
 		}
 		done := make(chan error, 1)
 		go func() { done <- idleCmd.Wait() }()
-		poll := time.NewTimer(60 * time.Second)
+		renew := time.NewTimer(idleRenewInterval)
 		var idleErr error
 		gotDone := false
 	idleWait:
@@ -628,11 +646,11 @@ func (m *Manager) watchSession(ctx context.Context, acct mail.Account, r folderR
 			case <-ctx.Done():
 				idleCmd.Close()
 				<-done
-				poll.Stop()
+				renew.Stop()
 				return nil
 			case <-wake:
 				break idleWait
-			case <-poll.C:
+			case <-renew.C:
 				break idleWait
 			case err := <-done:
 				idleErr = err
@@ -640,7 +658,7 @@ func (m *Manager) watchSession(ctx context.Context, acct mail.Account, r folderR
 				break idleWait
 			}
 		}
-		poll.Stop()
+		renew.Stop()
 		idleCmd.Close()
 		if !gotDone {
 			<-done

@@ -23,6 +23,8 @@ func quotaCost(method, path string, query url.Values) int {
 		return 5
 	case path == "/messages/send":
 		return 100
+	case path == "/watch":
+		return 100
 	case path == "/drafts" && method == http.MethodPost:
 		return 10
 	case strings.HasSuffix(path, "/modify"):

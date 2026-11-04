@@ -131,17 +131,19 @@ func encField(key []byte, value string) string {
 	return b64encode(encryptBytes(key, []byte(value)))
 }
 
-func draftRecipient(key []byte, a mail.Addr) map[string]any {
+func transferMailAddress(sk []byte, a mail.Addr) map[string]any {
 	return map[string]any{
-		"484": encField(key, a.Name),
-		"485": a.Email,
+		"2030": genAggID(),
+		"2031": b64encode(encryptBytes(sk, []byte(a.Name))),
+		"2032": a.Email,
+		"2033": []any{},
 	}
 }
 
-func draftRecipients(key []byte, in []mail.Addr) []any {
+func transferMailAddresses(sk []byte, in []mail.Addr) []any {
 	out := make([]any, 0, len(in))
 	for _, a := range in {
-		out = append(out, draftRecipient(key, a))
+		out = append(out, transferMailAddress(sk, a))
 	}
 	return out
 }
@@ -171,7 +173,7 @@ func (s *Session) createDraft(pm *parsedMail, confidential bool) (draftList, dra
 		return "", "", nil, err
 	}
 	ownerEnc := encryptKey(groupKey, sk)
-	var added []any
+	added := make([]any, 0, len(pm.attachments))
 	for _, att := range pm.attachments {
 		da, err := s.uploadDraftAttachment(att, groupKey, groupVersion, groupID)
 		if err != nil {
@@ -180,7 +182,7 @@ func (s *Session) createDraft(pm *parsedMail, confidential bool) (draftList, dra
 		added = append(added, da)
 	}
 	conversationType := "0"
-	previousMessageID := ""
+	var previousMessageID any
 	if pm.inReplyTo != "" {
 		conversationType = "1"
 		previousMessageID = pm.inReplyTo
@@ -189,42 +191,87 @@ func (s *Session) createDraft(pm *parsedMail, confidential bool) (draftList, dra
 	if confidential {
 		confVal = "1"
 	}
-	bodyCompressed := lz4Compress([]byte(pm.body))
+	encOwner := b64encode(ownerEnc)
+	ownerVersion := fmt.Sprint(groupVersion)
+	mailTransfer := map[string]any{
+		"2059": genAggID(),
+		"2060": encOwner,
+		"2061": ownerVersion,
+		"2062": nil,
+		"2063": b64encode(encryptBytes(sk, []byte(pm.subject))),
+		"2064": b64encode(encryptBytes(sk, []byte(confVal))),
+		"2065": b64encode(encryptBytes(sk, []byte("0"))),
+		"2066": []any{transferMailAddress(sk, pm.from)},
+		"2067": []any{},
+	}
+	first := pm.to
+	if len(first) == 0 {
+		first = pm.cc
+	}
+	if len(first) == 0 {
+		first = pm.bcc
+	}
+	if len(first) > 0 {
+		mailTransfer["2067"] = []any{transferMailAddress(sk, first[0])}
+	}
+	detailsID := genAggID()
+	recipientsID := genAggID()
+	bodyID := genAggID()
+	blobTransfer := map[string]any{
+		"2053": genAggID(),
+		"2054": encOwner,
+		"2055": ownerVersion,
+		"2056": nil,
+		"2057": []any{map[string]any{
+			"2048": detailsID,
+			"2049": []any{},
+			"2050": []any{map[string]any{
+				"2043": recipientsID,
+				"2044": transferMailAddresses(sk, pm.to),
+				"2045": transferMailAddresses(sk, pm.cc),
+				"2046": transferMailAddresses(sk, pm.bcc),
+			}},
+			"2051": []any{map[string]any{
+				"2039": bodyID,
+				"2040": b64encode(encryptBytes(sk, []byte(""))),
+				"2041": b64encode(encryptBytes(sk, lz4Compress([]byte(pm.body)))),
+			}},
+		}},
+	}
 	data := instance{
 		"509":  "0",
 		"510":  previousMessageID,
 		"511":  conversationType,
-		"512":  b64encode(ownerEnc),
-		"1427": fmt.Sprint(groupVersion),
-		"515": map[string]any{
-			"498":  encField(sk, pm.subject),
-			"499":  "",
-			"500":  pm.from.Email,
-			"501":  encField(sk, pm.from.Name),
-			"502":  encField(sk, confVal),
-			"1116": encField(sk, "0"),
-			"1194": encFieldBytes(sk, bodyCompressed),
-			"503":  draftRecipients(sk, pm.to),
-			"504":  draftRecipients(sk, pm.cc),
-			"505":  draftRecipients(sk, pm.bcc),
+		"512":  nil,
+		"1427": nil,
+		"515": []any{map[string]any{
+			"497":  genAggID(),
+			"498":  nil,
+			"499":  nil,
+			"500":  nil,
+			"501":  nil,
+			"502":  nil,
+			"1116": nil,
+			"1194": nil,
+			"503":  []any{},
+			"504":  []any{},
+			"505":  []any{},
 			"506":  added,
 			"507":  []any{},
 			"819":  []any{},
-		},
+			"2069": []any{mailTransfer},
+			"2070": []any{blobTransfer},
+		}},
 	}
-	ret, err := s.rest.callService(http.MethodPost, "tutanota", "draftservice", modelVersionTutanota, data)
+	ret, err := s.rest.callService(http.MethodPost, "tutanota", "draftservice", modelVersionSend, data)
 	if err != nil {
 		return "", "", nil, err
 	}
-	l, el, ok := ret.idTuple("518")
-	if !ok {
+	tuples := ret.idTuples("518")
+	if len(tuples) == 0 {
 		return "", "", nil, errors.New("tuta: draft service returned no draft id")
 	}
-	return l, el, sk, nil
-}
-
-func encFieldBytes(key, plain []byte) string {
-	return b64encode(encryptBytes(key, plain))
+	return tuples[0][0], tuples[0][1], sk, nil
 }
 
 func (s *Session) uploadDraftAttachment(att outAttachment, groupKey []byte, groupVersion int, groupID string) (map[string]any, error) {
@@ -240,7 +287,7 @@ func (s *Session) uploadDraftAttachment(att outAttachment, groupKey []byte, grou
 		if err != nil {
 			return nil, err
 		}
-		tokens = append(tokens, map[string]any{"1992": tok})
+		tokens = append(tokens, map[string]any{"1991": genAggID(), "1992": tok})
 	}
 	for start := 0; start < len(data); start += maxBlobSizeBytes {
 		end := start + maxBlobSizeBytes
@@ -252,23 +299,33 @@ func (s *Session) uploadDraftAttachment(att outAttachment, groupKey []byte, grou
 		if err != nil {
 			return nil, err
 		}
-		tokens = append(tokens, map[string]any{"1992": tok})
+		tokens = append(tokens, map[string]any{"1991": genAggID(), "1992": tok})
 	}
-	ownerEnc := encryptKey(groupKey, fileSK)
-	newFile := map[string]any{
-		"488":  encFieldBytes(fileSK, []byte(att.name)),
-		"489":  encFieldBytes(fileSK, []byte(att.mime)),
-		"1226": tokens,
+	fileTransfer := map[string]any{
+		"2022": genAggID(),
+		"2023": b64encode(encryptKey(groupKey, fileSK)),
+		"2024": fmt.Sprint(groupVersion),
+		"2025": nil,
+		"2026": b64encode(encryptBytes(fileSK, []byte(att.name))),
+		"2027": b64encode(encryptBytes(fileSK, []byte(att.mime))),
+		"2028": nil,
 	}
 	if att.cid != "" {
-		newFile["925"] = encFieldBytes(fileSK, []byte(att.cid))
-	} else {
-		newFile["925"] = nil
+		fileTransfer["2028"] = b64encode(encryptBytes(fileSK, []byte(att.cid)))
+	}
+	newFile := map[string]any{
+		"487":  genAggID(),
+		"488":  nil,
+		"489":  nil,
+		"925":  nil,
+		"1226": tokens,
+		"2068": []any{fileTransfer},
 	}
 	return map[string]any{
-		"493":  b64encode(ownerEnc),
-		"1430": fmt.Sprint(groupVersion),
-		"494":  newFile,
+		"492":  genAggID(),
+		"493":  nil,
+		"1430": nil,
+		"494":  []any{newFile},
 		"495":  []any{},
 	}, nil
 }
@@ -476,6 +533,7 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 		return "", err
 	}
 	params := instance{
+		"1789": genAggID(),
 		"1791": "en",
 		"1790": []any{[]any{draftList, draftID}},
 		"1795": "0",
@@ -504,7 +562,7 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		var internalData []any
+		internalData := make([]any, 0, len(all))
 		for _, rcpt := range all {
 			rk, ok := keys[rcpt.Email]
 			if !ok {
@@ -517,7 +575,13 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 			internalData = append(internalData, data)
 		}
 		params["1797"] = internalData
-		if len(internalData) > 0 {
+		tutaCrypt := len(internalData) > 0
+		for _, data := range internalData {
+			if m, ok := data.(map[string]any); !ok || m["1352"] != "2" {
+				tutaCrypt = false
+			}
+		}
+		if tutaCrypt {
 			params["1801"] = encField(sk, "4")
 		} else {
 			params["1801"] = nil
@@ -525,7 +589,7 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 	} else {
 		params["1801"] = nil
 	}
-	var attachmentData []any
+	attachmentData := make([]any, 0)
 	for _, tuple := range draft.idTuples("115") {
 		f, err := s.rest.getEntity("tutanota", "file", modelVersionTutanota, tuple[0], tuple[1])
 		if err != nil {
@@ -542,7 +606,8 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 			}
 		}
 		entry := map[string]any{
-			"546": []any{tuple[0], tuple[1]},
+			"543": genAggID(),
+			"546": []any{[]any{tuple[0], tuple[1]}},
 		}
 		if confidential {
 			entry["544"] = b64encode(encryptKey(bucketKey, fileSK))
@@ -570,9 +635,9 @@ func (s *Session) SendRaw(raw []byte) (string, error) {
 		"1353": params["1799"],
 		"555":  params["1800"],
 		"556":  params["1790"],
-		"1810": params,
+		"1810": []any{params},
 	}
-	ret, err := s.rest.callService(http.MethodPost, "tutanota", "senddraftservice", modelVersionTutanota, send)
+	ret, err := s.rest.callService(http.MethodPost, "tutanota", "senddraftservice", modelVersionSend, send)
 	if err != nil {
 		return "", err
 	}
@@ -614,6 +679,7 @@ func (s *Session) recipientKeyData(rk recipientKey, bucketKey []byte, senderKP *
 			return nil, err
 		}
 		return map[string]any{
+			"528":  genAggID(),
 			"529":  rk.address,
 			"530":  b64encode(pubEnc),
 			"531":  fmt.Sprint(rk.keyVersion),
@@ -631,6 +697,7 @@ func (s *Session) recipientKeyData(rk recipientKey, bucketKey []byte, senderKP *
 			return nil, err
 		}
 		return map[string]any{
+			"528":  genAggID(),
 			"529":  rk.address,
 			"530":  b64encode(enc),
 			"531":  fmt.Sprint(rk.keyVersion),

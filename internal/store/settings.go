@@ -31,6 +31,11 @@ const (
 	settingBaseURL       = "base_url"
 )
 
+const (
+	SettingGmailPubSubTopic    = "gmail_pubsub_topic"
+	SettingGmailPubSubTokenEnc = "gmail_pubsub_token_enc"
+)
+
 func (s *Store) loadAppSettings() {
 	cfg := DefaultAppSettings()
 	read := func(key string, dst *int64) {

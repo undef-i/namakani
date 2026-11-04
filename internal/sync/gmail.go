@@ -7,6 +7,7 @@ import (
 
 	"namakani/internal/gmail"
 	"namakani/internal/mail"
+	"namakani/internal/store"
 )
 
 func (m *Manager) gmailSession(ctx context.Context, acct mail.Account, releaseInit func()) error {
@@ -117,15 +118,66 @@ func (m *Manager) gmailSession(ctx context.Context, acct mail.Account, releaseIn
 		}
 	}
 
-	sweep := time.NewTicker(5 * time.Minute)
-	defer sweep.Stop()
+	topic, _, _ := m.st.GetSetting(store.SettingGmailPubSubTopic)
+	push := m.registerGmailPush(acct.ID)
+	defer m.unregisterGmailPush(acct.ID)
+
+	if topic == "" {
+		m.setStatus(acct.ID, &Status{
+			State:      "error",
+			LastSyncAt: time.Now().Unix(),
+			LastError:  "gmail pub/sub topic not configured",
+			Folders:    len(refs),
+			Messages:   n,
+		})
+		select {
+		case <-ctx.Done():
+		case <-m.workerRetry(acct.ID):
+		}
+		return nil
+	}
+
+	var renewTimer *time.Timer
+	var renewC <-chan time.Time
+	watchFailures := 0
+	startWatch := func() {
+		expiration, err := sess.Watch(topic)
+		if err != nil {
+			watchFailures++
+			nn, _ := m.st.CountMessages(acct.ID)
+			m.setStatus(acct.ID, &Status{State: "error", LastSyncAt: time.Now().Unix(), LastError: err.Error(), Folders: len(refs), Messages: nn})
+			renewTimer = time.NewTimer(time.Duration(store.BackoffSeconds(watchFailures)) * time.Second)
+			renewC = renewTimer.C
+			return
+		}
+		watchFailures = 0
+		renewTimer = time.NewTimer(gmailWatchRenewIn(expiration))
+		renewC = renewTimer.C
+	}
+	startWatch()
+	defer func() {
+		if renewTimer != nil {
+			renewTimer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-sweep.C:
+		case <-push:
 			sess.InvalidateCaches()
 			runSync()
+		case <-renewC:
+			startWatch()
 		}
 	}
+}
+
+const gmailWatchRenewInterval = 24 * time.Hour
+
+func gmailWatchRenewIn(expiration time.Time) time.Duration {
+	if until := time.Until(expiration); until < gmailWatchRenewInterval {
+		return until
+	}
+	return gmailWatchRenewInterval
 }

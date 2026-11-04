@@ -109,8 +109,6 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseI
 	}
 	armRetry()
 
-	sweep := time.NewTicker(10 * time.Minute)
-	defer sweep.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -120,17 +118,14 @@ func (m *Manager) protonSession(ctx context.Context, acct mail.Account, releaseI
 			retryC = nil
 			ps.retryOnce()
 			armRetry()
-		case <-sweep.C:
-			if newRefs, _, err := listRefs(); err == nil {
-				refs = newRefs
-				m.setStatus(acct.ID, &Status{State: "idle", Folders: len(refs)})
-			} else {
-				log.Printf("sync account %d list folders: %v", acct.ID, err)
-			}
-			syncAll()
-			armRetry()
 		case ev := <-events:
 			if ev.Refresh&protonmail.EventRefreshMail != 0 {
+				if newRefs, _, err := listRefs(); err == nil {
+					refs = newRefs
+					m.setStatus(acct.ID, &Status{State: "idle", Folders: len(refs)})
+				} else {
+					log.Printf("sync account %d list folders: %v", acct.ID, err)
+				}
 				syncAll()
 				armRetry()
 				continue

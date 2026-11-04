@@ -474,7 +474,7 @@ async function submit(mode) {
       if (
         form.value.kind === 'gmail' &&
         editing.value &&
-        err.message === '连接失败，请检查服务器设置和账号密码'
+        err.message === 'connection failed, check the server settings and account password'
       ) {
         void reconnect({ id: editing.value, kind: 'gmail' })
         return
@@ -957,14 +957,14 @@ async function saveAppSet() {
 
 const oauthState = ref('loading')
 const oauthError = ref('')
-const oauth = ref({ client_id: '', client_secret: '', has_secret: false })
+const oauth = ref({ client_id: '', client_secret: '', has_secret: false, pubsub_topic: '', pubsub_endpoint: '' })
 const oauthBusy = ref(false)
 
 async function loadOAuth() {
   oauthState.value = 'loading'
   try {
     const res = await api.getGmailOAuth()
-    oauth.value = { client_id: res.client_id || '', client_secret: '', has_secret: !!res.has_secret }
+    oauth.value = { client_id: res.client_id || '', client_secret: '', has_secret: !!res.has_secret, pubsub_topic: res.pubsub_topic || '', pubsub_endpoint: res.pubsub_endpoint || '' }
     oauthState.value = 'ready'
   } catch (err) {
     oauthError.value = t(err.message)
@@ -978,8 +978,9 @@ async function saveOAuth() {
     const res = await api.saveGmailOAuth({
       client_id: oauth.value.client_id.trim(),
       client_secret: oauth.value.client_secret,
+      pubsub_topic: oauth.value.pubsub_topic.trim(),
     })
-    oauth.value = { client_id: res.client_id || '', client_secret: '', has_secret: !!res.has_secret }
+    oauth.value = { client_id: res.client_id || '', client_secret: '', has_secret: !!res.has_secret, pubsub_topic: res.pubsub_topic || '', pubsub_endpoint: res.pubsub_endpoint || '' }
     showSnack(t('已保存'))
   } catch (err) {
     showSnack(t('保存失败：{error}', { error: t(err.message) }))
@@ -1210,6 +1211,24 @@ onMounted(() => {
         density="compact"
         autocomplete="off"
         :placeholder="oauth.has_secret ? t('已保存，留空不改') : ''"
+        class="mb-2"
+      />
+      <v-text-field
+        v-model="oauth.pubsub_topic"
+        :label="t('Gmail 推送主题')"
+        variant="outlined"
+        density="compact"
+        autocomplete="off"
+        placeholder="projects/my-project/topics/gmail"
+        class="mb-2"
+      />
+      <v-text-field
+        v-if="oauth.pubsub_endpoint"
+        :model-value="oauth.pubsub_endpoint"
+        :label="t('Gmail 推送接收地址')"
+        variant="outlined"
+        density="compact"
+        readonly
         class="mb-2"
       />
       <v-btn color="primary" :loading="oauthBusy" @click="saveOAuth">{{ t('保存') }}</v-btn>

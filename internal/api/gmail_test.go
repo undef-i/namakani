@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"namakani/internal/auth"
 	"namakani/internal/gmail"
@@ -20,10 +22,13 @@ import (
 )
 
 type apiFakeGmail struct {
-	mu        sync.Mutex
-	sendRaws  []string
-	tokenHits int
-	srv       *httptest.Server
+	mu          sync.Mutex
+	sendRaws    []string
+	tokenHits   int
+	watchHits   int
+	historyHits int
+	lastTopic   string
+	srv         *httptest.Server
 }
 
 func newAPIFakeGmail(t *testing.T) *apiFakeGmail {
@@ -69,6 +74,28 @@ func newAPIFakeGmail(t *testing.T) *apiFakeGmail {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"resultSizeEstimate": 0})
 	})
+	mux.HandleFunc("/gmail/v1/users/me/watch", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			TopicName string `json:"topicName"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.watchHits++
+		f.lastTopic = body.TopicName
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"historyId":  "1000",
+			"expiration": strconv.FormatInt(time.Now().Add(7*24*time.Hour).UnixMilli(), 10),
+		})
+	})
+	mux.HandleFunc("/gmail/v1/users/me/history", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.historyHits++
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"history": []any{}, "historyId": "1000"})
+	})
 	mux.HandleFunc("/gmail/v1/users/me/messages/send", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Raw string `json:"raw"`
@@ -94,6 +121,24 @@ func (f *apiFakeGmail) sendCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.sendRaws)
+}
+
+func (f *apiFakeGmail) watchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.watchHits
+}
+
+func (f *apiFakeGmail) historyCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.historyHits
+}
+
+func (f *apiFakeGmail) watchedTopic() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastTopic
 }
 
 type gmailFixture struct {
@@ -373,7 +418,7 @@ func TestGmailSaveWithoutPendingRequiresTest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "请先点测试连接") {
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "use test connection first") {
 		t.Fatalf("save without pending = %d, %s; want 400 telling the user to test first", resp.StatusCode, body)
 	}
 }
@@ -399,7 +444,7 @@ func TestGmailPendingCancelDiscards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "请先点测试连接") {
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "use test connection first") {
 		t.Fatalf("save after cancel = %d, %s; want 400 telling the user to test first", resp.StatusCode, body)
 	}
 	var n int
@@ -450,7 +495,7 @@ func TestGmailAccountFormTestInvalidStoredToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "连接失败，请检查服务器设置和账号密码") {
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "connection failed, check the server settings and account password") {
 		t.Fatalf("gmail form test with a bad token = %d, %s; want the 502 connection-failure form", resp.StatusCode, body)
 	}
 }
@@ -463,7 +508,7 @@ func TestGmailAccountFormTestWithoutStoredAccountRequiresAuthorization(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "请先完成授权") {
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "complete authorization first") {
 		t.Fatalf("gmail form test without an account = %d, %s; want 400 telling the user to authorize first", resp.StatusCode, body)
 	}
 }
@@ -583,7 +628,7 @@ func TestGmailStartRequiresSharedOAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), "账号与认证") {
+	if !strings.Contains(string(body), "accounts and authentication") {
 		t.Fatalf("start without shared oauth error = %s; want it to name the 账号与认证 settings", body)
 	}
 }

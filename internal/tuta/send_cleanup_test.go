@@ -40,7 +40,7 @@ func sendCleanupSession(t *testing.T, failDraftFetch bool, deletes *[]string) *S
 		case strings.Contains(p, "/sys/publickeyservice"):
 			return errResponse(r, 500), nil
 		case strings.Contains(p, "/tutanota/draftservice"):
-			return jsonResponse(r, `{"518":["draftList1","draftElem1"]}`), nil
+			return jsonResponse(r, `{"518":[["draftList1","draftElem1"]]}`), nil
 		case strings.Contains(p, "/tutanota/mail/"):
 			if failDraftFetch {
 				return errResponse(r, 500), nil

@@ -1701,8 +1701,21 @@ function placeholderMessage(id) {
   }
 }
 
+function currentFlags(id, fallback) {
+  let v = fallback
+  const lf = latestFlags.get(id)
+  if (lf !== undefined) v = lf
+  const mf = memberFlags.get(id)
+  if (mf !== undefined) v = mf
+  for (const it of intents.value.values()) {
+    if (it.kind === 'flags' && it.ids.has(id)) v = it.flagsVal
+  }
+  return v
+}
+
 function enrichSelected(d) {
   if (selected.value?.id !== d.id) return
+  const flags = currentFlags(d.id, d.flags)
   selected.value = {
     ...selected.value,
     account_id: d.account_id,
@@ -1713,9 +1726,12 @@ function enrichSelected(d) {
     from_name: d.from?.name || '',
     from_email: d.from?.email || '',
     date_ts: d.date_ts,
-    flags: d.flags,
+    flags,
     has_attach: !!d.has_attach,
     size: d.size,
+  }
+  if (detail.value?.id === d.id && detail.value.flags !== flags) {
+    detail.value = { ...detail.value, flags }
   }
 }
 
@@ -3147,7 +3163,7 @@ function applyFlagsInput(items) {
   baseRows.value = rowsApplyFlags(baseRows.value, items)
   snapEpoch = listEpoch
   for (const it of items) memberFlags.set(it.id, it.flags)
-  patchAuxFlags(items)
+  patchAuxFlags(items.map((it) => ({ id: it.id, flags: currentFlags(it.id, it.flags) })))
 }
 
 function applyMessagesInput(items) {
@@ -3749,6 +3765,8 @@ function onHashChange() {
         convo.value = { ...convo.value, anchor: route.id }
         convoOpenIds.value = new Set([route.id])
         loadCardBody(route.id)
+        const target = convo.value.msgs.find((x) => x.id === route.id)
+        if (target) markSeen(target)
         nextTick(() => {
           document.querySelector('[data-convo-card="' + route.id + '"]')?.scrollIntoView({ block: 'start' })
         })

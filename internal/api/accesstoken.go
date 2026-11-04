@@ -11,7 +11,7 @@ import (
 func (s *Server) sessionOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := s.sessionKey(r); !ok {
-			writeErr(w, http.StatusUnauthorized, "尚未登录")
+			writeErr(w, http.StatusUnauthorized, "not signed in")
 			return
 		}
 		s.renewSession(w, r)
@@ -22,7 +22,7 @@ func (s *Server) sessionOnly(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request) {
 	n, err := auth.DeleteAllSessions(s.st)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "吊销会话失败")
+		writeErr(w, http.StatusInternalServerError, "failed to revoke the session")
 		return
 	}
 	s.mu.Lock()
@@ -47,37 +47,37 @@ type accessTokenOut struct {
 func (s *Server) handleCreateAccessToken(w http.ResponseWriter, r *http.Request) {
 	key, ok := s.sessionKey(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		writeErr(w, http.StatusUnauthorized, "not signed in")
 		return
 	}
 	var req struct {
 		Label string `json:"label"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	label := strings.TrimSpace(req.Label)
 	if label == "" {
-		writeErr(w, http.StatusBadRequest, "请填写令牌名称")
+		writeErr(w, http.StatusBadRequest, "token name is required")
 		return
 	}
 	if len([]rune(label)) > 64 {
-		writeErr(w, http.StatusBadRequest, "令牌名称太长")
+		writeErr(w, http.StatusBadRequest, "token name is too long")
 		return
 	}
 	wrapped := ""
 	if s.serverKey != nil {
 		sealed, err := auth.Encrypt(s.serverKey, string(key))
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "创建令牌失败")
+			writeErr(w, http.StatusInternalServerError, "failed to create the token")
 			return
 		}
 		wrapped = sealed
 	}
 	id, token, err := auth.NewAccessToken(s.st, label, wrapped)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "创建令牌失败")
+		writeErr(w, http.StatusInternalServerError, "failed to create the token")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -90,7 +90,7 @@ func (s *Server) handleCreateAccessToken(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleListAccessTokens(w http.ResponseWriter, r *http.Request) {
 	rows, err := auth.ListAccessTokens(s.st)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取令牌失败")
+		writeErr(w, http.StatusInternalServerError, "failed to read the token")
 		return
 	}
 	out := make([]accessTokenOut, 0, len(rows))
@@ -103,16 +103,16 @@ func (s *Server) handleListAccessTokens(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleDeleteAccessToken(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id <= 0 {
-		writeErr(w, http.StatusBadRequest, "令牌编号不对")
+		writeErr(w, http.StatusBadRequest, "invalid token id")
 		return
 	}
 	deleted, err := auth.DeleteAccessToken(s.st, id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "吊销令牌失败")
+		writeErr(w, http.StatusInternalServerError, "failed to revoke the token")
 		return
 	}
 	if !deleted {
-		writeErr(w, http.StatusNotFound, "令牌不存在")
+		writeErr(w, http.StatusNotFound, "token not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

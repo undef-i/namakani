@@ -1498,7 +1498,7 @@ func (s *Store) SealSendForDelivery(id, claimToken, newToken int64) (bool, bool,
 	return false, o.UndoRequested && o.ClaimToken == claimToken, nil
 }
 
-const SendOutcomeUnknownError = "发送结果未知：发送执行中断，无法确认服务商是否已接受这封邮件"
+const SendOutcomeUnknownError = "send outcome unknown: delivery was interrupted, and it cannot be confirmed whether the provider accepted the message"
 
 func (s *Store) ListSealedInFlightSends(accountID int64) ([]*Op, error) {
 	rows, err := s.DB.Query("SELECT "+opColumns+" FROM ops WHERE account_id = ? AND type = 'send' AND status = 'in_flight' AND sealed = 1 ORDER BY id", accountID)

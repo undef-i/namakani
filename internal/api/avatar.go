@@ -23,7 +23,7 @@ func (s *Server) handleAvatars(w http.ResponseWriter, r *http.Request) {
 		Emails []string `json:"emails"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	if len(req.Emails) > 60 {
@@ -79,12 +79,12 @@ func (s *Server) handleAvatars(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAvatarImage(w http.ResponseWriter, r *http.Request) {
 	email := avatar.NormalizeEmail(r.URL.Query().Get("e"))
 	if email == "" {
-		writeErr(w, http.StatusBadRequest, "请填写邮箱")
+		writeErr(w, http.StatusBadRequest, "email is required")
 		return
 	}
 	row, ok, err := s.st.GetAvatar(email)
 	if err != nil || !ok || row.Kind == "" || len(row.Data) == 0 {
-		writeErr(w, http.StatusNotFound, "没有头像")
+		writeErr(w, http.StatusNotFound, "no avatar")
 		return
 	}
 	mime := row.Mime

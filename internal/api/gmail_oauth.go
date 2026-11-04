@@ -9,6 +9,7 @@ import (
 
 	"namakani/internal/auth"
 	"namakani/internal/gmail"
+	"namakani/internal/store"
 )
 
 const (
@@ -20,6 +21,8 @@ type gmailOAuthConfig struct {
 	ClientID     string
 	ClientSecret string
 	HasSecret    bool
+	PubSubTopic  string
+	PubSubToken  string
 }
 
 func (s *Server) gmailOAuthLoad() gmailOAuthConfig {
@@ -35,7 +38,51 @@ func (s *Server) gmailOAuthLoad() gmailOAuthConfig {
 			}
 		}
 	}
+	if v, ok, _ := s.st.GetSetting(store.SettingGmailPubSubTopic); ok {
+		cfg.PubSubTopic = strings.TrimSpace(v)
+	}
+	if v, ok, _ := s.st.GetSetting(store.SettingGmailPubSubTokenEnc); ok && v != "" {
+		if s.serverKey != nil {
+			if tok, err := auth.Decrypt(s.serverKey, v); err == nil {
+				cfg.PubSubToken = tok
+			}
+		}
+	}
 	return cfg
+}
+
+func (s *Server) gmailPubSubSave(topic string) error {
+	if err := s.st.SetSetting(store.SettingGmailPubSubTopic, topic); err != nil {
+		return err
+	}
+	if topic == "" {
+		return nil
+	}
+	cfg := s.gmailOAuthLoad()
+	if cfg.PubSubToken != "" {
+		return nil
+	}
+	if s.serverKey == nil {
+		return errors.New("server key unavailable")
+	}
+	token, err := gmail.RandomState()
+	if err != nil {
+		return err
+	}
+	enc, err := auth.Encrypt(s.serverKey, token)
+	if err != nil {
+		return err
+	}
+	return s.st.SetSetting(store.SettingGmailPubSubTokenEnc, enc)
+}
+
+func (s *Server) gmailPubSubEndpoint() string {
+	cfg := s.gmailOAuthLoad()
+	base := s.st.BaseURL()
+	if base == "" || cfg.PubSubTopic == "" || cfg.PubSubToken == "" {
+		return ""
+	}
+	return base + "/api/gmail/pubsub?token=" + cfg.PubSubToken
 }
 
 func (s *Server) gmailOAuthSave(clientID, clientSecret string) error {
@@ -44,7 +91,7 @@ func (s *Server) gmailOAuthSave(clientID, clientSecret string) error {
 	}
 	if clientSecret != "" {
 		if s.serverKey == nil {
-			return errors.New("服务器密钥不可用")
+			return errors.New("server key unavailable")
 		}
 		enc, err := auth.Encrypt(s.serverKey, clientSecret)
 		if err != nil {
@@ -60,8 +107,10 @@ func (s *Server) gmailOAuthSave(clientID, clientSecret string) error {
 func (s *Server) handleGetGmailOAuth(w http.ResponseWriter, r *http.Request) {
 	cfg := s.gmailOAuthLoad()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"client_id":  cfg.ClientID,
-		"has_secret": cfg.HasSecret,
+		"client_id":       cfg.ClientID,
+		"has_secret":      cfg.HasSecret,
+		"pubsub_topic":    cfg.PubSubTopic,
+		"pubsub_endpoint": s.gmailPubSubEndpoint(),
 	})
 }
 
@@ -69,14 +118,38 @@ func (s *Server) handlePutGmailOAuth(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		ClientID     string `json:"client_id"`
 		ClientSecret string `json:"client_secret"`
+		PubSubTopic  string `json:"pubsub_topic"`
 	}
 	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	if err := s.gmailOAuthSave(strings.TrimSpace(in.ClientID), in.ClientSecret); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	topic := strings.TrimSpace(in.PubSubTopic)
+	if topic != s.gmailOAuthLoad().PubSubTopic {
+		if err := s.gmailPubSubSave(topic); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if key, ok := s.credentialKey(r); ok {
+			rows, err := s.st.DB.Query("SELECT id FROM accounts WHERE kind = 'gmail'")
+			if err == nil {
+				var ids []int64
+				for rows.Next() {
+					var id int64
+					if err := rows.Scan(&id); err == nil {
+						ids = append(ids, id)
+					}
+				}
+				rows.Close()
+				for _, id := range ids {
+					s.startWorkerFor(id, key)
+				}
+			}
+		}
 	}
 	s.handleGetGmailOAuth(w, r)
 }

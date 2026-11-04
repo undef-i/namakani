@@ -2,7 +2,10 @@ package api
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/url"
@@ -103,13 +106,13 @@ func (s *Server) gmailPendingFor(id string, key []byte, consume bool) (gmailPend
 func (s *Server) handleGetGmailPending(w http.ResponseWriter, r *http.Request) {
 	key, ok := s.credentialKey(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		writeErr(w, http.StatusUnauthorized, "not signed in")
 		return
 	}
 	id := r.PathValue("id")
 	e, ok := s.gmailPendingFor(id, key, false)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "授权已过期，请重新发起授权")
+		writeErr(w, http.StatusNotFound, "authorization expired, start the authorization again")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -126,11 +129,11 @@ func (s *Server) handleGetGmailPending(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteGmailPending(w http.ResponseWriter, r *http.Request) {
 	key, ok := s.credentialKey(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		writeErr(w, http.StatusUnauthorized, "not signed in")
 		return
 	}
 	if _, ok := s.gmailPendingFor(r.PathValue("id"), key, true); !ok {
-		writeErr(w, http.StatusNotFound, "授权已过期，请重新发起授权")
+		writeErr(w, http.StatusNotFound, "authorization expired, start the authorization again")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -147,7 +150,7 @@ func (s *Server) pruneGmailReauthLocked() {
 func (s *Server) handleGetGmailReauth(w http.ResponseWriter, r *http.Request) {
 	key, ok := s.credentialKey(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		writeErr(w, http.StatusUnauthorized, "not signed in")
 		return
 	}
 	id := r.PathValue("id")
@@ -156,7 +159,7 @@ func (s *Server) handleGetGmailReauth(w http.ResponseWriter, r *http.Request) {
 	e, ok := s.gmailReauth[id]
 	s.gmailReauthMu.Unlock()
 	if !ok || e.keyFP != keyFingerprint(key) {
-		writeErr(w, http.StatusNotFound, "授权已过期，请重新发起授权")
+		writeErr(w, http.StatusNotFound, "authorization expired, start the authorization again")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -173,7 +176,7 @@ func (s *Server) handleGetGmailReauth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createGmailAccount(w http.ResponseWriter, key []byte, in *accountIn) {
 	e, ok := s.gmailPendingFor(in.GmailPendingID, key, true)
 	if !ok {
-		writeErr(w, http.StatusBadRequest, "请先点测试连接")
+		writeErr(w, http.StatusBadRequest, "use test connection first")
 		return
 	}
 	res, err := s.st.DB.Exec(`INSERT INTO accounts(label, email, imap_host, imap_port, imap_tls,
@@ -182,7 +185,7 @@ func (s *Server) createGmailAccount(w http.ResponseWriter, key []byte, in *accou
 		e.label, e.email, "", 0, "none",
 		"", 0, "none", e.email, e.enc, e.signature, e.fromName, false, "gmail", time.Now().Unix())
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存账号失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save the account")
 		return
 	}
 	id, _ := res.LastInsertId()
@@ -193,19 +196,19 @@ func (s *Server) createGmailAccount(w http.ResponseWriter, key []byte, in *accou
 func (s *Server) handleGmailStart(w http.ResponseWriter, r *http.Request) {
 	key, ok := s.credentialKey(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "尚未登录")
+		writeErr(w, http.StatusUnauthorized, "not signed in")
 		return
 	}
 	var in gmailStartIn
 	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求格式不对")
+		writeErr(w, http.StatusBadRequest, "malformed request")
 		return
 	}
 	entry := gmailAuthEntry{accountID: in.AccountID}
 	if in.AccountID > 0 {
 		acct, err := s.loadMailAccount(in.AccountID, key)
 		if err != nil || acct.Kind != "gmail" {
-			writeErr(w, http.StatusNotFound, "账号不存在")
+			writeErr(w, http.StatusNotFound, "account not found")
 			return
 		}
 		entry.label = acct.Label
@@ -216,28 +219,28 @@ func (s *Server) handleGmailStart(w http.ResponseWriter, r *http.Request) {
 		entry.fromName = in.FromName
 		entry.signature = in.Signature
 		if entry.label == "" || !strings.Contains(entry.email, "@") {
-			writeErr(w, http.StatusBadRequest, "请填写名称和邮箱")
+			writeErr(w, http.StatusBadRequest, "name and email are required")
 			return
 		}
 	}
 	state, err := gmail.RandomState()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "生成授权状态失败")
+		writeErr(w, http.StatusInternalServerError, "failed to generate the authorization state")
 		return
 	}
 	verifier, challenge, err := gmail.PKCEPair()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "生成授权参数失败")
+		writeErr(w, http.StatusInternalServerError, "failed to generate the authorization parameters")
 		return
 	}
 	base := s.st.BaseURL()
 	if base == "" {
-		writeErr(w, http.StatusBadRequest, "尚未设置 Base URL，请先在设置里填写 Base URL")
+		writeErr(w, http.StatusBadRequest, "Base URL is not set, fill it in under settings first")
 		return
 	}
 	shared := s.gmailOAuthLoad()
 	if shared.ClientID == "" || shared.ClientSecret == "" {
-		writeErr(w, http.StatusBadRequest, "尚未配置 Google OAuth 客户端，请先在设置的「账号与认证」里填写 OAuth 客户端")
+		writeErr(w, http.StatusBadRequest, "google oauth client is not configured, fill it in under accounts and authentication in settings first")
 		return
 	}
 	entry.clientID = shared.ClientID
@@ -255,15 +258,55 @@ func (s *Server) handleGmailStart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleGmailPubSub(w http.ResponseWriter, r *http.Request) {
+	cfg := s.gmailOAuthLoad()
+	token := r.URL.Query().Get("token")
+	if cfg.PubSubToken == "" || subtle.ConstantTimeCompare([]byte(token), []byte(cfg.PubSubToken)) != 1 {
+		writeErr(w, http.StatusForbidden, "invalid token")
+		return
+	}
+	defer r.Body.Close()
+	var in struct {
+		Message struct {
+			Data        string            `json:"data"`
+			MessageID   string            `json:"messageId"`
+			PublishTime string            `json:"publishTime"`
+			Attributes  map[string]string `json:"attributes"`
+		} `json:"message"`
+		Subscription string `json:"subscription"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		log.Printf("gmail pubsub: undecodable request: %v", err)
+		writeErr(w, http.StatusBadRequest, "undecodable request")
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(in.Message.Data)
+	if err != nil {
+		log.Printf("gmail pubsub: undecodable message data: %v", err)
+		writeErr(w, http.StatusBadRequest, "undecodable message data")
+		return
+	}
+	var note struct {
+		EmailAddress string `json:"emailAddress"`
+	}
+	if err := json.Unmarshal(raw, &note); err != nil || note.EmailAddress == "" {
+		log.Printf("gmail pubsub: undecodable notification: %v", err)
+		writeErr(w, http.StatusBadRequest, "undecodable notification")
+		return
+	}
+	s.mgr.NotifyGmailPush(note.EmailAddress)
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *Server) updateGmailAccount(w http.ResponseWriter, r *http.Request, in *accountIn) {
 	id := r.PathValue("id")
 	if strings.TrimSpace(in.Label) == "" {
-		writeErr(w, http.StatusBadRequest, "请填写名称")
+		writeErr(w, http.StatusBadRequest, "name is required")
 		return
 	}
 	if _, err := s.st.DB.Exec(`UPDATE accounts SET label = ?, signature = ?, from_name = ? WHERE id = ? AND kind = 'gmail'`,
 		in.Label, in.Signature, in.FromName, id); err != nil {
-		writeErr(w, http.StatusInternalServerError, "保存失败")
+		writeErr(w, http.StatusInternalServerError, "failed to save")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -278,13 +321,13 @@ func gmailAuthFail(w http.ResponseWriter, code int, msg string) {
 func (s *Server) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	if q.Get("error") != "" {
-		gmailAuthFail(w, http.StatusBadRequest, "Google 授权未完成："+q.Get("error")+"。请返回设置页重新发起授权。")
+		gmailAuthFail(w, http.StatusBadRequest, "google authorization was not completed: "+q.Get("error")+". go back to settings and start the authorization again")
 		return
 	}
 	state := q.Get("state")
 	code := q.Get("code")
 	if state == "" || code == "" {
-		gmailAuthFail(w, http.StatusBadRequest, "授权回调参数不完整，请返回设置页重新发起授权。")
+		gmailAuthFail(w, http.StatusBadRequest, "authorization callback parameters are incomplete, go back to settings and start the authorization again")
 		return
 	}
 	s.gmailAuthMu.Lock()
@@ -292,41 +335,41 @@ func (s *Server) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 	delete(s.gmailAuth, state)
 	s.gmailAuthMu.Unlock()
 	if !ok || time.Since(entry.at) > gmailAuthTTL {
-		gmailAuthFail(w, http.StatusBadRequest, "授权已过期，请返回设置页重新发起授权。")
+		gmailAuthFail(w, http.StatusBadRequest, "authorization expired, go back to settings and start the authorization again")
 		return
 	}
 	key, kok := s.credentialKey(r)
 	if !kok {
-		gmailAuthFail(w, http.StatusUnauthorized, "登录已过期，请重新登录后再发起授权。")
+		gmailAuthFail(w, http.StatusUnauthorized, "your session has expired, sign in again and then start the authorization")
 		return
 	}
 	if keyFingerprint(key) != entry.keyFP {
-		gmailAuthFail(w, http.StatusForbidden, "授权会话与当前登录不一致，请重新发起授权。")
+		gmailAuthFail(w, http.StatusForbidden, "the authorization session does not match the current sign-in, start the authorization again")
 		return
 	}
 	ctx := r.Context()
 	creds, err := gmail.ExchangeCode(ctx, entry.clientID, entry.clientSecret, code, entry.verifier, entry.redirectURI)
 	if err != nil {
 		log.Printf("gmail: callback exchange code failed: %v", err)
-		gmailAuthFail(w, http.StatusBadGateway, "向 Google 换取令牌失败，请返回设置页重新发起授权。")
+		gmailAuthFail(w, http.StatusBadGateway, "failed to exchange the token with google, go back to settings and start the authorization again")
 		return
 	}
 	profile, err := gmail.NewClient(creds).Profile(ctx)
 	if err != nil || profile.EmailAddress == "" {
 		log.Printf("gmail: callback profile failed: %v", err)
-		gmailAuthFail(w, http.StatusBadGateway, "读取 Google 账号资料失败，请返回设置页重新发起授权。")
+		gmailAuthFail(w, http.StatusBadGateway, "failed to read the google account profile, go back to settings and start the authorization again")
 		return
 	}
 	enc, err := auth.Encrypt(key, gmail.TokenCredsJSON(creds.RefreshToken))
 	if err != nil {
-		gmailAuthFail(w, http.StatusInternalServerError, "加密凭据失败。")
+		gmailAuthFail(w, http.StatusInternalServerError, "failed to encrypt the credentials")
 		return
 	}
 	acct := mail.Account{Kind: "gmail", Email: profile.EmailAddress, Username: profile.EmailAddress, Password: creds.JSON()}
 	cl, err := gmail.Connect(s.st, acct)
 	if err != nil {
 		log.Printf("gmail: callback connect failed: %v", err)
-		gmailAuthFail(w, http.StatusBadGateway, "连接失败，请返回设置页重新发起授权。")
+		gmailAuthFail(w, http.StatusBadGateway, "connection failed, go back to settings and start the authorization again")
 		return
 	}
 	folders, err := cl.ListFolders()
@@ -334,17 +377,17 @@ func (s *Server) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 	cl.Close()
 	if err != nil {
 		log.Printf("gmail: callback list folders failed: %v", err)
-		gmailAuthFail(w, http.StatusBadGateway, "读取文件夹列表失败，请返回设置页重新发起授权。")
+		gmailAuthFail(w, http.StatusBadGateway, "failed to read the folder list, go back to settings and start the authorization again")
 		return
 	}
 	if entry.accountID > 0 {
 		var label, email, fromName, signature string
 		if err := s.st.DB.QueryRow(`SELECT label, email, from_name, signature FROM accounts WHERE id = ? AND kind = 'gmail'`, entry.accountID).Scan(&label, &email, &fromName, &signature); err != nil {
-			gmailAuthFail(w, http.StatusInternalServerError, "读取账号失败。")
+			gmailAuthFail(w, http.StatusInternalServerError, "failed to read the account")
 			return
 		}
 		if _, err := s.st.DB.Exec(`UPDATE accounts SET enc_password = ? WHERE id = ? AND kind = 'gmail'`, enc, entry.accountID); err != nil {
-			gmailAuthFail(w, http.StatusInternalServerError, "保存凭据失败。")
+			gmailAuthFail(w, http.StatusInternalServerError, "failed to save the credentials")
 			return
 		}
 		if acct, err := s.loadMailAccount(entry.accountID, key); err == nil {
@@ -352,7 +395,7 @@ func (s *Server) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		reauthID, err := gmail.RandomState()
 		if err != nil {
-			gmailAuthFail(w, http.StatusInternalServerError, "生成授权状态失败。")
+			gmailAuthFail(w, http.StatusInternalServerError, "failed to generate the authorization state")
 			return
 		}
 		s.gmailReauthMu.Lock()
@@ -377,7 +420,7 @@ func (s *Server) handleGmailCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	pendingID, err := gmail.RandomState()
 	if err != nil {
-		gmailAuthFail(w, http.StatusInternalServerError, "生成授权状态失败。")
+		gmailAuthFail(w, http.StatusInternalServerError, "failed to generate the authorization state")
 		return
 	}
 	s.gmailPendingMu.Lock()
