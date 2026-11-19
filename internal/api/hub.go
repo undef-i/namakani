@@ -10,6 +10,8 @@ import (
 	syncmgr "namakani/internal/sync"
 )
 
+var eventsHeartbeatInterval = 25 * time.Second
+
 type hub struct {
 	mu   sync.Mutex
 	subs map[chan []byte]struct{}
@@ -66,7 +68,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer unsub()
 	fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
-	heartbeat := time.NewTicker(25 * time.Second)
+	heartbeat := time.NewTicker(eventsHeartbeatInterval)
 	defer heartbeat.Stop()
 	for {
 		select {
@@ -79,7 +81,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		case <-heartbeat.C:
-			fmt.Fprint(w, ": ping\n\n")
+			fmt.Fprint(w, "data: {\"type\":\"ping\"}\n\n")
 			flusher.Flush()
 		}
 	}

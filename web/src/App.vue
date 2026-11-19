@@ -1631,6 +1631,10 @@ const detailCache = new Map()
 let es = null
 let esTimer = null
 let esWasDown = false
+const STREAM_HEARTBEAT_MS = 25000
+const STREAM_SILENCE_LIMIT_MS = STREAM_HEARTBEAT_MS * 2
+let lastStreamAt = 0
+let streamWatchdog = null
 let statusTimer = null
 let booted = false
 
@@ -2012,7 +2016,7 @@ function fmtAddrList(list) {
 }
 
 
-async function loadMessages(soft = false) {
+async function loadMessages(soft = false, force = false) {
   if (mobileSearch.value && !searching.value) return
   if (!searching.value && rangeId.value && foldersStatus.value !== 'ready') {
     await loadFolders()
@@ -2033,7 +2037,7 @@ async function loadMessages(soft = false) {
     newMailPending.value = 0
   }
   const keepReady =
-    (soft || target.kind === 'search') &&
+    (soft || force || target.kind === 'search') &&
     listStatus.value === 'ready' &&
     messages.value.length > 0 &&
     listSnap.value.kind === target.kind
@@ -2044,7 +2048,7 @@ async function loadMessages(soft = false) {
   convoOpenIds.value = new Set()
   convoDetails.value = {}
   cursorIdx.value = 0
-  const rawHit = !soft ? scopeCache.get(listCacheKey(target)) : null
+  const rawHit = !soft && !force ? scopeCache.get(listCacheKey(target)) : null
   let hit = rawHit && rawHit.epoch === listEpoch ? rawHit : null
   let staleAnchor = null
   if (!hit && rawHit && rawHit.seq != null && rawHit.seq >= journalBase) {
@@ -2945,7 +2949,7 @@ async function loadStatuses() {
 }
 
 async function refreshData() {
-  await Promise.all([loadFolders(), loadMessages(), loadStatuses()])
+  await Promise.all([loadFolders(), loadMessages(false, true), loadStatuses()])
 }
 
 let discardRowId = 0
@@ -3318,6 +3322,31 @@ function onServerEvent(ev) {
   }
 }
 
+function noteStreamAlive() {
+  lastStreamAt = Date.now()
+  armStreamWatchdog()
+}
+
+function armStreamWatchdog() {
+  clearTimeout(streamWatchdog)
+  streamWatchdog = null
+  if (!es) return
+  const remain = STREAM_SILENCE_LIMIT_MS - (Date.now() - lastStreamAt)
+  streamWatchdog = setTimeout(checkStreamAlive, Math.max(remain, 0))
+}
+
+function checkStreamAlive() {
+  if (!es || view.value !== 'app') return
+  if (Date.now() - lastStreamAt >= STREAM_SILENCE_LIMIT_MS) {
+    es.close()
+    es = null
+    esWasDown = true
+    scheduleReconnect()
+  } else {
+    armStreamWatchdog()
+  }
+}
+
 function connectEvents() {
   disconnectEvents()
   try {
@@ -3326,7 +3355,10 @@ function connectEvents() {
     scheduleReconnect()
     return
   }
+  lastStreamAt = Date.now()
+  armStreamWatchdog()
   es.onopen = () => {
+    noteStreamAlive()
     const wasReconnect = esWasDown
     esWasDown = false
     if (wasReconnect && view.value === 'app') {
@@ -3340,6 +3372,7 @@ function connectEvents() {
     }
   }
   es.onmessage = (e) => {
+    noteStreamAlive()
     try {
       onServerEvent(JSON.parse(e.data))
     } catch {
@@ -3370,6 +3403,7 @@ async function checkVersion() {
 function onVisibility() {
   if (!document.hidden && view.value === 'app') {
     checkVersion()
+    checkStreamAlive()
     obFlush()
   }
 }
@@ -3383,6 +3417,8 @@ function scheduleReconnect() {
 
 function disconnectEvents() {
   clearTimeout(esTimer)
+  clearTimeout(streamWatchdog)
+  streamWatchdog = null
   if (es) {
     es.close()
     es = null
